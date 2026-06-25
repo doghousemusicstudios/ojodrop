@@ -28,6 +28,10 @@ go karts and a Casio Keyboard.](https://www.youtube.com/watch?v=FuX5_OWObA0)
 
 [Monetize your own 85-year-long YouTube video and do it without a web browser engine underneath](https://www.youtube.com/watch?v=qirWins5tus)
 
+## Why call it OjoDrop?
+
+Because when it first rendered successfully I went "OH HO HO!" 
+
 ## Does it actually work?
 
 Mostly. In fidelity tests with the "cream of the crop" presets, I encountered a 97% pass rate
