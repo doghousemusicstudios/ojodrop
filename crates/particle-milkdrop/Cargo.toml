@@ -1,0 +1,50 @@
+[package]
+name = "particle-milkdrop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "particle-milkdrop"
+path = "src/main.rs"
+
+[dependencies]
+wgpu.workspace = true
+winit.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+log.workspace = true
+env_logger.workspace = true
+particle-audio.workspace = true
+naga = { version = "29.0.3", features = ["glsl-in", "wgsl-out"] }
+png = "0.18"
+serde.workspace = true
+serde_json.workspace = true
+particle-milkdrop-converter-sys = { path = "../particle-milkdrop-converter-sys", optional = true }
+
+# The native in-process .milk → GLSL converter is ON by default so the OjoDrop
+# app "just works" when a raw .milk is dropped, with no external tooling. The
+# sys-crate degrades to a no-op stub when the upstream C++ sources are absent at
+# build time (see particle-milkdrop-converter-sys/build.rs), so this never makes
+# the C++ toolchain a hard build requirement. For a lean / JSON-only build (e.g.
+# engine devs who don't want the converter), use `--no-default-features`.
+[features]
+default = ["milk-native-converter"]
+milk-native-converter = ["dep:particle-milkdrop-converter-sys"]
+
+# macOS .app packaging via `cargo bundle --release` (`cargo install cargo-bundle`).
+# A hand-rolled equivalent that needs no extra tooling lives at
+# scripts/ojodrop/bundle_mac.sh.
+[package.metadata.bundle]
+name = "OjoDrop"
+identifier = "run.sho.ojodrop"
+icon = ["bundle/OjoDrop.icns", "bundle/ojodrop-1024.png"]
+short_description = "Drop a MilkDrop preset, watch it play."
+long_description = """
+OjoDrop is a native Rust + wgpu MilkDrop / Butterchurn preset player. Drag a
+.milk or .json preset onto the window and it renders live, reacting to your mic.
+The .milk → GLSL converter is baked in.
+"""
+category = "public.app-category.entertainment"
+osx_minimum_system_version = "11.0"

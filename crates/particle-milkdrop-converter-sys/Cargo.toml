@@ -1,0 +1,17 @@
+[package]
+name = "particle-milkdrop-converter-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+links = "milk_converter_shim"
+
+[[example]]
+name = "smoke_test"
+path = "src/test_main.rs"
+
+[build-dependencies]
+cc = "1"
+# Builds hlsl2glslfork + glsl-optimizer from the vendored submodule sources when
+# no prebuilt static libs are present (the clean-clone / public-repo path).
+cmake = "0.1"

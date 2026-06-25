@@ -1,0 +1,42 @@
+# OjoDrop workspace manifest. It carries the crates OjoDrop needs — the milkdrop
+# engine/app, its audio crate, and the native converter sys-crate — plus the
+# workspace dependency versions they inherit.
+[workspace]
+resolver = "2"
+members = [
+    "crates/particle-audio",
+    "crates/particle-milkdrop",
+    "crates/particle-milkdrop-converter-sys",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT"
+authors = ["sho.run"]
+
+# Pinned to match sho.run's gpux stack (wgpu 29.0.x).
+[workspace.dependencies]
+wgpu = "29.0.3"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
+winit = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cpal = "0.18"
+realfft = "3"
+rtrb = "0.3"
+
+# internal
+particle-audio = { path = "crates/particle-audio" }
+
+[profile.dev]
+opt-level = 1          # particle sims are unusably slow at opt-level 0
+[profile.dev.package."*"]
+opt-level = 3          # always optimize deps (wgpu, realfft)
+[profile.release]
+lto = "thin"
+codegen-units = 1

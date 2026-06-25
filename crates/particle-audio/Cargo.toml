@@ -1,0 +1,20 @@
+[package]
+name = "particle-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Self-contained real-time audio capture + DSP for an audio-reactive visual engine."
+
+[dependencies]
+cpal.workspace = true
+realfft.workspace = true
+rtrb.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true
+
+[[example]]
+name = "meter"
+path = "examples/meter.rs"
