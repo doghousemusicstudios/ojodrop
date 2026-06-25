@@ -117,6 +117,9 @@ millenials and Gen-Xers during college, and milkdrop was this fun thing
 everyone could just watch for hours and forget that their organic chemistry
 midterm was the next day.
 
+Lastly, Claude is to blame for this. I didn't think it was possible until I just started throwing
+random platforms at the thing.
+
 So, to the creators listed above, the consumers of milkdrop over the past 3 decades,
 and drugs, thank you all.
 
