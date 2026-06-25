@@ -36,6 +36,13 @@ interpret presets is a little fuzzy, so I made some middle-of-the-road decisions
 I may iterate more to get the fidelity rate up, but there will be diminishing returns unless
 I found a couple of slam dunk levers to move the needle.
 
+## Is it faster than WebGL2? Was it worth it to move to WGPU?
+
+Listen. I just make the stuff. I was curious on Reddit 3 days ago and boom, this popped out of Claude.
+I not going to host an episode of milkdrop Top Gear. 
+Feel free to benchmark and create a snarky YouTube video. Something with large fonts
+where you're pointing to a 4k monitor and saying something like "THE BUTTERCHURN CHURNER?!"
+
 
 ## Use
 
