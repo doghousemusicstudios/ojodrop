@@ -1,10 +1,9 @@
 # OjoDrop
 
-**Drop a MilkDrop preset, watch it play.** OjoDrop is a standalone, open-source
-(MIT) macOS app: a window where you drag a `.milk` MilkDrop preset (or a
-pre-converted `.json`) and it renders, live, reacting to your microphone. It is a
-native Rust + [wgpu](https://wgpu.rs) reimplementation of the MilkDrop /
-[Butterchurn](https://github.com/jberg/butterchurn) engine — no browser, no
+ OjoDrop is a standalone, open-source (MIT) macOS app: a window where you drag
+ a `.milk` MilkDrop preset (or a pre-converted `.json`) and it renders, live,
+ reacting to your microphone. It is a native Rust + [wgpu](https://wgpu.rs)
+ reimplementation of the MilkDrop / [Butterchurn](https://github.com/jberg/butterchurn) engine — no browser, no
 Node, no Winamp. The `.milk` → GLSL converter is **baked into the binary**.
 
 > OjoDrop is the app layer over the `particle-milkdrop` engine crate, which is the
@@ -12,13 +11,40 @@ Node, no Winamp. The `.milk` → GLSL converter is **baked into the binary**.
 > `.milk` ingestion, crash-safety against arbitrary files, packaging, and the
 > open-source scaffolding.
 
+DISCLAIMER: I built this out of sheer curiosity, on whether I could build actually build something
+that runs Milkdrop presets but doesn't require a webview or WebGL layer. It runs on wgpu
+and Rust, with a dash of C++ if you are interested in the HLSL conversion. 
+
+What could it be used for? Who knows, but here's some ideas I came up with while eating
+pizza:
+
+[Creating an Oculus VR game to simulate the “Magic Milk” experiment from childhood
+without milk, food coloring, or childhood](https://youtube.com/shorts/GGCwdV-I-0c?si=Piz4epG5nQG6AlAf) 
+
+[Re-create your own version of this music video without a Nintendo N64. Just add
+go karts and a Casio Keyboard.](https://www.youtube.com/watch?v=FuX5_OWObA0)
+
+[Develop your own karaoke app so you can create an open source alternative to Karafun](https://www.youtube.com/watch?v=_WwA-02ZCks)
+
+[Monetize your own 85-year-long YouTube video and do it without a web browser engine underneath](https://www.youtube.com/watch?v=qirWins5tus)
+
+## Does it actually work?
+
+Mostly. In fidelity tests with the "cream of the crop" presets, I encountered a 97% pass rate
+for ingest, and a 70% pass rate for fidelity and image quality. The way all Milkdrop iterations
+interpret presets is a little fuzzy, so I made some middle-of-the-road decisions when finding differences.
+I may iterate more to get the fidelity rate up, but there will be diminishing returns unless
+I found a couple of slam dunk levers to move the needle.
+
+
 ## Use
 
 - **Launch it** → an empty window: *"drag a .milk or .json preset here."*
 - **Drag a `.milk`** onto the window → it's converted in-process and rendered.
 - **Drag a `.json`** (Butterchurn-exported preset) → loaded directly.
 - A malformed or hostile file shows an error in the title bar and the app keeps
-  running — it never crashes on bad input.
+  running — it shouldn't crash on bad input, but hey, code always loves to surprise
+  us.
 - `Esc` quits. `--about` prints credits and license info.
 
 Audio comes from your default input device (the room mic); if none is available
@@ -73,9 +99,27 @@ OjoDrop exists because of **Ryan Geiss** (MilkDrop), **Jordan "jberg" Berg**
 (Butterchurn + the shader converter), **Nullsoft / Winamp**, and the
 hlsl2glslfork / glsl-optimizer / Mesa / MojoShader authors. See
 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for full attribution and the
-licensing verdict. Thank you, all of you.
+licensing verdict. 
+
+OjoDrop also exists because weed and other drugs were accessible to elder
+millenials and Gen-Xers went to college, and milkdrop was this fun thing
+everyone could just watch for hours and forget that their organic chemistry
+midterm was the next day.
+
+So, to the creators listed above, the consumers of milkdrop over the past 3 decades,
+and drugs, thank you all.
 
 ## License
 
 MIT — see [`LICENSE`](./LICENSE). Bundled third-party components retain their own
 permissive licenses (BSD-3 / zlib / MIT), reproduced in `THIRD_PARTY_NOTICES.md`.
+
+## Contribute
+
+I don't know how often I'll check this, but if anyone wants to improve upon the engine I'm all for it.
+Most of this was vibe coded. So feel free to vibe code along with me. If you find an em-dash, please
+don't hurt me. Birds aren't real. Or they might be. Either way, always keen to hear opinions or entertain updates.
+
+Love, peace, and chicken grease,
+
+Kenny
