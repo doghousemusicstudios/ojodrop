@@ -27,11 +27,11 @@ pub struct MilkShaders {
     pub per_pixel: Option<String>,
     /// 0.0–1.0; default 0.98
     pub decay:     f32,
-    /// brightness exponent; default 1.5
+    /// brightness exponent; default 2.0
     pub gamma_adj: f32,
 
     // ── Video echo (in-comp-shader feedback look) ─────────────────────────────
-    pub echo_zoom:  f32, // fVideoEchoZoom,        default 1.0
+    pub echo_zoom:  f32, // fVideoEchoZoom,        default 2.0
     pub echo_alpha: f32, // fVideoEchoAlpha,       default 0.0
     pub echo_orient: f32, // nVideoEchoOrientation, default 0.0
 
@@ -206,9 +206,9 @@ pub fn parse(content: &str) -> MilkShaders {
         per_frame_init: extract_per_frame_init(content),
         per_pixel: extract_per_pixel(content),
         decay:     parse_float(content, "fDecay",    0.98),
-        gamma_adj: parse_float(content, "fGammaAdj", 1.5),
+        gamma_adj: parse_float(content, "fGammaAdj", 2.0),
 
-        echo_zoom:   parse_float(content, "fVideoEchoZoom",        1.0),
+        echo_zoom:   parse_float(content, "fVideoEchoZoom",        2.0),
         echo_alpha:  parse_float(content, "fVideoEchoAlpha",       0.0),
         echo_orient: parse_float(content, "nVideoEchoOrientation", 0.0),
 
@@ -244,7 +244,7 @@ pub fn parse(content: &str) -> MilkShaders {
         wave_dots:      parse_bool (content, "bWaveDots",      false),
         wave_thick:     parse_bool (content, "bWaveThick",     false),
         additive_wave:  parse_bool (content, "bAdditiveWaves", false),
-        wave_brighten:  parse_bool (content, "bMaximizeWaveColor", false),
+        wave_brighten:  parse_bool (content, "bMaximizeWaveColor", true),
         modwavealphabyvolume: parse_bool(content, "bModWaveAlphaByVolume", false),
         modwavealphastart: parse_float(content, "fModWaveAlphaStart", 0.75),
         modwavealphaend:   parse_float(content, "fModWaveAlphaEnd",   0.95),
@@ -505,16 +505,56 @@ fn extract_section(content: &str, prefix: &str) -> Option<String> {
 
     // Reassemble
     let raw: String = lines.values().cloned().collect::<Vec<_>>().join("\n");
-
-    // Strip the `shader_body` header and outer `{ }` braces.
-    // The first line is typically "shader_body", second is "{", last is "}".
     let trimmed = raw.trim();
-    let inner = trimmed
-        .strip_prefix("shader_body")
-        .unwrap_or(trimmed)
-        .trim();
-    let inner = inner.strip_prefix('{').unwrap_or(inner);
-    let inner = inner.strip_suffix('}').unwrap_or(inner);
 
-    Some(inner.trim().to_string())
+    // Strip the `shader_body { … }` wrapper. The `shader_body` token is usually the
+    // first line, but sampler/#define/global declarations can precede it. Locate the
+    // token wherever it sits, brace-match its open/close to extract the inner body,
+    // and keep any pre-`shader_body` globals so the downstream HLSL splitter still
+    // sees them at file scope. The old prefix/suffix strip silently no-oped the
+    // prefix strips when globals were present but still chopped the trailing `}`,
+    // leaving `shader_body` and `{` embedded with the closing brace gone.
+    match trimmed.find("shader_body") {
+        Some(pos) => {
+            let before = trimmed[..pos].trim_end();
+            let after_kw = trimmed[pos + "shader_body".len()..].trim_start();
+            let inner = match after_kw.strip_prefix('{') {
+                Some(body_src) => strip_to_matching_brace(body_src).trim().to_string(),
+                // No `{` after the token — nothing sane to strip; keep as-is.
+                None => after_kw.to_string(),
+            };
+            if before.is_empty() {
+                Some(inner)
+            } else {
+                // Re-emit the canonical wrapper so the HLSL path's
+                // split_shader_body_wrapper still separates globals from body.
+                Some(format!("{before}\nshader_body {{\n{inner}\n}}"))
+            }
+        }
+        None => Some(trimmed.to_string()),
+    }
+}
+
+/// Return everything up to (but excluding) the `}` that closes depth 0, given a
+/// string that begins just AFTER an opening `{` (depth starts at 1). Skips `//`
+/// line comments. If no matching close is found, returns the whole input.
+fn strip_to_matching_brace(src: &str) -> &str {
+    let bytes = src.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+            }
+            b'{' => { depth += 1; i += 1; }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 { return &src[..i]; }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    src
 }

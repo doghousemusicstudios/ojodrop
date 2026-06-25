@@ -146,9 +146,9 @@ pub fn butterchurn_to_naga(src: &str) -> String {
 
 fn emit_ubo(scalars: &[ScalarDecl], binding: u32, out: &mut Vec<String>) {
     out.push(format!("layout(set = 1, binding = {binding}) uniform PerFrame {{"));
-    // Emit in std140-friendly order: vec4 first, then vec2, then float, then int
-    // (avoids alignment padding issues)
-    for ty_order in &["vec4", "vec2", "float", "int"] {
+    // Emit in std140-friendly order: vec4 first, then vec3 (aligns as vec4), then
+    // vec2, then float, then int (avoids alignment padding issues)
+    for ty_order in &["vec4", "vec3", "vec2", "float", "int"] {
         for s in scalars {
             if &s.ty.as_str() == ty_order {
                 out.push(format!("    {} {};", s.ty, s.name));
@@ -2380,8 +2380,10 @@ fn param_widths(
 /// Rewrite `A <cmp> B` where one side is a float-vector and the other a scalar into
 /// `vecN(lessThan(A, vecN(B)))` (and greaterThan/…): naga rejects `vec < scalar`, and
 /// these comparisons are used as bool-as-number multipliers in MilkDrop presets, so the
-/// vecN(...) wrapper makes the result usable in arithmetic. Only fires when inference is
-/// confident one side is a vector — scalar comparisons (valid bool) are untouched.
+/// vecN(...) wrapper makes the result usable in arithmetic. When both sides are vectors
+/// of differing width, the wider operand is truncated to the narrower so the componentwise
+/// builtin has a matching overload. Only fires when inference is confident at least one
+/// side is a vector — scalar comparisons (valid bool) are untouched.
 fn fix_vector_relops(src: &str, t: &TypeTable) -> String {
     let b: Vec<char> = src.chars().collect();
     let n = b.len();
@@ -2403,9 +2405,17 @@ fn fix_vector_relops(src: &str, t: &TypeTable) -> String {
                 let right: String = b[i + op.len()..re].iter().collect();
                 let lt = infer_ty(left.trim(), t);
                 let rt = infer_ty(right.trim(), t);
-                let w = gty_width(lt).max(gty_width(rt));
                 let lv = matches!(lt, GTy::V(_));
                 let rv = matches!(rt, GTy::V(_));
+                // componentwise builtins (lessThan, …) require both operands the same
+                // vector width. When both sides are vectors of differing width, the
+                // result/wrapper width is the MIN and the wider side is truncated;
+                // when one side is scalar it is broadcast up to the vector width (max).
+                let w = if lv && rv {
+                    gty_width(lt).min(gty_width(rt))
+                } else {
+                    gty_width(lt).max(gty_width(rt))
+                };
                 // only act when confidently a vector vs (vector|scalar) comparison
                 if w > 1 && (lv || rv) && lt != GTy::Unknown && rt != GTy::Unknown {
                     let fname = match op.as_str() {
@@ -2415,8 +2425,18 @@ fn fix_vector_relops(src: &str, t: &TypeTable) -> String {
                         ">=" => "greaterThanEqual",
                         _ => unreachable!(),
                     };
-                    let lexpr = if lv { left.trim().to_string() } else { format!("vec{w}({})", left.trim()) };
-                    let rexpr = if rv { right.trim().to_string() } else { format!("vec{w}({})", right.trim()) };
+                    // mirror rewrite_expr_width: truncate the wider operand to `w`.
+                    let sw = &"xyzw"[..w as usize];
+                    let lexpr = if lv {
+                        if gty_width(lt) > w { format!("({}).{sw}", left.trim()) } else { left.trim().to_string() }
+                    } else {
+                        format!("vec{w}({})", left.trim())
+                    };
+                    let rexpr = if rv {
+                        if gty_width(rt) > w { format!("({}).{sw}", right.trim()) } else { right.trim().to_string() }
+                    } else {
+                        format!("vec{w}({})", right.trim())
+                    };
                     // drop whatever we had buffered for the left operand, re-emit wrapped
                     let keep = out.len() - (i - ls);
                     out.truncate(keep);

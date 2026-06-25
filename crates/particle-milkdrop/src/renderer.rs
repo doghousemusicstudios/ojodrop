@@ -3722,6 +3722,10 @@ impl MilkdropRenderer {
                 rp.set_index_buffer(self.shape_idx_buf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.set_bind_group(0, shape_read_bg, &[]);
                 for d in &fill_draws {
+                    // Clamp to the uploaded vertex count (truncated to SHAPE_VERT_CAP) so
+                    // an over-cap shape never draws from a stale/zero buffer tail. The fan
+                    // touches verts base_vertex..base_vertex+(sides+2) (center + sides+1 rim).
+                    if d.base_vertex as u32 + d.sides + 2 > SHAPE_VERT_CAP as u32 { continue; }
                     let pipe = if d.additive { &self.shapes_fill_pipeline_additive } else { &self.shapes_fill_pipeline_alpha };
                     rp.set_pipeline(pipe);
                     rp.set_bind_group(0, shape_read_bg, &[]);

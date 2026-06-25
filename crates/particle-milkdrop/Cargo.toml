@@ -5,22 +5,30 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The OjoDrop binary needs the `app` feature (windowing + live audio + PNG export).
+# Gating it this way means a library consumer (particle-core/particle-demo) that
+# pulls this crate with `default-features = false` does NOT try to build the bin,
+# so the window-free engine core never has to satisfy winit/audio deps.
 [[bin]]
 name = "particle-milkdrop"
 path = "src/main.rs"
+required-features = ["app"]
 
 [dependencies]
 wgpu.workspace = true
-winit.workspace = true
 bytemuck.workspace = true
-pollster.workspace = true
 log.workspace = true
-env_logger.workspace = true
-particle-audio.workspace = true
 naga = { version = "29.0.3", features = ["glsl-in", "wgsl-out"] }
-png = "0.18"
 serde.workspace = true
 serde_json.workspace = true
+# App/binary-only deps — windowing, the pollster block-on used by the windowed
+# init path, env_logger, live mic capture, and headless PNG export. Optional so
+# the renderer can be consumed as a window-free library (see the `app` feature).
+winit = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+env_logger = { workspace = true, optional = true }
+particle-audio = { workspace = true, optional = true }
+png = { version = "0.18", optional = true }
 particle-milkdrop-converter-sys = { path = "../particle-milkdrop-converter-sys", optional = true }
 
 # The native in-process .milk → GLSL converter is ON by default so the OjoDrop
@@ -30,8 +38,12 @@ particle-milkdrop-converter-sys = { path = "../particle-milkdrop-converter-sys",
 # the C++ toolchain a hard build requirement. For a lean / JSON-only build (e.g.
 # engine devs who don't want the converter), use `--no-default-features`.
 [features]
-default = ["milk-native-converter"]
+default = ["milk-native-converter", "app"]
 milk-native-converter = ["dep:particle-milkdrop-converter-sys"]
+# The standalone OjoDrop application layer: a winit window, the pollster block-on
+# used to init it, env_logger, live mic audio (particle-audio), and headless PNG
+# export (png). Library consumers (particle-core, particle-demo) omit this.
+app = ["dep:winit", "dep:pollster", "dep:env_logger", "dep:particle-audio", "dep:png"]
 
 # macOS .app packaging via `cargo bundle --release` (`cargo install cargo-bundle`).
 # A hand-rolled equivalent that needs no extra tooling lives at

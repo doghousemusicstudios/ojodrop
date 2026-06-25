@@ -104,9 +104,9 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
         per_pixel: pick_eqs(&p.pixel_eqs_eel, &p.pixel_eqs_str),
 
         decay: f("decay", 0.98),
-        gamma_adj: f("gammaadj", 1.5),
+        gamma_adj: f("gammaadj", 2.0),
 
-        echo_zoom: f("echo_zoom", 1.0),
+        echo_zoom: f("echo_zoom", 2.0),
         echo_alpha: f("echo_alpha", 0.0),
         echo_orient: f("echo_orient", 0.0),
 
@@ -142,7 +142,7 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
         wave_dots: b("wave_dots", false),
         wave_thick: b("wave_thick", false),
         additive_wave: b("additivewave", false),
-        wave_brighten: b("wave_brighten", false),
+        wave_brighten: b("wave_brighten", true),
         modwavealphabyvolume: b("modwavealphabyvolume", false),
         modwavealphastart: f("modwavealphastart", 0.75),
         modwavealphaend: f("modwavealphaend", 0.95),

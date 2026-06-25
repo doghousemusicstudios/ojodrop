@@ -422,12 +422,14 @@ impl DspState {
         }
 
         // --- Butterchurn-parity bass/mid/treb + `_att` ---
-        // Feed the most-recent NUM_SAMPS mono samples (scaled to Butterchurn's
-        // signed -128..127 domain) into the FPS-aware levels follower. The result
-        // hovers around ~1.0 because each band is divided by its long-term running
-        // average, matching the reference renderer's normalization.
-        let mut bc_time = [0.0f32; butterchurn::NUM_SAMPS];
-        let tail = window.len().saturating_sub(butterchurn::NUM_SAMPS);
+        // Feed the most-recent FFT_SIZE mono samples (scaled to Butterchurn's
+        // signed -128..127 domain) into the FPS-aware levels follower. Butterchurn's
+        // FFT is FFT_SIZE-point, so feeding only NUM_SAMPS would zero the second
+        // transform half — feed the full window. The result hovers around ~1.0
+        // because each band is divided by its long-term running average, matching
+        // the reference renderer's normalization.
+        let mut bc_time = [0.0f32; butterchurn::FFT_SIZE];
+        let tail = window.len().saturating_sub(butterchurn::FFT_SIZE);
         for (dst, &s) in bc_time.iter_mut().zip(window[tail..].iter()) {
             *dst = (s * 128.0).clamp(-128.0, 127.0);
         }

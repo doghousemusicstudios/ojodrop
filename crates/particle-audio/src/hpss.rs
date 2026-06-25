@@ -32,6 +32,7 @@ pub(crate) struct HpssSeparator {
     bin_hz: f32,
     history: Vec<f32>,
     history_write: usize,
+    history_filled: usize,
     time_scratch: Vec<f32>,
     freq_scratch: Vec<f32>,
     harmonic_mag: Vec<f32>,
@@ -59,6 +60,7 @@ impl HpssSeparator {
             bin_hz,
             history: vec![0.0; n_bins * TIME_MEDIAN_FRAMES],
             history_write: 0,
+            history_filled: 0,
             time_scratch: vec![0.0; TIME_MEDIAN_FRAMES],
             freq_scratch: vec![0.0; FREQ_MEDIAN_RADIUS * 2 + 1],
             harmonic_mag: vec![0.0; n_bins],
@@ -186,13 +188,19 @@ impl HpssSeparator {
         let offset = self.history_write * self.n_bins;
         self.history[offset..offset + self.n_bins].copy_from_slice(mag);
         self.history_write = (self.history_write + 1) % TIME_MEDIAN_FRAMES;
+        self.history_filled = (self.history_filled + 1).min(TIME_MEDIAN_FRAMES);
     }
 
     fn time_median(&mut self, bin: usize) -> f32 {
-        for frame in 0..TIME_MEDIAN_FRAMES {
+        // Median only over written frames so warm-up isn't biased toward zero-init slots.
+        let count = self.history_filled;
+        if count == 0 {
+            return 0.0;
+        }
+        for frame in 0..count {
             self.time_scratch[frame] = self.history[frame * self.n_bins + bin];
         }
-        median(&mut self.time_scratch)
+        median(&mut self.time_scratch[..count])
     }
 
     fn frequency_median(&mut self, mag: &[f32], bin: usize) -> f32 {
