@@ -459,7 +459,7 @@ impl GpuState {
             }
             None => fallback_preset(),
         };
-        let renderer = Self::build_renderer(&device, &queue, w, h, format, &shaders);
+        let (renderer, _compiled) = Self::build_renderer(&device, &queue, w, h, format, &shaders);
 
         // Start live mic capture (prefer the room mic, not system loopback).
         let audio = match AudioEngine::with_config(
@@ -482,6 +482,10 @@ impl GpuState {
     /// shader-compile error so an unsupported or hostile preset never crashes the
     /// app. The passthrough is a known-good internal asset; if it *also* fails that
     /// is a genuine engine bug worth surfacing loudly.
+    ///
+    /// Returns `(renderer, compiled)` where `compiled` is `true` when the preset's
+    /// OWN shaders built, and `false` when we fell back to passthrough — so the UI
+    /// can tell the user a preset is unsupported instead of silently showing blank.
     fn build_renderer(
         device: &Arc<wgpu::Device>,
         queue: &Arc<wgpu::Queue>,
@@ -489,14 +493,15 @@ impl GpuState {
         h: u32,
         format: wgpu::TextureFormat,
         shaders: &MilkShaders,
-    ) -> MilkdropRenderer {
+    ) -> (MilkdropRenderer, bool) {
         match MilkdropRenderer::new(device.clone(), queue.clone(), w, h, format, shaders) {
-            Ok(r) => r,
+            Ok(r) => (r, true),
             Err(e) => {
                 log::error!("shader compile failed ({e}) — using passthrough fallback preset");
                 let fallback = fallback_preset();
-                MilkdropRenderer::new(device.clone(), queue.clone(), w, h, format, &fallback)
-                    .unwrap_or_else(|e2| panic!("fallback renderer also failed: {e2}"))
+                let r = MilkdropRenderer::new(device.clone(), queue.clone(), w, h, format, &fallback)
+                    .unwrap_or_else(|e2| panic!("fallback renderer also failed: {e2}"));
+                (r, false)
             }
         }
     }
@@ -522,10 +527,16 @@ impl GpuState {
                 if shaders.warp.is_none() { log::warn!("no warp shader found in {name}"); }
                 if shaders.comp.is_none() { log::warn!("no comp shader found in {name}"); }
                 let (w, h) = (self.config.width, self.config.height);
-                self.renderer =
+                let (renderer, compiled) =
                     Self::build_renderer(&self.device, &self.queue, w, h, self.config.format, &shaders);
-                log::info!("loaded {name}");
-                format!("{APP_NAME} — {name}")
+                self.renderer = renderer;
+                if compiled {
+                    log::info!("loaded {name}");
+                    format!("{APP_NAME} — {name}")
+                } else {
+                    log::warn!("{name}: preset shader did not compile — showing passthrough");
+                    format!("{APP_NAME} — {name}  ·  shader unsupported")
+                }
             }
             Err(e) => {
                 log::error!("{e} — keeping current preset");
