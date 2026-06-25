@@ -1,5 +1,7 @@
 # OjoDrop
 
+![OjoDrop running a MilkDrop preset](media/ojodrop-demo.gif)
+
  OjoDrop is a standalone, open-source (MIT) macOS app: a window where you drag
  a `.milk` MilkDrop preset (or a pre-converted `.json`) and it renders, live,
  reacting to your microphone. It is a native Rust + [wgpu](https://wgpu.rs)
