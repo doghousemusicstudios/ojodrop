@@ -109,7 +109,7 @@ hlsl2glslfork / glsl-optimizer / Mesa / MojoShader authors. See
 licensing verdict. 
 
 OjoDrop also exists because weed and other drugs were accessible to elder
-millenials and Gen-Xers went to college, and milkdrop was this fun thing
+millenials and Gen-Xers during college, and milkdrop was this fun thing
 everyone could just watch for hours and forget that their organic chemistry
 midterm was the next day.
 
