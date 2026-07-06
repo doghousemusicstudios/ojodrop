@@ -56,6 +56,15 @@ pub const FFT_SIZE: usize = NUM_SAMPS * 2;
 /// (`audioLevels.js`: `sampleRate = 44100`).
 pub const DEFAULT_SAMPLE_RATE: f32 = 44_100.0;
 
+#[inline]
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 /// Full set of normalized MilkDrop audio rails for one frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AudioLevels {
@@ -186,8 +195,8 @@ impl Fft {
         }
 
         for i in 0..self.samples_out {
-            out[i] =
-                self.equalize[i] * (self.real[i] * self.real[i] + self.imag[i] * self.imag[i]).sqrt();
+            out[i] = self.equalize[i]
+                * (self.real[i] * self.real[i] + self.imag[i] * self.imag[i]).sqrt();
         }
     }
 }
@@ -268,7 +277,9 @@ impl ButterchurnLevels {
     /// same range as Butterchurn's signed bytes.
     pub fn update_signed(&mut self, time_signed: &[f32], fps: f32, frame: u64) -> AudioLevels {
         let n = time_signed.len().min(FFT_SIZE);
-        self.time_signed[..n].copy_from_slice(&time_signed[..n]);
+        for (dst, &src) in self.time_signed[..n].iter_mut().zip(time_signed.iter()) {
+            *dst = finite_or_zero(src).clamp(-128.0, 127.0);
+        }
         for dst in self.time_signed.iter_mut().skip(n) {
             *dst = 0.0;
         }
@@ -293,12 +304,19 @@ impl ButterchurnLevels {
         for i in 0..3 {
             let mut acc = 0.0f32;
             for j in self.starts[i]..self.stops[i] {
-                acc += self.freq_array[j];
+                acc += finite_or_zero(self.freq_array[j]).max(0.0);
             }
             self.imm[i] = acc;
         }
 
         for i in 0..3 {
+            if !self.avg[i].is_finite() {
+                self.avg[i] = 1.0;
+            }
+            if !self.long_avg[i].is_finite() {
+                self.long_avg[i] = 1.0;
+            }
+
             // Short follower.
             let rate = if self.imm[i] > self.avg[i] { 0.2 } else { 0.5 };
             let rate = adjust_rate_to_fps(rate, 30.0, effective_fps);
@@ -313,8 +331,8 @@ impl ButterchurnLevels {
                 self.val[i] = 1.0;
                 self.att[i] = 1.0;
             } else {
-                self.val[i] = self.imm[i] / self.long_avg[i];
-                self.att[i] = self.avg[i] / self.long_avg[i];
+                self.val[i] = finite_or_zero(self.imm[i] / self.long_avg[i]);
+                self.att[i] = finite_or_zero(self.avg[i] / self.long_avg[i]);
             }
         }
 
@@ -357,6 +375,49 @@ mod tests {
         assert_eq!(stops, [6, 64, 255], "band stops");
     }
 
+    #[test]
+    fn signed_nan_input_does_not_poison_followers() {
+        let mut levels = ButterchurnLevels::new(DEFAULT_SAMPLE_RATE);
+        let mut signed = [0.0f32; FFT_SIZE];
+        signed[0] = f32::NAN;
+        signed[1] = f32::INFINITY;
+        signed[2] = -f32::INFINITY;
+
+        let poisoned = levels.update_signed(&signed, f32::NAN, 0);
+        for value in [
+            poisoned.bass,
+            poisoned.mid,
+            poisoned.treb,
+            poisoned.bass_att,
+            poisoned.mid_att,
+            poisoned.treb_att,
+            poisoned.vol,
+            poisoned.vol_att,
+        ] {
+            assert!(
+                value.is_finite(),
+                "poisoned output should be finite: {poisoned:?}"
+            );
+        }
+
+        let recovered = levels.update_signed(&[0.0; FFT_SIZE], 60.0, 1);
+        for value in [
+            recovered.bass,
+            recovered.mid,
+            recovered.treb,
+            recovered.bass_att,
+            recovered.mid_att,
+            recovered.treb_att,
+            recovered.vol,
+            recovered.vol_att,
+        ] {
+            assert!(
+                value.is_finite(),
+                "recovered output should be finite: {recovered:?}"
+            );
+        }
+    }
+
     /// Initial state: with no input the long average starts at 1.0 and decays;
     /// the very first frame (`imm = 0`, `longAvg = 1`) yields `att = avg/longAvg`.
     /// Reference (Butterchurn JS over silent bytes, fps=60):
@@ -365,7 +426,11 @@ mod tests {
     fn silent_warmup_attenuation_matches_reference() {
         let silent = [128u8; FFT_SIZE];
         let fps = 60.0;
-        let expected_att = [(0u64, 0.7453559637f32), (1, 0.5555555224), (5, 0.1714677513)];
+        let expected_att = [
+            (0u64, 0.7453559637f32),
+            (1, 0.5555555224),
+            (5, 0.1714677513),
+        ];
         for (frame, want) in expected_att {
             // The follower is stateful, so replay from frame 0 each time.
             let mut l = ButterchurnLevels::new(DEFAULT_SAMPLE_RATE);
@@ -395,8 +460,9 @@ mod tests {
         for frame in 0..400u64 {
             let mut bytes = [128u8; FFT_SIZE];
             for (i, b) in bytes.iter_mut().enumerate() {
-                let phase =
-                    (frame as f32 * NUM_SAMPS as f32 + i as f32) / sr * freq * std::f32::consts::TAU;
+                let phase = (frame as f32 * NUM_SAMPS as f32 + i as f32) / sr
+                    * freq
+                    * std::f32::consts::TAU;
                 let s = (phase.sin() * 100.0).round();
                 *b = (128.0 + s).clamp(0.0, 255.0) as u8;
             }

@@ -68,8 +68,14 @@ fn map_audio(f: &particle_audio::Features) -> AudioFrame {
 /// renderers bloom on the same beats — a fair, audio-driven fidelity comparison
 /// instead of the misleading silent-audio one (which leaves reactive presets black).
 struct SynthAudio {
-    bass: f32, mid: f32, treb: f32, vol: f32,
-    bass_att: f32, mid_att: f32, treb_att: f32, vol_att: f32,
+    bass: f32,
+    mid: f32,
+    treb: f32,
+    vol: f32,
+    bass_att: f32,
+    mid_att: f32,
+    treb_att: f32,
+    vol_att: f32,
     waveform: Vec<f32>, // 512, [-1,1]
     spectrum: Vec<f32>, // 512, [0,1]
 }
@@ -82,26 +88,52 @@ fn synth_audio(frame: u32, fps: f32) -> SynthAudio {
     let bp = beat - beat.floor(); // 0..1 within the beat
     let env = (-bp * 5.0).exp(); // kick pulse
     let env_s = (-bp * 2.0).exp(); // smoothed (attenuated band)
-    let hp = { let x = beat + 0.5; x - x.floor() };
+    let hp = {
+        let x = beat + 0.5;
+        x - x.floor()
+    };
     let hat = (-hp * 9.0).exp(); // off-beat hi-hat
-    // Punchy levels (bass peaks ~3.1) — deliberately HOTTER than Butterchurn's
-    // AGC-normalized reaction to the same beat. This vibrant, energetic look is the
-    // preferred aesthetic for the engine's output; we do NOT tone it down to match
-    // the reference's subtler response.
-    // Higher sustained floors (~1.0 = "average" energy) so presets that build content
-    // from mid/treb over the run aren't starved between beats — real music (the
-    // MilkDrop2 references) has broadband sustain, not just a bass-heavy pulse.
-    // Higher between-beat FLOORS (the constant terms) so feedback-buildup presets
-    // accumulate over the 0..90 run instead of starving between beats; env/hat
-    // coefficients trimmed so the on-beat PEAKS stay at the preferred ~3.1 bass
-    // (do not raise the peak — that only adds washed-white blow-outs).
-    let bass = 1.3 + 1.8 * env;
-    let mid = 1.3 + 0.7 * env + 0.45 * hat;
-    let treb = 1.15 + 1.25 * hat + 0.4 * env;
+                                 // Punchy levels (bass peaks ~3.1) — deliberately HOTTER than Butterchurn's
+                                 // AGC-normalized reaction to the same beat. This vibrant, energetic look is the
+                                 // preferred aesthetic for the engine's output; we do NOT tone it down to match
+                                 // the reference's subtler response.
+                                 // Higher sustained floors (~1.0 = "average" energy) so presets that build content
+                                 // from mid/treb over the run aren't starved between beats — real music (the
+                                 // MilkDrop2 references) has broadband sustain, not just a bass-heavy pulse.
+                                 // Higher between-beat FLOORS (the constant terms) so feedback-buildup presets
+                                 // accumulate over the 0..90 run instead of starving between beats; env/hat
+                                 // coefficients trimmed so the on-beat PEAKS stay at the preferred ~3.1 bass
+                                 // (do not raise the peak — that only adds washed-white blow-outs).
+    let synth_profile = std::env::var("MILKDROP_SYNTH_PROFILE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let (bass, mid, treb, bass_att, mid_att, treb_att) = match synth_profile.as_str() {
+        "balanced" => (
+            0.85 + 1.85 * env,
+            0.95 + 0.75 * env + 0.45 * hat,
+            0.85 + 1.25 * hat + 0.4 * env,
+            0.90 + 1.20 * env_s,
+            0.90 + 0.55 * env_s,
+            0.85 + 0.85 * env_s,
+        ),
+        "soft" | "subtle" => (
+            0.55 + 1.15 * env,
+            0.65 + 0.45 * env + 0.25 * hat,
+            0.55 + 0.75 * hat + 0.25 * env,
+            0.65 + 0.70 * env_s,
+            0.65 + 0.35 * env_s,
+            0.60 + 0.50 * env_s,
+        ),
+        _ => (
+            1.3 + 1.8 * env,
+            1.3 + 0.7 * env + 0.45 * hat,
+            1.15 + 1.25 * hat + 0.4 * env,
+            1.3 + 1.2 * env_s,
+            1.2 + 0.55 * env_s,
+            1.1 + 0.85 * env_s,
+        ),
+    };
     let vol = (bass + mid + treb) / 3.0;
-    let bass_att = 1.3 + 1.2 * env_s;
-    let mid_att = 1.2 + 0.55 * env_s;
-    let treb_att = 1.1 + 0.85 * env_s;
     let vol_att = (bass_att + mid_att + treb_att) / 3.0;
 
     let n = 512usize;
@@ -123,11 +155,25 @@ fn synth_audio(frame: u32, fps: f32) -> SynthAudio {
         let treb_band = (-(f - 0.7).abs() * 7.0).exp() * treb;
         spectrum[b] = ((bass_band + mid_band + treb_band) * 0.22).clamp(0.0, 1.0);
     }
-    SynthAudio { bass, mid, treb, vol, bass_att, mid_att, treb_att, vol_att, waveform, spectrum }
+    SynthAudio {
+        bass,
+        mid,
+        treb,
+        vol,
+        bass_att,
+        mid_att,
+        treb_att,
+        vol_att,
+        waveform,
+        spectrum,
+    }
 }
 
 fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
-    let (w, h) = (1280u32, 720u32);
+    let (w, h) = std::env::var("MILKDROP_HEADLESS_SIZE")
+        .ok()
+        .and_then(|s| parse_headless_size(&s))
+        .unwrap_or((1280u32, 720u32));
 
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -135,11 +181,13 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
         compatible_surface: None,
         force_fallback_adapter: false,
     }))
-    .or_else(|_| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::None,
-        compatible_surface: None,
-        force_fallback_adapter: true,
-    })))
+    .or_else(|_| {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::None,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+    })
     .expect("no wgpu adapter — no GPU/software renderer found");
     eprintln!("adapter: {:?}", adapter.get_info());
 
@@ -153,13 +201,17 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
     }))
     .expect("no device");
     let device = Arc::new(device);
-    let queue  = Arc::new(queue);
+    let queue = Arc::new(queue);
 
     // Offscreen RGBA target — comp pipeline writes here instead of a surface
     let fmt = wgpu::TextureFormat::Rgba8Unorm;
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("headless-target"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -172,12 +224,21 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
     // Parse preset (.milk = HLSL bodies / .json = Butterchurn GLSL bodies).
     // Headless/CLI path: fail loudly (a batch run wants a clear non-zero exit, not a
     // silent fallback). The windowed app path uses graceful fallback instead.
-    let shaders = load_preset(milk_path).unwrap_or_else(|e| panic!("{e}"));
+    let shaders = match load_preset(milk_path) {
+        Ok(shaders) => shaders,
+        Err(e) => {
+            eprintln!("load preset: {e}");
+            std::process::exit(2);
+        }
+    };
 
-    let mut rnd = MilkdropRenderer::new(
-        device.clone(), queue.clone(), w, h, fmt, &shaders,
-    )
-    .unwrap_or_else(|e| panic!("renderer: {e}"));
+    let mut rnd = match MilkdropRenderer::new(device.clone(), queue.clone(), w, h, fmt, &shaders) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln!("renderer: {e}");
+            std::process::exit(3);
+        }
+    };
 
     if synth {
         rnd.set_fixed_fps(30.0); // deterministic time so the beat model lands on frames
@@ -195,7 +256,9 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
             rnd.set_freq_spectrum(&a.spectrum);
         }
         rnd.render(&target_view);
-        if (i + 1) % 60 == 0 { eprint!("  frame {}/{frames}\r", i + 1); }
+        if (i + 1) % 60 == 0 {
+            eprint!("  frame {}/{frames}\r", i + 1);
+        }
     }
     // Flush and check for GPU errors before reading back
     device.poll(wgpu::PollType::wait_indefinitely()).ok();
@@ -226,7 +289,11 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
                 rows_per_image: Some(h),
             },
         },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
     );
     queue.submit(std::iter::once(enc.finish()));
 
@@ -255,6 +322,16 @@ fn run_headless(milk_path: &str, frames: u32, out_path: &str, synth: bool) {
     println!("Saved {out_path}  ({w}x{h})");
 }
 
+fn parse_headless_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value.split_once('x').or_else(|| value.split_once('X'))?;
+    let w = w.trim().parse::<u32>().ok()?;
+    let h = h.trim().parse::<u32>().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
 fn align256(n: u32) -> u32 {
     (n + 255) & !255
 }
@@ -272,11 +349,13 @@ fn run_anim(milk_path: &str, frames: u32, out_dir: &str) {
         compatible_surface: None,
         force_fallback_adapter: false,
     }))
-    .or_else(|_| pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::None,
-        compatible_surface: None,
-        force_fallback_adapter: true,
-    })))
+    .or_else(|_| {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::None,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+    })
     .expect("no wgpu adapter");
     eprintln!("adapter: {:?}", adapter.get_info());
 
@@ -290,12 +369,16 @@ fn run_anim(milk_path: &str, frames: u32, out_dir: &str) {
     }))
     .expect("no device");
     let device = Arc::new(device);
-    let queue  = Arc::new(queue);
+    let queue = Arc::new(queue);
 
     let fmt = wgpu::TextureFormat::Rgba8Unorm;
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("anim-target"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -305,10 +388,21 @@ fn run_anim(milk_path: &str, frames: u32, out_dir: &str) {
     });
     let target_view = target.create_view(&Default::default());
 
-    let shaders = load_preset(milk_path).unwrap_or_else(|e| panic!("{e}"));
+    let shaders = match load_preset(milk_path) {
+        Ok(shaders) => shaders,
+        Err(e) => {
+            eprintln!("load preset: {e}");
+            std::process::exit(2);
+        }
+    };
 
-    let mut rnd = MilkdropRenderer::new(device.clone(), queue.clone(), w, h, fmt, &shaders)
-        .unwrap_or_else(|e| panic!("renderer: {e}"));
+    let mut rnd = match MilkdropRenderer::new(device.clone(), queue.clone(), w, h, fmt, &shaders) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln!("renderer: {e}");
+            std::process::exit(3);
+        }
+    };
     rnd.set_fixed_fps(30.0); // deterministic time so synthetic audio animates
 
     std::fs::create_dir_all(out_dir).expect("create out dir");
@@ -336,7 +430,11 @@ fn run_anim(milk_path: &str, frames: u32, out_dir: &str) {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         queue.submit(std::iter::once(enc.finish()));
 
@@ -362,7 +460,9 @@ fn run_anim(milk_path: &str, frames: u32, out_dir: &str) {
         let mut writer = penc.write_header().expect("png header");
         writer.write_image_data(&pixels).expect("png data");
 
-        if (i + 1) % 30 == 0 { eprint!("  frame {}/{frames}\r", i + 1); }
+        if (i + 1) % 30 == 0 {
+            eprint!("  frame {}/{frames}\r", i + 1);
+        }
     }
     eprintln!("\nDone. {frames} frames in {out_dir}/");
 }
@@ -390,6 +490,7 @@ struct GpuState {
     queue: Arc<wgpu::Queue>,
     config: wgpu::SurfaceConfiguration,
     renderer: MilkdropRenderer,
+    active_shaders: MilkShaders,
     /// Live mic capture + DSP. None if no input device was available; the
     /// renderer then falls back to its synthetic audio. Must stay alive for
     /// capture to continue (cpal stops on drop).
@@ -412,18 +513,17 @@ impl GpuState {
         .expect("no adapter");
         log::info!("adapter: {:?}", adapter.get_info());
 
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("milk-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: adapter.limits(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-                experimental_features: Default::default(),
-            }))
-            .expect("no device");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("milk-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+            experimental_features: Default::default(),
+        }))
+        .expect("no device");
         let device = Arc::new(device);
-        let queue  = Arc::new(queue);
+        let queue = Arc::new(queue);
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -431,14 +531,27 @@ impl GpuState {
             .iter()
             .copied()
             .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+            .or_else(|| caps.formats.first().copied())
+            .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+            wgpu::PresentMode::Fifo
+        } else {
+            caps.present_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::PresentMode::Fifo)
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: w,
             height: h,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            present_mode,
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Opaque),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -453,8 +566,12 @@ impl GpuState {
                     log::error!("{e} — using passthrough fallback");
                     fallback_preset()
                 });
-                if s.warp.is_none() { log::warn!("no warp shader found in {p}"); }
-                if s.comp.is_none() { log::warn!("no comp shader found in {p}"); }
+                if s.warp.is_none() {
+                    log::warn!("no warp shader found in {p}");
+                }
+                if s.comp.is_none() {
+                    log::warn!("no comp shader found in {p}");
+                }
                 s
             }
             None => fallback_preset(),
@@ -463,10 +580,17 @@ impl GpuState {
 
         // Start live mic capture (prefer the room mic, not system loopback).
         let audio = match AudioEngine::with_config(
-            CaptureConfig { prefer_loopback: false }, 1.0,
+            CaptureConfig {
+                prefer_loopback: false,
+            },
+            1.0,
         ) {
             Ok(eng) => {
-                log::info!("audio: capturing '{}' @ {} Hz", eng.device_name(), eng.sample_rate());
+                log::info!(
+                    "audio: capturing '{}' @ {} Hz",
+                    eng.device_name(),
+                    eng.sample_rate()
+                );
                 Some(eng)
             }
             Err(e) => {
@@ -475,7 +599,15 @@ impl GpuState {
             }
         };
 
-        Self { surface, device, queue, config, renderer, audio }
+        Self {
+            surface,
+            device,
+            queue,
+            config,
+            renderer,
+            active_shaders: shaders,
+            audio,
+        }
     }
 
     /// Build a renderer for `shaders`, falling back to the passthrough preset on a
@@ -499,8 +631,9 @@ impl GpuState {
             Err(e) => {
                 log::error!("shader compile failed ({e}) — using passthrough fallback preset");
                 let fallback = fallback_preset();
-                let r = MilkdropRenderer::new(device.clone(), queue.clone(), w, h, format, &fallback)
-                    .unwrap_or_else(|e2| panic!("fallback renderer also failed: {e2}"));
+                let r =
+                    MilkdropRenderer::new(device.clone(), queue.clone(), w, h, format, &fallback)
+                        .unwrap_or_else(|e2| panic!("fallback renderer also failed: {e2}"));
                 (r, false)
             }
         }
@@ -524,12 +657,23 @@ impl GpuState {
         }
         match load_preset(path) {
             Ok(shaders) => {
-                if shaders.warp.is_none() { log::warn!("no warp shader found in {name}"); }
-                if shaders.comp.is_none() { log::warn!("no comp shader found in {name}"); }
+                if shaders.warp.is_none() {
+                    log::warn!("no warp shader found in {name}");
+                }
+                if shaders.comp.is_none() {
+                    log::warn!("no comp shader found in {name}");
+                }
                 let (w, h) = (self.config.width, self.config.height);
-                let (renderer, compiled) =
-                    Self::build_renderer(&self.device, &self.queue, w, h, self.config.format, &shaders);
+                let (renderer, compiled) = Self::build_renderer(
+                    &self.device,
+                    &self.queue,
+                    w,
+                    h,
+                    self.config.format,
+                    &shaders,
+                );
                 self.renderer = renderer;
+                self.active_shaders = shaders;
                 if compiled {
                     log::info!("loaded {name}");
                     format!("{APP_NAME} — {name}")
@@ -547,9 +691,10 @@ impl GpuState {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         let (w, h) = (size.width.max(1), size.height.max(1));
-        self.config.width  = w;
+        self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
+        self.renderer.resize(w, h);
     }
 
     fn render(&mut self) {
@@ -560,7 +705,10 @@ impl GpuState {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
-            other => { log::warn!("surface: {other:?}"); return; }
+            other => {
+                log::warn!("surface: {other:?}");
+                return;
+            }
         };
         // Pull the latest mic analysis and drive reactivity.
         if let Some(eng) = &self.audio {
@@ -584,7 +732,9 @@ impl GpuState {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() { return; }
+        if self.window.is_some() {
+            return;
+        }
         // Title reflects whether we boot into a preset or the idle empty-state.
         let title = match self.initial_path.as_deref() {
             Some(p) => {
@@ -602,15 +752,10 @@ impl ApplicationHandler for App {
         let win = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let state = GpuState::new(win.clone(), self.initial_path.as_deref());
         self.window = Some(win);
-        self.state  = Some(state);
+        self.state = Some(state);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. }
@@ -620,7 +765,9 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                if let Some(s) = &mut self.state { s.resize(size); }
+                if let Some(s) = &mut self.state {
+                    s.resize(size);
+                }
             }
             // Drag-and-drop: a hovered file previews intent in the title bar; the
             // actual drop loads it. Loading is crash-safe (see GpuState::load_path).
@@ -646,15 +793,21 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(s) = &mut self.state { s.render(); }
-                if let Some(w) = &self.window { w.request_redraw(); }
+                if let Some(s) = &mut self.state {
+                    s.render();
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(w) = &self.window { w.request_redraw(); }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 }
 
@@ -675,7 +828,11 @@ Built on the work of:
 License: MIT (see LICENSE). Bundled converter components keep their own
 permissive licenses (BSD-3 / zlib / MIT) — see THIRD_PARTY_NOTICES.md.
 Native .milk converter in this build: {}",
-        if particle_milkdrop::native_converter_available() { "yes" } else { "no (JSON-only)" }
+        if particle_milkdrop::native_converter_available() {
+            "yes"
+        } else {
+            "no (JSON-only)"
+        }
     );
 }
 
@@ -693,7 +850,8 @@ fn main() {
     if let Some(pos) = args.iter().position(|a| a == "--anim") {
         let frames: u32 = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(90);
         let out_dir = args.get(pos + 2).map(|s| s.as_str()).unwrap_or("frames");
-        let Some(milk_path) = args.iter()
+        let Some(milk_path) = args
+            .iter()
             .find(|a| a.ends_with(".milk") || a.ends_with(".json"))
             .map(|s| s.as_str())
         else {
@@ -706,14 +864,19 @@ fn main() {
 
     // Detect --headless FRAMES OUTPUT.png  [--synth-audio]
     if let Some(pos) = args.iter().position(|a| a == "--headless") {
-        let frames: u32 = args.get(pos + 1)
+        let frames: u32 = args
+            .get(pos + 1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
-        let out = args.get(pos + 2).map(|s| s.as_str()).unwrap_or("milkdrop.png");
+        let out = args
+            .get(pos + 2)
+            .map(|s| s.as_str())
+            .unwrap_or("milkdrop.png");
         // Opt-in manufactured beat audio (120 BPM) so audio-reactive presets bloom,
         // matching the Butterchurn oracle's identical synth model for a fair compare.
         let synth = args.iter().any(|a| a == "--synth-audio");
-        let Some(milk_path) = args.iter()
+        let Some(milk_path) = args
+            .iter()
             .find(|a| a.ends_with(".milk") || a.ends_with(".json"))
             .map(|s| s.as_str())
         else {
@@ -727,7 +890,8 @@ fn main() {
     // Windowed: an optional file arg boots straight into a preset; otherwise the
     // app opens in the idle "drop a file" empty-state. Presets then arrive by
     // drag-and-drop (WindowEvent::DroppedFile).
-    let initial_path = args.get(1)
+    let initial_path = args
+        .get(1)
         .filter(|a| a.ends_with(".milk") || a.ends_with(".json"))
         .cloned();
 
@@ -743,6 +907,10 @@ fn main() {
         );
     }
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = App { initial_path, window: None, state: None };
+    let mut app = App {
+        initial_path,
+        window: None,
+        state: None,
+    };
     event_loop.run_app(&mut app).expect("run");
 }

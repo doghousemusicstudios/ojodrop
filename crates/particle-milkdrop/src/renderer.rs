@@ -3,24 +3,64 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 use crate::equations::{EelProgram, EelState, Env, MegaBuf};
+use crate::parse_milk::{CustomWaveDef, MilkShaders, ShapeBaseVals};
+use crate::preprocess::{
+    fix_glsl_vector_types, glsl_milk_body_to_naga, glsl_milk_warp_body_to_naga,
+    hlsl_milk_body_to_naga, hlsl_milk_warp_body_to_naga, MILKDROP_SAMPLERS,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::preprocess::{
-    hlsl_milk_body_to_naga, hlsl_milk_warp_body_to_naga,
-    glsl_milk_body_to_naga, glsl_milk_warp_body_to_naga, fix_glsl_vector_types, MILKDROP_SAMPLERS,
-};
-use crate::parse_milk::{MilkShaders, ShapeBaseVals, CustomWaveDef};
 
 // ── Warp mesh constants ──────────────────────────────────────────────────────
 
 const GRID_W: u32 = 48;
 const GRID_H: u32 = 32;
+const GPU_TIME_WRAP_SECONDS: f64 = 65_536.0;
+const GPU_FRAME_WRAP: u64 = 1 << 24;
+
+fn deterministic_time_seconds(frame_idx: u64, time_per_frame: Option<f64>) -> Option<f64> {
+    time_per_frame.map(|dt| {
+        if dt.is_finite() && dt > 0.0 {
+            frame_idx as f64 * dt
+        } else {
+            0.0
+        }
+    })
+}
+
+fn shader_time_seconds(time_seconds: f64) -> f32 {
+    if time_seconds.is_finite() {
+        time_seconds.rem_euclid(GPU_TIME_WRAP_SECONDS) as f32
+    } else {
+        0.0
+    }
+}
+
+fn shader_frame_index(frame_idx: u64) -> f32 {
+    (frame_idx % GPU_FRAME_WRAP) as f32
+}
+
+fn shader_progress(time_seconds: f64) -> f32 {
+    if time_seconds.is_finite() {
+        (time_seconds.rem_euclid(30.0) / 30.0) as f32
+    } else {
+        0.0
+    }
+}
+
+fn finite_clamp(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct WarpVert {
-    pos:   [f32; 2], // NDC screen position
-    uv:    [f32; 2], // warped UV (sample coord) into the previous frame [0,1], DirectX-UV
+    pos: [f32; 2],   // NDC screen position
+    uv: [f32; 2],    // warped UV (sample coord) into the previous frame [0,1], DirectX-UV
     decay: [f32; 4], // per-vertex decay rgb (a unused = 1.0)
 }
 const _: () = assert!(std::mem::size_of::<WarpVert>() == 32);
@@ -28,58 +68,87 @@ const _: () = assert!(std::mem::size_of::<WarpVert>() == 32);
 // Per-frame warp base values (from MilkShaders), overridable by the per-frame EEL.
 #[derive(Copy, Clone)]
 struct WarpBase {
-    zoom: f32, zoomexp: f32, rot: f32, warp: f32,
-    cx: f32, cy: f32, dx: f32, dy: f32, sx: f32, sy: f32,
-    warpscale: f32, warpanimspeed: f32, decay: f32, wrap: bool,
+    zoom: f32,
+    zoomexp: f32,
+    rot: f32,
+    warp: f32,
+    cx: f32,
+    cy: f32,
+    dx: f32,
+    dy: f32,
+    sx: f32,
+    sy: f32,
+    warpscale: f32,
+    warpanimspeed: f32,
+    decay: f32,
+    wrap: bool,
 }
 
 // ── Custom-shape vertex (interleaved pos/color/uv) ───────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct ShapeVert {
-    pos:   [f32; 2],
+    pos: [f32; 2],
     color: [f32; 4],
-    uv:    [f32; 2],
+    uv: [f32; 2],
 }
 const _: () = assert!(std::mem::size_of::<ShapeVert>() == 32);
 
 // ── Border vertex (pos only; color via uniform) ──────────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct BorderVert { pos: [f32; 2] }
+struct BorderVert {
+    pos: [f32; 2],
+}
 
 // ── ShapeU uniform (textured flag) ───────────────────────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct ShapeU { textured: f32, _pad: [f32; 3] }
+struct ShapeU {
+    textured: f32,
+    _pad: [f32; 3],
+}
 
 // ── BorderU uniform (color + thick offset) ───────────────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct BorderU { color: [f32; 4], offset: [f32; 4] }
+struct BorderU {
+    color: [f32; 4],
+    offset: [f32; 4],
+}
 
 // ── Waveform vertex (pos + color) ────────────────────────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct WaveVert { pos: [f32; 2], color: [f32; 4] }
+struct WaveVert {
+    pos: [f32; 2],
+    color: [f32; 4],
+}
 const _: () = assert!(std::mem::size_of::<WaveVert>() == 24);
 
 // ── Motion-vector vertex (pos only; color via uniform) ───────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct MVVert { pos: [f32; 2] }
+struct MVVert {
+    pos: [f32; 2],
+}
 // maxX*maxY*2 verts (butterchurn caps the grid at 64x48, 2 verts per arrow).
 const MV_VERT_CAP: usize = 64 * 48 * 2;
 
 // ── MV color uniform (vec4) ──────────────────────────────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct MVColor { color: [f32; 4] }
+struct MVColor {
+    color: [f32; 4],
+}
 
 // ── Darken-center vertex (pos + color) ───────────────────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct DarkenVert { pos: [f32; 2], color: [f32; 4] }
+struct DarkenVert {
+    pos: [f32; 2],
+    color: [f32; 4],
+}
 const _: () = assert!(std::mem::size_of::<DarkenVert>() == 24);
 
 const SIDES_MAX: usize = 100;
@@ -88,29 +157,37 @@ const SHAPE_FILL_VERTS_MAX: usize = SIDES_MAX + 2;
 // Static fan index count = sides*3 for sides<=100 → 300.
 const SHAPE_FAN_IDX_MAX: usize = SIDES_MAX * 3;
 // Custom-shape fill geometry capacity (verts for ALL shapes×instances of a frame).
-const SHAPE_VERT_CAP: usize = 8192;
+// Some cream-of-the-crop presets use 512/1024-instanced shape arrays; the old 8k
+// cap skipped most of those fans and left otherwise-live presets nearly black.
+const SHAPE_VERT_CAP: usize = 65536;
 // Waveform vertex capacity (built-in + custom). 4 waves × ~1023 verts (512 samples,
 // line-strip) ≈ 4092 — right at the old 4096 cap, so the 4th wave of multi-wave
 // presets overflowed the upload and drew from a stale buffer tail.
 const WAVE_VERT_CAP: usize = 16384;
 // Border vertex capacity (per-frame across all shapes).
-const BORDER_VERT_CAP: usize = 4096;
+const BORDER_VERT_CAP: usize = 65536;
+const BORDER_THICK_LINE_PASSES: usize = 4;
+// Dynamic uniform slots for per-border color/thickness offsets. Four slots are
+// needed per thick border draw, so this comfortably covers multi-instance shapes.
+const BORDER_UNIFORM_SLOTS: usize = 32768;
+const WAVE_THICK_LINE_PASSES: usize = 4;
+const WAVE_THICK_DOT_PASSES: usize = 9;
 
 // Runtime state for one custom shape (base vals + per-frame program + var pool).
 struct ShapeRT {
     base: ShapeBaseVals,
     prog: Option<EelProgram>,
-    env:  Env,
+    env: Env,
     /// Per-pool megabuf (private) sharing the preset-wide gmegabuf.
     state: EelState,
 }
 
 // Runtime state for one custom waveform.
 struct WaveRT {
-    def:           CustomWaveDef,
+    def: CustomWaveDef,
     per_frame_prog: Option<EelProgram>,
     per_point_prog: Option<EelProgram>,
-    env:           Env,
+    env: Env,
     /// Per-pool megabuf (private) sharing the preset-wide gmegabuf.
     state: EelState,
 }
@@ -118,23 +195,23 @@ struct WaveRT {
 // One fill draw (a shape instance). base_vertex = vertex offset into shape_vert_buf.
 struct ShapeFillDraw {
     base_vertex: i32,
-    sides:       u32,   // index count = sides*3
-    additive:    bool,
+    sides: u32, // index count = sides*3
+    additive: bool,
 }
 // One border source (rim verts already appended to border_vert_buf).
 struct BorderDraw {
     start_vert: u32,
-    count:      u32,    // = sides+1
-    color:      [f32; 4],
-    thick:      bool,
+    count: u32, // = sides+1
+    color: [f32; 4],
+    thick: bool,
 }
 // One waveform draw record.
 struct WaveDraw {
     start_vert: u32,
-    count:      u32,
-    points:     bool,   // PointList vs LineStrip
-    additive:   bool,
-    thick:      bool,   // 4-pass thick offset expansion
+    count: u32,
+    points: bool, // PointList vs LineStrip
+    additive: bool,
+    thick: bool, // 4-pass thick offset expansion
 }
 
 fn build_warp_indices() -> Vec<u32> {
@@ -156,56 +233,56 @@ fn build_warp_indices() -> Vec<u32> {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct PerFrame {
-    texsize:          [f32; 4],  //   0 — (w, h, 1/w, 1/h)
-    aspect:           [f32; 4],  //  16 — (asp, 1/asp, 1, 1)
-    slow_roam_cos:    [f32; 4],  //  32
-    roam_cos:         [f32; 4],  //  48
-    slow_roam_sin:    [f32; 4],  //  64
-    roam_sin:         [f32; 4],  //  80
-    rand_frame:       [f32; 4],  //  96
-    rand_preset:      [f32; 4],  // 112
-    _qa:              [f32; 4],  // 128 — q1..q4
-    _qb:              [f32; 4],  // 144 — q5..q8
-    _qc:              [f32; 4],  // 160
-    _qd:              [f32; 4],  // 176
-    _qe:              [f32; 4],  // 192
-    _qf:              [f32; 4],  // 208
-    _qg:              [f32; 4],  // 224
-    _qh:              [f32; 4],  // 240
-    time:             f32,       // 256
-    fps:              f32,       // 260
-    frame:            f32,       // 264
-    progress:         f32,       // 268
-    bass:             f32,       // 272
-    mid:              f32,       // 276
-    treb:             f32,       // 280
-    vol:              f32,       // 284
-    bass_att:         f32,       // 288
-    mid_att:          f32,       // 292
-    treb_att:         f32,       // 296
-    vol_att:          f32,       // 300
-    f_shader:         f32,       // 304
-    gamma_adj:        f32,       // 308
-    echo_zoom:        f32,       // 312
-    echo_alpha:       f32,       // 316
-    echo_orientation: f32,       // 320
-    blur1_min:        f32,       // 324
-    blur1_max:        f32,       // 328
-    blur2_min:        f32,       // 332
-    blur2_max:        f32,       // 336
-    blur3_min:        f32,       // 340
-    blur3_max:        f32,       // 344
-    scale1:           f32,       // 348
-    scale2:           f32,       // 352
-    scale3:           f32,       // 356
-    bias1:            f32,       // 360
-    bias2:            f32,       // 364
-    bias3:            f32,       // 368
-    brighten:         f32,       // 372 — comp post-FX flags (bBrighten/bDarken/bSolarize/bInvert)
-    darken:           f32,       // 376
-    solarize:         f32,       // 380
-    invert:           f32,       // 384
-    _pad:             [f32; 3],  // 388 → pad to 400
+    texsize: [f32; 4],       //   0 — (w, h, 1/w, 1/h)
+    aspect: [f32; 4],        //  16 — (aspectx, aspecty, invAspectx, invAspecty)
+    slow_roam_cos: [f32; 4], //  32
+    roam_cos: [f32; 4],      //  48
+    slow_roam_sin: [f32; 4], //  64
+    roam_sin: [f32; 4],      //  80
+    rand_frame: [f32; 4],    //  96
+    rand_preset: [f32; 4],   // 112
+    _qa: [f32; 4],           // 128 — q1..q4
+    _qb: [f32; 4],           // 144 — q5..q8
+    _qc: [f32; 4],           // 160
+    _qd: [f32; 4],           // 176
+    _qe: [f32; 4],           // 192
+    _qf: [f32; 4],           // 208
+    _qg: [f32; 4],           // 224
+    _qh: [f32; 4],           // 240
+    time: f32,               // 256
+    fps: f32,                // 260
+    frame: f32,              // 264
+    progress: f32,           // 268
+    bass: f32,               // 272
+    mid: f32,                // 276
+    treb: f32,               // 280
+    vol: f32,                // 284
+    bass_att: f32,           // 288
+    mid_att: f32,            // 292
+    treb_att: f32,           // 296
+    vol_att: f32,            // 300
+    f_shader: f32,           // 304
+    gamma_adj: f32,          // 308
+    echo_zoom: f32,          // 312
+    echo_alpha: f32,         // 316
+    echo_orientation: f32,   // 320
+    blur1_min: f32,          // 324
+    blur1_max: f32,          // 328
+    blur2_min: f32,          // 332
+    blur2_max: f32,          // 336
+    blur3_min: f32,          // 340
+    blur3_max: f32,          // 344
+    scale1: f32,             // 348
+    scale2: f32,             // 352
+    scale3: f32,             // 356
+    bias1: f32,              // 360
+    bias2: f32,              // 364
+    bias3: f32,              // 368
+    brighten: f32,           // 372 — comp post-FX flags (bBrighten/bDarken/bSolarize/bInvert)
+    darken: f32,             // 376
+    solarize: f32,           // 380
+    invert: f32,             // 384
+    _pad: [f32; 3],          // 388 → pad to 400
 }
 const _: () = assert!(std::mem::size_of::<PerFrame>() == 400);
 
@@ -214,14 +291,31 @@ const _: () = assert!(std::mem::size_of::<PerFrame>() == 400);
 fn make_tex2d(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    w: u32, h: u32,
+    w: u32,
+    h: u32,
     usage: wgpu::TextureUsages,
+    data: Option<&[u8]>,
+) -> wgpu::Texture {
+    make_tex2d_with_mips(device, queue, w, h, usage, 1, data)
+}
+
+fn make_tex2d_with_mips(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    w: u32,
+    h: u32,
+    usage: wgpu::TextureUsages,
+    mip_level_count: u32,
     data: Option<&[u8]>,
 ) -> wgpu::Texture {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1,
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
@@ -237,21 +331,54 @@ fn make_tex2d(
                 bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
     }
     tex
 }
 
-fn make_tex3d(
+fn mip_level_count_2d(w: u32, h: u32) -> u32 {
+    let max_dim = w.max(h).max(1);
+    u32::BITS - max_dim.leading_zeros()
+}
+
+fn mip_level_view(texture: &wgpu::Texture, level: u32) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        base_mip_level: level,
+        mip_level_count: Some(1),
+        ..Default::default()
+    })
+}
+
+fn mip_chain_views(texture: &wgpu::Texture, levels: u32) -> Vec<wgpu::TextureView> {
+    (0..levels)
+        .map(|level| mip_level_view(texture, level))
+        .collect()
+}
+
+fn generate_mip_chain(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    s: u32,
-    data: &[u8],
-) -> wgpu::Texture {
+    blitter: &wgpu::util::TextureBlitter,
+    encoder: &mut wgpu::CommandEncoder,
+    views: &[wgpu::TextureView],
+) {
+    for level in 1..views.len() {
+        blitter.copy(device, encoder, &views[level - 1], &views[level]);
+    }
+}
+
+fn make_tex3d(device: &wgpu::Device, queue: &wgpu::Queue, s: u32, data: &[u8]) -> wgpu::Texture {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: s, height: s, depth_or_array_layers: s },
+        size: wgpu::Extent3d {
+            width: s,
+            height: s,
+            depth_or_array_layers: s,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D3,
@@ -267,7 +394,11 @@ fn make_tex3d(
             bytes_per_row: Some(s * 4),
             rows_per_image: Some(s),
         },
-        wgpu::Extent3d { width: s, height: s, depth_or_array_layers: s },
+        wgpu::Extent3d {
+            width: s,
+            height: s,
+            depth_or_array_layers: s,
+        },
     );
     tex
 }
@@ -283,7 +414,9 @@ fn preset_hue_seed(s: &str) -> [f32; 4] {
     }
     let mut out = [0.0f32; 4];
     for slot in out.iter_mut() {
-        h ^= h << 13; h ^= h >> 7; h ^= h << 17; // xorshift64
+        h ^= h << 13;
+        h ^= h >> 7;
+        h ^= h << 17; // xorshift64
         *slot = ((h >> 40) as f32) / ((1u64 << 24) as f32); // → [0,1)
     }
     out
@@ -293,8 +426,15 @@ fn noise_bytes(n: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 4);
     let mut x: u32 = 0xdeadbeef;
     for _ in 0..n {
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-        let r = ((x & 0xff) as u8, ((x >> 8) & 0xff) as u8, ((x >> 16) & 0xff) as u8, 255u8);
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let r = (
+            (x & 0xff) as u8,
+            ((x >> 8) & 0xff) as u8,
+            ((x >> 16) & 0xff) as u8,
+            255u8,
+        );
         v.extend_from_slice(&[r.0, r.1, r.2, r.3]);
     }
     v
@@ -304,7 +444,9 @@ fn noise_bytes_scaled(n: usize, max_val: u8) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 4);
     let mut x: u32 = 0xcafebabe;
     for _ in 0..n {
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
         let scale = |b: u8| ((b as u32 * max_val as u32) / 255) as u8;
         v.push(scale((x & 0xff) as u8));
         v.push(scale(((x >> 8) & 0xff) as u8));
@@ -481,7 +623,10 @@ fn create_noise_vol_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f32)
                         let y0 = rd4(&buf, ((base_y - zoom) % n) * words_per_line + base_z + x);
                         let y1 = rd4(&buf, (base_y % n) * words_per_line + base_z + x);
                         let y2 = rd4(&buf, ((base_y + zoom) % n) * words_per_line + base_z + x);
-                        let y3 = rd4(&buf, ((base_y + zoom * 2) % n) * words_per_line + base_z + x);
+                        let y3 = rd4(
+                            &buf,
+                            ((base_y + zoom * 2) % n) * words_per_line + base_z + x,
+                        );
                         let t = (y % zoom) as f32 / zoom as f32;
                         let r = dw_cubic(&y0, &y1, &y2, &y3, t);
                         let dst = (z * words_per_slice + y * words_per_line + x) * 4;
@@ -502,7 +647,10 @@ fn create_noise_vol_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f32)
                         let y0 = rd4(&buf, ((base_z - zoom) % n) * words_per_slice + base_y + x);
                         let y1 = rd4(&buf, (base_z % n) * words_per_slice + base_y + x);
                         let y2 = rd4(&buf, ((base_z + zoom) % n) * words_per_slice + base_y + x);
-                        let y3 = rd4(&buf, ((base_z + zoom * 2) % n) * words_per_slice + base_y + x);
+                        let y3 = rd4(
+                            &buf,
+                            ((base_z + zoom * 2) % n) * words_per_slice + base_y + x,
+                        );
                         let t = (y % zoom) as f32 / zoom as f32; // QUIRK: y, not z
                         let r = dw_cubic(&y0, &y1, &y2, &y3, t);
                         let dst = (z * words_per_slice + y * words_per_line + x) * 4;
@@ -519,9 +667,10 @@ fn create_noise_vol_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f32)
 // ----- bind group layout helpers --------------------------------------------
 
 fn sampler_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let mut entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::with_capacity(28);
+    let mut entries: Vec<wgpu::BindGroupLayoutEntry> =
+        Vec::with_capacity(MILKDROP_SAMPLERS.len() * 2);
     for (i, name) in MILKDROP_SAMPLERS.iter().enumerate() {
-        let tex_bind  = (i * 2) as u32;
+        let tex_bind = (i * 2) as u32;
         let samp_bind = tex_bind + 1;
         let dim = if name.contains("vol") {
             wgpu::TextureViewDimension::D3
@@ -552,7 +701,7 @@ fn sampler_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 }
 
 fn perframe_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let ubo_binding = (MILKDROP_SAMPLERS.len() * 2) as u32; // = 28
+    let ubo_binding = (MILKDROP_SAMPLERS.len() * 2) as u32;
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("perframe-bgl"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -610,7 +759,7 @@ fn build_sampler_bg(
     blur1_view: &wgpu::TextureView,
     blur2_view: &wgpu::TextureView,
     blur3_view: &wgpu::TextureView,
-    noise2d_view: &wgpu::TextureView, // placeholder for fw/pw/pc slots (2/6/8)
+    _noise2d_view: &wgpu::TextureView,
     noise_lq_view: &wgpu::TextureView,
     noise_mq_view: &wgpu::TextureView,
     noise_hq_view: &wgpu::TextureView,
@@ -619,57 +768,43 @@ fn build_sampler_bg(
     noisevol_hq_view: &wgpu::TextureView,
     samp: &wgpu::Sampler,
     samp_clamp: &wgpu::Sampler,
+    samp_point: &wgpu::Sampler,
+    samp_point_clamp: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     use wgpu::{BindGroupEntry, BindingResource};
+    let mut entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(MILKDROP_SAMPLERS.len() * 2);
+    for (i, name) in MILKDROP_SAMPLERS.iter().enumerate() {
+        let (view, sampler) = match *name {
+            "sampler_main" | "sampler_fw_main" => (main_view, samp),
+            "sampler_fc_main" => (main_view, samp_clamp),
+            "sampler_pw_main" => (main_view, samp_point),
+            "sampler_pc_main" => (main_view, samp_point_clamp),
+            "sampler_blur1" => (blur1_view, samp),
+            "sampler_blur2" => (blur2_view, samp),
+            "sampler_blur3" => (blur3_view, samp),
+            "sampler_noise_lq" => (noise_lq_view, samp),
+            "sampler_noise_lq_lite" | "sampler_noise_hq_lite" => (noise_lite_view, samp),
+            "sampler_noise_mq" => (noise_mq_view, samp),
+            "sampler_noise_hq" => (noise_hq_view, samp),
+            "sampler_pw_noise_lq" => (noise_lq_view, samp_point),
+            "sampler_noisevol_lq" => (noisevol_lq_view, samp),
+            "sampler_noisevol_hq" => (noisevol_hq_view, samp),
+            _ => (_noise2d_view, samp),
+        };
+        let tex_bind = (i * 2) as u32;
+        entries.push(BindGroupEntry {
+            binding: tex_bind,
+            resource: BindingResource::TextureView(view),
+        });
+        entries.push(BindGroupEntry {
+            binding: tex_bind + 1,
+            resource: BindingResource::Sampler(sampler),
+        });
+    }
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: bgl,
-        entries: &[
-            // 0,1  sampler_main
-            BindGroupEntry { binding:  0, resource: BindingResource::TextureView(main_view) },
-            BindGroupEntry { binding:  1, resource: BindingResource::Sampler(samp) },
-            // 2,3  sampler_fw_main (placeholder)
-            BindGroupEntry { binding:  2, resource: BindingResource::TextureView(noise2d_view) },
-            BindGroupEntry { binding:  3, resource: BindingResource::Sampler(samp) },
-            // 4,5  sampler_fc_main → "force clamp": ALWAYS ClampToEdge (MilkDrop/Butterchurn).
-            // The parade warp samples this without frac(), so Repeat here wraps opposite-edge
-            // content into the border every frame → the vertical seam streaks. Clamp fixes it.
-            BindGroupEntry { binding:  4, resource: BindingResource::TextureView(main_view) },
-            BindGroupEntry { binding:  5, resource: BindingResource::Sampler(samp_clamp) },
-            // 6,7  sampler_pw_main (placeholder)
-            BindGroupEntry { binding:  6, resource: BindingResource::TextureView(noise2d_view) },
-            BindGroupEntry { binding:  7, resource: BindingResource::Sampler(samp) },
-            // 8,9  sampler_pc_main (placeholder) — "force clamp" → ClampToEdge, like fc.
-            BindGroupEntry { binding:  8, resource: BindingResource::TextureView(noise2d_view) },
-            BindGroupEntry { binding:  9, resource: BindingResource::Sampler(samp_clamp) },
-            // 10,11 sampler_blur1
-            BindGroupEntry { binding: 10, resource: BindingResource::TextureView(blur1_view) },
-            BindGroupEntry { binding: 11, resource: BindingResource::Sampler(samp) },
-            // 12,13 sampler_blur2
-            BindGroupEntry { binding: 12, resource: BindingResource::TextureView(blur2_view) },
-            BindGroupEntry { binding: 13, resource: BindingResource::Sampler(samp) },
-            // 14,15 sampler_blur3
-            BindGroupEntry { binding: 14, resource: BindingResource::TextureView(blur3_view) },
-            BindGroupEntry { binding: 15, resource: BindingResource::Sampler(samp) },
-            // 16,17 noise_lq (256² zoom1)
-            BindGroupEntry { binding: 16, resource: BindingResource::TextureView(noise_lq_view) },
-            BindGroupEntry { binding: 17, resource: BindingResource::Sampler(samp) },
-            // 18,19 noise_mq (256² zoom4)
-            BindGroupEntry { binding: 18, resource: BindingResource::TextureView(noise_mq_view) },
-            BindGroupEntry { binding: 19, resource: BindingResource::Sampler(samp) },
-            // 20,21 noise_hq (256² zoom8)
-            BindGroupEntry { binding: 20, resource: BindingResource::TextureView(noise_hq_view) },
-            BindGroupEntry { binding: 21, resource: BindingResource::Sampler(samp) },
-            // 22,23 noise_hq_lite / noise_lq_lite (32² zoom1)
-            BindGroupEntry { binding: 22, resource: BindingResource::TextureView(noise_lite_view) },
-            BindGroupEntry { binding: 23, resource: BindingResource::Sampler(samp) },
-            // 24,25 noisevol_lq (32³ zoom1, 3D)
-            BindGroupEntry { binding: 24, resource: BindingResource::TextureView(noisevol_lq_view) },
-            BindGroupEntry { binding: 25, resource: BindingResource::Sampler(samp) },
-            // 26,27 noisevol_hq (32³ zoom4, 3D)
-            BindGroupEntry { binding: 26, resource: BindingResource::TextureView(noisevol_hq_view) },
-            BindGroupEntry { binding: 27, resource: BindingResource::Sampler(samp) },
-        ],
+        entries: &entries,
     })
 }
 
@@ -693,9 +828,7 @@ pub fn compile_glsl(glsl: &str) -> Result<String, String> {
         stage: naga::ShaderStage::Fragment,
         defines: Default::default(),
     };
-    let module = parser
-        .parse(&opts, glsl)
-        .map_err(|e| format!("{e:?}"))?;
+    let module = parser.parse(&opts, glsl).map_err(|e| format!("{e:?}"))?;
     let info = Validator::new(ValidationFlags::all(), Capabilities::all())
         .validate(&module)
         .map_err(|e| {
@@ -716,6 +849,79 @@ pub fn compile_glsl(glsl: &str) -> Result<String, String> {
     Ok(wgsl)
 }
 
+#[derive(Clone, Debug)]
+pub struct CompiledMilkdropShaderBodies {
+    pub warp_wgsl: String,
+    pub warp_custom_wgsl: String,
+    pub comp_wgsl: String,
+}
+
+pub fn compile_milkdrop_shader_bodies(
+    shaders: &MilkShaders,
+) -> Result<CompiledMilkdropShaderBodies, String> {
+    compile_milkdrop_shader_bodies_from_parts(
+        shaders.shaders_glsl,
+        shaders.warp.as_deref(),
+        shaders.comp.as_deref(),
+    )
+}
+
+pub fn compile_milkdrop_shader_bodies_from_parts(
+    shaders_glsl: bool,
+    warp: Option<&str>,
+    comp: Option<&str>,
+) -> Result<CompiledMilkdropShaderBodies, String> {
+    // Compile warp/comp shaders. Fallback body passes through sampler_main.
+    // The legacy fullscreen warp FS (quad VS) is retained only as a dead
+    // fallback; the live custom-warp path uses warp_custom_wgsl (mesh VS).
+    let warp_default = "ret = GetMain(uv);";
+    let comp_default = "float _eh = mod(echo_orientation, 2.0); \
+             float _ex = (_eh != 0.0) ? -1.0 : 1.0; \
+             float _ey = (echo_orientation >= 2.0) ? -1.0 : 1.0; \
+             vec2 uv_echo = ((uv - 0.5) * (1.0 / echo_zoom) * vec2(_ex, _ey)) + 0.5; \
+             ret = mix(GetMain(uv), GetMain(uv_echo), echo_alpha); \
+             ret = ret * gammaAdj; \
+             if (fShader >= 1.0) ret = ret * hue_shader; \
+             else if (fShader > 0.001) ret = mix(ret, ret * hue_shader, fShader); \
+             if (brighten != 0.0) ret = sqrt(ret); \
+             if (darken   != 0.0) ret = ret * ret; \
+             if (solarize != 0.0) ret = ret * (1.0 - ret) * 4.0; \
+             if (invert   != 0.0) ret = 1.0 - ret;";
+
+    // shaders_glsl path (Butterchurn converted-JSON): the custom warp/comp
+    // bodies are already GLSL, so compile them via the GLSL-body path.
+    let warp_legacy_glsl = match (shaders_glsl, warp) {
+        (true, Some(body)) => glsl_milk_body_to_naga(body),
+        _ => hlsl_milk_body_to_naga(warp.unwrap_or(warp_default)),
+    };
+    let warp_custom_glsl = match (shaders_glsl, warp) {
+        (true, Some(body)) => glsl_milk_warp_body_to_naga(body),
+        _ => hlsl_milk_warp_body_to_naga(warp.unwrap_or(warp_default)),
+    };
+    let comp_glsl = match (shaders_glsl, comp) {
+        (true, Some(body)) => glsl_milk_body_to_naga(body),
+        _ => hlsl_milk_body_to_naga(comp.unwrap_or(comp_default)),
+    };
+
+    if std::env::var("MILKDROP_DUMP_GLSL").is_ok() {
+        eprintln!("==== legacy warp GLSL ====\n{warp_legacy_glsl}\n==== end legacy warp ====");
+        eprintln!("==== custom warp GLSL ====\n{warp_custom_glsl}\n==== end custom warp ====");
+        eprintln!("==== comp GLSL ====\n{comp_glsl}\n==== end comp ====");
+    }
+    let warp_wgsl = compile_glsl(&warp_legacy_glsl)?;
+    let warp_custom_wgsl = compile_glsl(&warp_custom_glsl)?;
+    let comp_wgsl = compile_glsl(&comp_glsl)?;
+    if std::env::var("MILKDROP_DUMP_WARP_WGSL").is_ok() {
+        eprintln!("==== custom warp WGSL (naga) ====\n{warp_custom_wgsl}\n==== end warp WGSL ====");
+    }
+
+    Ok(CompiledMilkdropShaderBodies {
+        warp_wgsl,
+        warp_custom_wgsl,
+        comp_wgsl,
+    })
+}
+
 // compute_warp_verts is now a method on MilkdropRenderer (see impl block) — it
 // runs the per_pixel EEL program per vertex and composes the butterchurn warped UV.
 
@@ -723,7 +929,7 @@ pub fn compile_glsl(glsl: &str) -> Result<String, String> {
 
 pub struct MilkdropRenderer {
     device: Arc<wgpu::Device>,
-    queue:  Arc<wgpu::Queue>,
+    queue: Arc<wgpu::Queue>,
 
     // which warp/comp path to use
     has_custom_warp: bool,
@@ -734,13 +940,22 @@ pub struct MilkdropRenderer {
     rand_preset: [f32; 4],
 
     // ping-pong feedback textures (both RGBA8, same size as render)
-    tex_a:      wgpu::Texture,
-    tex_b:      wgpu::Texture,
-    view_a:     wgpu::TextureView,
-    view_b:     wgpu::TextureView,
+    tex_a: wgpu::Texture,
+    tex_b: wgpu::Texture,
+    // level-0 render-attachment views for feedback writes
+    view_a: wgpu::TextureView,
+    view_b: wgpu::TextureView,
+    // all-mip sampling views for shader feedback reads
+    #[allow(dead_code)]
+    view_a_sample: wgpu::TextureView,
+    #[allow(dead_code)]
+    view_b_sample: wgpu::TextureView,
+    feedback_mips_a: Vec<wgpu::TextureView>,
+    feedback_mips_b: Vec<wgpu::TextureView>,
+    feedback_mip_blitter: wgpu::util::TextureBlitter,
     write_to_a: bool, // true → write_to_a, read from b
 
-    // blur textures (half-res, quarter-res, eighth-res)
+    // blur textures and horizontal-pass intermediates.
     blur1: wgpu::Texture,
     blur2: wgpu::Texture,
     blur3: wgpu::Texture,
@@ -756,24 +971,40 @@ pub struct MilkdropRenderer {
     view_btemp3: wgpu::TextureView,
 
     // noise textures (Butterchurn-faithful; kept alive — views borrowed by bind groups)
-    #[allow(dead_code)] noise2d:      wgpu::Texture, // placeholder for fw/pw/pc slots
-    #[allow(dead_code)] noise_lq:     wgpu::Texture,
-    #[allow(dead_code)] noise_mq:     wgpu::Texture,
-    #[allow(dead_code)] noise_hq:     wgpu::Texture,
-    #[allow(dead_code)] noise_lite:   wgpu::Texture,
-    #[allow(dead_code)] noisevol_lq:  wgpu::Texture,
-    #[allow(dead_code)] noisevol_hq:  wgpu::Texture,
-    #[allow(dead_code)] view_noise2d:      wgpu::TextureView,
-    #[allow(dead_code)] view_noise_lq:     wgpu::TextureView,
-    #[allow(dead_code)] view_noise_mq:     wgpu::TextureView,
-    #[allow(dead_code)] view_noise_hq:     wgpu::TextureView,
-    #[allow(dead_code)] view_noise_lite:   wgpu::TextureView,
-    #[allow(dead_code)] view_noisevol_lq:  wgpu::TextureView,
-    #[allow(dead_code)] view_noisevol_hq:  wgpu::TextureView,
+    #[allow(dead_code)]
+    noise2d: wgpu::Texture, // placeholder for fw/pw/pc slots
+    #[allow(dead_code)]
+    noise_lq: wgpu::Texture,
+    #[allow(dead_code)]
+    noise_mq: wgpu::Texture,
+    #[allow(dead_code)]
+    noise_hq: wgpu::Texture,
+    #[allow(dead_code)]
+    noise_lite: wgpu::Texture,
+    #[allow(dead_code)]
+    noisevol_lq: wgpu::Texture,
+    #[allow(dead_code)]
+    noisevol_hq: wgpu::Texture,
+    #[allow(dead_code)]
+    view_noise2d: wgpu::TextureView,
+    #[allow(dead_code)]
+    view_noise_lq: wgpu::TextureView,
+    #[allow(dead_code)]
+    view_noise_mq: wgpu::TextureView,
+    #[allow(dead_code)]
+    view_noise_hq: wgpu::TextureView,
+    #[allow(dead_code)]
+    view_noise_lite: wgpu::TextureView,
+    #[allow(dead_code)]
+    view_noisevol_lq: wgpu::TextureView,
+    #[allow(dead_code)]
+    view_noisevol_hq: wgpu::TextureView,
 
     // samplers
     linear_samp: wgpu::Sampler,
     clamp_samp: wgpu::Sampler,
+    point_samp: wgpu::Sampler,
+    point_clamp_samp: wgpu::Sampler,
 
     // UBO
     perframe_buf: wgpu::Buffer,
@@ -791,20 +1022,23 @@ pub struct MilkdropRenderer {
     blur_h_pipeline: wgpu::RenderPipeline,
     blur_v_pipeline: wgpu::RenderPipeline,
     // FXAA output pass: COMP → comp_view (offscreen Rgba8Unorm) → FXAA → swapchain.
-    #[allow(dead_code)] comp_tex: wgpu::Texture, // kept alive; comp_view borrows it
+    #[allow(dead_code)]
+    comp_tex: wgpu::Texture, // kept alive; comp_view borrows it
     comp_view: wgpu::TextureView,
     output_pipeline: wgpu::RenderPipeline,
-    #[allow(dead_code)] fxaa_bgl: wgpu::BindGroupLayout,
-    #[allow(dead_code)] fxaa_ubo: wgpu::Buffer,
+    #[allow(dead_code)]
+    fxaa_bgl: wgpu::BindGroupLayout,
+    #[allow(dead_code)]
+    fxaa_ubo: wgpu::Buffer,
     fxaa_bg: wgpu::BindGroup,
     // standard warp mesh (used when no custom warp shader)
     warp_mesh_pipeline: wgpu::RenderPipeline,
-    warp_mesh_bg_a:     wgpu::BindGroup, // reads from tex_a
-    warp_mesh_bg_b:     wgpu::BindGroup, // reads from tex_b
-    warp_mesh_bgl:      wgpu::BindGroupLayout,
-    warp_vert_buf:      wgpu::Buffer,    // updated per frame
-    warp_idx_buf:       wgpu::Buffer,    // static
-    warp_idx_count:     u32,
+    warp_mesh_bg_a: wgpu::BindGroup, // reads from tex_a
+    warp_mesh_bg_b: wgpu::BindGroup, // reads from tex_b
+    warp_mesh_bgl: wgpu::BindGroupLayout,
+    warp_vert_buf: wgpu::Buffer, // updated per frame
+    warp_idx_buf: wgpu::Buffer,  // static
+    warp_idx_count: u32,
 
     // bind group layouts
     sampler_bgl: wgpu::BindGroupLayout,
@@ -830,30 +1064,30 @@ pub struct MilkdropRenderer {
 
     // EEL2 per-frame equations
     eel_program: Option<EelProgram>,
-    eel_env:     Env,
+    eel_env: Env,
     /// Per-frame megabuf pool (private) + shared preset-wide gmegabuf handle.
-    eel_state:   EelState,
+    eel_state: EelState,
     /// Preset-wide gmegabuf shared by all pools (per-frame/per-pixel/shape/wave).
     #[allow(dead_code)]
-    gmegabuf:    Rc<RefCell<MegaBuf>>,
+    gmegabuf: Rc<RefCell<MegaBuf>>,
     /// q1..q32 post-init snapshot — re-applied at the top of every frame so
     /// accumulator-q presets don't drift (Butterchurn's per-frame q reset).
-    q_init:      Vec<(String, f64)>,
+    q_init: Vec<(String, f64)>,
 
     // Per-vertex warp (per_pixel) program + per-frame warp base values.
     per_pixel_prog: Option<EelProgram>,
-    base_warp:      WarpBase,
+    base_warp: WarpBase,
     /// Scratch EEL env reused across warp vertices (avoids per-vertex alloc).
-    warp_env:       Env,
+    warp_env: Env,
     /// Per-pixel megabuf pool (private) sharing the preset-wide gmegabuf.
-    warp_state:     EelState,
+    warp_state: EelState,
 
     // frame state
-    frame_idx: u32,
+    frame_idx: u64,
     start: std::time::Instant,
     /// When Some(dt), time advances by `dt` seconds per rendered frame instead
     /// of using the wall clock. Used for deterministic offscreen animation export.
-    time_per_frame: Option<f32>,
+    time_per_frame: Option<f64>,
     /// Live audio reactivity. When Some([bass, mid, treb, vol]), these drive the
     /// per-frame audio uniforms instead of the synthetic sine-wave fallback.
     audio: Option<[f32; 4]>,
@@ -864,20 +1098,20 @@ pub struct MilkdropRenderer {
     /// Butterchurn-shaped 512-bin FFT magnitude array for `bSpectrum` custom
     /// waveforms. Empty when no live audio (built-in/synthetic path uses time data).
     freq_spectrum: Vec<f32>,
-    pub width:  u32,
+    pub width: u32,
     pub height: u32,
 
     pub surface_format: wgpu::TextureFormat,
 
     // ── Custom shapes ────────────────────────────────────────────────────────
     shapes: Vec<ShapeRT>,
-    shapes_fill_pipeline_alpha:    wgpu::RenderPipeline,
+    shapes_fill_pipeline_alpha: wgpu::RenderPipeline,
     shapes_fill_pipeline_additive: wgpu::RenderPipeline,
-    shapes_border_pipeline:        wgpu::RenderPipeline,
-    shape_bgl:    wgpu::BindGroupLayout,
-    border_bgl:   wgpu::BindGroupLayout,
+    shapes_border_pipeline: wgpu::RenderPipeline,
+    shape_bgl: wgpu::BindGroupLayout,
+    border_bgl: wgpu::BindGroupLayout,
     shape_vert_buf: wgpu::Buffer,
-    shape_idx_buf:  wgpu::Buffer,  // static fan triangulation, 300 u32
+    shape_idx_buf: wgpu::Buffer,     // static fan triangulation, 300 u32
     shape_uniform_buf: wgpu::Buffer, // ShapeU (textured)
     border_vert_buf: wgpu::Buffer,
     // border uniforms: dyn-offset buffer (4 slots of 256B = up to 4 thick passes)
@@ -889,43 +1123,74 @@ pub struct MilkdropRenderer {
 
     // ── Waveforms (built-in + custom) ────────────────────────────────────────
     waves: Vec<WaveRT>,
-    wave_pipeline_lines_alpha:    wgpu::RenderPipeline,
+    wave_pipeline_lines_alpha: wgpu::RenderPipeline,
     wave_pipeline_lines_additive: wgpu::RenderPipeline,
-    wave_pipeline_points_alpha:   wgpu::RenderPipeline,
+    wave_pipeline_points_alpha: wgpu::RenderPipeline,
     wave_pipeline_points_additive: wgpu::RenderPipeline,
-    wave_bgl:      wgpu::BindGroupLayout,
+    wave_bgl: wgpu::BindGroupLayout,
     wave_vert_buf: wgpu::Buffer,
-    wave_off_buf:  wgpu::Buffer,   // dyn-offset, 4 slots of 256B (thick offsets)
-    wave_bg:       wgpu::BindGroup,
+    wave_off_buf: wgpu::Buffer, // dyn-offset slots of 256B (thick offsets)
+    wave_bg: wgpu::BindGroup,
 
     // built-in waveform scalar/bool state (parsed)
     bw_mode: f32,
-    bw_x: f32, bw_y: f32,
-    bw_r: f32, bw_g: f32, bw_b: f32, bw_a: f32,
-    bw_mystery: f32, bw_scale: f32, bw_smoothing: f32,
-    bw_dots: bool, bw_thick: bool, bw_additive: bool, bw_brighten: bool,
-    bw_modalphavol: bool, bw_modalphastart: f32, bw_modalphaend: f32,
+    bw_x: f32,
+    bw_y: f32,
+    bw_r: f32,
+    bw_g: f32,
+    bw_b: f32,
+    bw_a: f32,
+    bw_mystery: f32,
+    bw_scale: f32,
+    bw_smoothing: f32,
+    bw_dots: bool,
+    bw_thick: bool,
+    bw_additive: bool,
+    bw_brighten: bool,
+    bw_modalphavol: bool,
+    bw_modalphastart: f32,
+    bw_modalphaend: f32,
 
     // comp post-FX flags (bBrighten/bDarken/bSolarize/bInvert) for the built-in comp body
-    comp_brighten: bool, comp_darken: bool, comp_solarize: bool, comp_invert: bool,
+    comp_gamma_adj: f32,
+    comp_brighten: bool,
+    comp_darken: bool,
+    comp_solarize: bool,
+    comp_invert: bool,
 
     // ── Motion vectors ───────────────────────────────────────────────────────
-    mv_pipeline:  wgpu::RenderPipeline,   // LineList, alpha blend, Rgba8Unorm
-    mv_bgl:       wgpu::BindGroupLayout,
-    mv_vert_buf:  wgpu::Buffer,
-    mv_color_buf: wgpu::Buffer,           // 16-byte uniform (vec4 color)
-    mv_bg:        wgpu::BindGroup,
-    mv_on: bool, mv_x: f32, mv_y: f32, mv_dx: f32, mv_dy: f32, mv_l: f32,
-    mv_r: f32, mv_g: f32, mv_b: f32, mv_a: f32,
+    mv_pipeline: wgpu::RenderPipeline, // LineList, alpha blend, Rgba8Unorm
+    mv_bgl: wgpu::BindGroupLayout,
+    mv_vert_buf: wgpu::Buffer,
+    mv_color_buf: wgpu::Buffer, // 16-byte uniform (vec4 color)
+    mv_bg: wgpu::BindGroup,
+    mv_on: bool,
+    mv_x: f32,
+    mv_y: f32,
+    mv_dx: f32,
+    mv_dy: f32,
+    mv_l: f32,
+    mv_r: f32,
+    mv_g: f32,
+    mv_b: f32,
+    mv_a: f32,
 
     // ── Frame borders (outer/inner) ──────────────────────────────────────────
     // Reuses border_bgl (BorderU) + a triangle-list pipeline. 24 verts/border.
     frame_border_pipeline: wgpu::RenderPipeline,
-    frame_border_vert_buf: wgpu::Buffer,   // up to 2 borders * 24 verts
+    frame_border_vert_buf: wgpu::Buffer, // up to 2 borders * 24 verts
     frame_border_uniform_buf: wgpu::Buffer, // dyn-offset, 2 slots of 256B
     frame_border_bg: wgpu::BindGroup,
-    ob_size: f32, ob_r: f32, ob_g: f32, ob_b: f32, ob_a: f32,
-    ib_size: f32, ib_r: f32, ib_g: f32, ib_b: f32, ib_a: f32,
+    ob_size: f32,
+    ob_r: f32,
+    ob_g: f32,
+    ob_b: f32,
+    ob_a: f32,
+    ib_size: f32,
+    ib_r: f32,
+    ib_g: f32,
+    ib_b: f32,
+    ib_a: f32,
 
     // ── Darken center ────────────────────────────────────────────────────────
     darken_pipeline: wgpu::RenderPipeline, // TriangleList, alpha blend
@@ -937,7 +1202,13 @@ pub struct MilkdropRenderer {
     vol_prev: f64,
 
     // ── Blur min/max (per-level range remap base; overridable per-frame via EEL) ─
-    b1n: f32, b1x: f32, b2n: f32, b2x: f32, b3n: f32, b3x: f32,
+    b1n: f32,
+    b1x: f32,
+    b1ed: f32,
+    b2n: f32,
+    b2x: f32,
+    b3n: f32,
+    b3x: f32,
 
     // per-sample audio waveform (range ~[-1,1]); filled by set_waveform or synthesized.
     wave_l: Vec<f32>,
@@ -953,86 +1224,95 @@ impl MilkdropRenderer {
         surface_format: wgpu::TextureFormat,
         shaders: &MilkShaders,
     ) -> Result<Self, String> {
+        Self::new_with_pipeline_cache(device, queue, width, height, surface_format, shaders, None)
+    }
+
+    pub fn new_with_pipeline_cache(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        width: u32,
+        height: u32,
+        surface_format: wgpu::TextureFormat,
+        shaders: &MilkShaders,
+        pipeline_cache: Option<&wgpu::PipelineCache>,
+    ) -> Result<Self, String> {
+        let compiled = compile_milkdrop_shader_bodies(shaders)?;
+        Self::new_with_compiled_pipeline_cache(
+            device,
+            queue,
+            width,
+            height,
+            surface_format,
+            shaders,
+            &compiled,
+            pipeline_cache,
+        )
+    }
+
+    pub fn new_with_compiled_pipeline_cache(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        width: u32,
+        height: u32,
+        surface_format: wgpu::TextureFormat,
+        shaders: &MilkShaders,
+        compiled: &CompiledMilkdropShaderBodies,
+        pipeline_cache: Option<&wgpu::PipelineCache>,
+    ) -> Result<Self, String> {
         let (w, h) = (width.max(1), height.max(1));
 
         let has_custom_warp = shaders.warp.is_some();
         let has_custom_comp = shaders.comp.is_some();
-
-        // Compile warp/comp shaders. Fallback body passes through sampler_main.
-        // The legacy fullscreen warp FS (quad VS) is retained only as a dead
-        // fallback; the live custom-warp path uses warp_custom_wgsl (mesh VS).
-        //
-        // shaders_glsl path (Butterchurn converted-JSON): the custom warp/comp
-        // bodies are ALREADY GLSL — compile them via glsl_milk_*_to_naga (no HLSL
-        // conversion). When no custom shader is present we fall back to the HLSL
-        // path's default bodies (which emit valid GLSL either way). The .milk path
-        // keeps shaders_glsl=false → identical to before (byte-for-byte).
-        let warp_default = "ret = GetMain(uv);";
-        let comp_default =
-            "float _eh = mod(echo_orientation, 2.0); \
-             float _ex = (_eh != 0.0) ? -1.0 : 1.0; \
-             float _ey = (echo_orientation >= 2.0) ? -1.0 : 1.0; \
-             vec2 uv_echo = ((uv - 0.5) * (1.0 / echo_zoom) * vec2(_ex, _ey)) + 0.5; \
-             ret = mix(GetMain(uv), GetMain(uv_echo), echo_alpha); \
-             ret = ret * gammaAdj; \
-             ret = ret * hue_shader; \
-             if (brighten != 0.0) ret = sqrt(ret); \
-             if (darken   != 0.0) ret = ret * ret; \
-             if (solarize != 0.0) ret = ret * (1.0 - ret) * 4.0; \
-             if (invert   != 0.0) ret = 1.0 - ret;";
-
-        // Legacy fullscreen warp FS (quad VS) — dead fallback, but still compiled.
-        // Must use the GLSL-body comp template for JSON presets (the body is GLSL,
-        // not HLSL) or naga chokes on the un-stripped `shader_body` wrapper.
-        let warp_legacy_glsl = match (shaders.shaders_glsl, shaders.warp.as_deref()) {
-            (true, Some(body)) => glsl_milk_body_to_naga(body),
-            _ => hlsl_milk_body_to_naga(shaders.warp.as_deref().unwrap_or(warp_default)),
-        };
-        // Custom-warp FS driven by the warped mesh VS (vUv@0, vWarpUv@1, vDecay@2).
-        let warp_custom_glsl = match (shaders.shaders_glsl, shaders.warp.as_deref()) {
-            (true, Some(body)) => glsl_milk_warp_body_to_naga(body),
-            _ => hlsl_milk_warp_body_to_naga(shaders.warp.as_deref().unwrap_or(warp_default)),
-        };
-        // Built-in (fallback) comp body: video echo applied BEFORE gamma, matching
-        // Butterchurn's compShader (echo mix -> gamma -> post-FX flags). The GLSL
-        // template (preprocess.rs) provides the y-flipped `uv`, GetMain(), and the
-        // echo_*/gammaAdj/brighten/darken/solarize/invert uniforms in the PerFrame UBO.
-        let comp_glsl = match (shaders.shaders_glsl, shaders.comp.as_deref()) {
-            (true, Some(body)) => glsl_milk_body_to_naga(body),
-            _ => hlsl_milk_body_to_naga(shaders.comp.as_deref().unwrap_or(comp_default)),
-        };
-        // Dump ALL generated GLSL before any compile, so a naga failure in one
-        // shader still leaves the others visible for triage (MILKDROP_DUMP_GLSL).
-        if std::env::var("MILKDROP_DUMP_GLSL").is_ok() {
-            eprintln!("==== legacy warp GLSL ====\n{warp_legacy_glsl}\n==== end legacy warp ====");
-            eprintln!("==== custom warp GLSL ====\n{warp_custom_glsl}\n==== end custom warp ====");
-            eprintln!("==== comp GLSL ====\n{comp_glsl}\n==== end comp ====");
-        }
-        let warp_wgsl = compile_glsl(&warp_legacy_glsl)?;
-        let warp_custom_wgsl = compile_glsl(&warp_custom_glsl)?;
-        let comp_wgsl = compile_glsl(&comp_glsl)?;
-        if std::env::var("MILKDROP_DUMP_WARP_WGSL").is_ok() {
-            eprintln!("==== custom warp WGSL (naga) ====\n{warp_custom_wgsl}\n==== end warp WGSL ====");
-        }
+        let warp_wgsl = compiled.warp_wgsl.as_str();
+        let warp_custom_wgsl = compiled.warp_custom_wgsl.as_str();
+        let comp_wgsl = compiled.comp_wgsl.as_str();
 
         // Create feedback textures — seed with low-level noise so the warp shader
         // has non-uniform gradients to amplify from the very first frame.
         let fb_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST;
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC;
+        let feedback_mip_levels = mip_level_count_2d(w, h);
 
-        let seed_a = noise_bytes_scaled((w * h) as usize, 16); // 0–15 range (subtle)
-        let seed_b = noise_bytes_scaled((w * h) as usize, 16);
-        let tex_a = make_tex2d(&device, &queue, w, h, fb_usage, Some(&seed_a));
-        let tex_b = make_tex2d(&device, &queue, w, h, fb_usage, Some(&seed_b));
-        let view_a = tex_a.create_view(&Default::default());
-        let view_b = tex_b.create_view(&Default::default());
+        let seed_a = noise_bytes_scaled((w * h) as usize, 32); // 0–31 range (subtle)
+        let seed_b = noise_bytes_scaled((w * h) as usize, 32);
+        let tex_a = make_tex2d_with_mips(
+            &device,
+            &queue,
+            w,
+            h,
+            fb_usage,
+            feedback_mip_levels,
+            Some(&seed_a),
+        );
+        let tex_b = make_tex2d_with_mips(
+            &device,
+            &queue,
+            w,
+            h,
+            fb_usage,
+            feedback_mip_levels,
+            Some(&seed_b),
+        );
+        let view_a = mip_level_view(&tex_a, 0);
+        let view_b = mip_level_view(&tex_b, 0);
+        let view_a_sample = tex_a.create_view(&Default::default());
+        let view_b_sample = tex_b.create_view(&Default::default());
+        let feedback_mips_a = mip_chain_views(&tex_a, feedback_mip_levels);
+        let feedback_mips_b = mip_chain_views(&tex_b, feedback_mip_levels);
 
-        // Blur textures: 1/2, 1/4, 1/8 of main size
-        let blur_usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        // Blur textures. Keep the established square level ratios here; the BC
+        // asymmetric blur-ratio experiment regressed the broad visual audit and
+        // needs a more surgical pass before it becomes the default.
+        let blur_usage =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
         let (bw1, bh1) = ((w / 2).max(1), (h / 2).max(1));
         let (bw2, bh2) = ((w / 4).max(1), (h / 4).max(1));
         let (bw3, bh3) = ((w / 8).max(1), (h / 8).max(1));
+        let (btw1, bth1) = (bw1, bh1);
+        let (btw2, bth2) = (bw2, bh2);
+        let (btw3, bth3) = (bw3, bh3);
 
         let blur1 = make_tex2d(&device, &queue, bw1, bh1, blur_usage, None);
         let blur2 = make_tex2d(&device, &queue, bw2, bh2, blur_usage, None);
@@ -1041,10 +1321,10 @@ impl MilkdropRenderer {
         let view_blur2 = blur2.create_view(&Default::default());
         let view_blur3 = blur3.create_view(&Default::default());
 
-        // Separable blur needs a horizontal-pass intermediate per level (same res).
-        let btemp1 = make_tex2d(&device, &queue, bw1, bh1, blur_usage, None);
-        let btemp2 = make_tex2d(&device, &queue, bw2, bh2, blur_usage, None);
-        let btemp3 = make_tex2d(&device, &queue, bw3, bh3, blur_usage, None);
+        // Separable blur needs a horizontal-pass intermediate per level.
+        let btemp1 = make_tex2d(&device, &queue, btw1, bth1, blur_usage, None);
+        let btemp2 = make_tex2d(&device, &queue, btw2, bth2, blur_usage, None);
+        let btemp3 = make_tex2d(&device, &queue, btw3, bth3, blur_usage, None);
         let view_btemp1 = btemp1.create_view(&Default::default());
         let view_btemp2 = btemp2.create_view(&Default::default());
         let view_btemp3 = btemp3.create_view(&Default::default());
@@ -1059,23 +1339,23 @@ impl MilkdropRenderer {
         // LQ-lite 32² zoom1, noisevol_lq 32³ zoom1, noisevol_hq 32³ zoom4 (smoothed).
         let tex_binding = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
         let mut rng = bc_rng();
-        let n_lq   = create_noise_tex(256, 1, &mut rng);
-        let n_mq   = create_noise_tex(256, 4, &mut rng);
-        let n_hq   = create_noise_tex(256, 8, &mut rng);
+        let n_lq = create_noise_tex(256, 1, &mut rng);
+        let n_mq = create_noise_tex(256, 4, &mut rng);
+        let n_hq = create_noise_tex(256, 8, &mut rng);
         let n_lite = create_noise_tex(32, 1, &mut rng);
-        let nv_lq  = create_noise_vol_tex(32, 1, &mut rng);
-        let nv_hq  = create_noise_vol_tex(32, 4, &mut rng);
+        let nv_lq = create_noise_vol_tex(32, 1, &mut rng);
+        let nv_hq = create_noise_vol_tex(32, 4, &mut rng);
 
-        let noise_lq    = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_lq));
-        let noise_mq    = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_mq));
-        let noise_hq    = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_hq));
-        let noise_lite  = make_tex2d(&device, &queue, 32, 32, tex_binding, Some(&n_lite));
+        let noise_lq = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_lq));
+        let noise_mq = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_mq));
+        let noise_hq = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_hq));
+        let noise_lite = make_tex2d(&device, &queue, 32, 32, tex_binding, Some(&n_lite));
         let noisevol_lq = make_tex3d(&device, &queue, 32, &nv_lq);
         let noisevol_hq = make_tex3d(&device, &queue, 32, &nv_hq);
 
-        let view_noise_lq   = noise_lq.create_view(&Default::default());
-        let view_noise_mq   = noise_mq.create_view(&Default::default());
-        let view_noise_hq   = noise_hq.create_view(&Default::default());
+        let view_noise_lq = noise_lq.create_view(&Default::default());
+        let view_noise_mq = noise_mq.create_view(&Default::default());
+        let view_noise_hq = noise_hq.create_view(&Default::default());
         let view_noise_lite = noise_lite.create_view(&Default::default());
         let view_noisevol_lq = noisevol_lq.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D3),
@@ -1114,6 +1394,39 @@ impl MilkdropRenderer {
             ..Default::default()
         });
 
+        let point_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let point_clamp_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let feedback_mip_blitter =
+            wgpu::util::TextureBlitterBuilder::new(&device, wgpu::TextureFormat::Rgba8Unorm)
+                .sample_type(wgpu::FilterMode::Linear)
+                .build();
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("feedback-seed-mips"),
+            });
+            generate_mip_chain(&device, &feedback_mip_blitter, &mut enc, &feedback_mips_a);
+            generate_mip_chain(&device, &feedback_mip_blitter, &mut enc, &feedback_mips_b);
+            queue.submit(std::iter::once(enc.finish()));
+        }
+
         // UBO
         let perframe_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("perframe-ubo"),
@@ -1122,38 +1435,49 @@ impl MilkdropRenderer {
             mapped_at_creation: false,
         });
 
-        // Blur uniform buffers: BlurU { texel: vec4 (1/levelW, 1/levelH, 0, 0), edge: vec4 }.
-        // Offsets are in the LEVEL's own texels (blur1 = half-res, etc.). Edge decay
+        // Blur uniform buffers: BlurU { texel: vec4 (1/srcW, 1/srcH, 0, 0), edge: vec4 }.
+        // Offsets are in the source texture's texels for each H/V pair. Edge decay
         // (ed1=1-b1ed, ed2=b1ed, ed3=5) fades the blur toward the borders, per Butterchurn.
         let b1ed = 0.25f32; // both jelly presets set b1ed=0.25 (default until parsed)
         let edge = [1.0f32 - b1ed, b1ed, 5.0f32, 0.0f32];
         // BlurU = { texel:vec4, edge:vec4, sb:vec4 } (12 floats / 48 bytes). sb (scale,
         // bias) is rewritten per-frame (offset 32B) from the blur min/max range remap.
-        let blur_ubo_contents = |bw: u32, bh: u32| -> [f32; 12] {
-            [1.0 / bw as f32, 1.0 / bh as f32, 0.0, 0.0,
-             edge[0], edge[1], edge[2], edge[3],
-             1.0, 0.0, 0.0, 0.0] // sb = identity (scale 1, bias 0) until updated
+        let blur_ubo_contents = |src_w: u32, src_h: u32| -> [f32; 12] {
+            [
+                1.0 / src_w as f32,
+                1.0 / src_h as f32,
+                0.0,
+                0.0,
+                edge[0],
+                edge[1],
+                edge[2],
+                edge[3],
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            ] // sb = identity (scale 1, bias 0) until updated
         };
         let blur1_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur1-ubo"),
-            contents: bytemuck::cast_slice(&blur_ubo_contents(bw1, bh1)),
+            contents: bytemuck::cast_slice(&blur_ubo_contents(w, bh1)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let blur2_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur2-ubo"),
-            contents: bytemuck::cast_slice(&blur_ubo_contents(bw2, bh2)),
+            contents: bytemuck::cast_slice(&blur_ubo_contents(bw1, bh2)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let blur3_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur3-ubo"),
-            contents: bytemuck::cast_slice(&blur_ubo_contents(bw3, bh3)),
+            contents: bytemuck::cast_slice(&blur_ubo_contents(bw2, bh3)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         // Bind group layouts
-        let sampler_bgl  = sampler_bgl(&device);
+        let sampler_bgl = sampler_bgl(&device);
         let perframe_bgl = perframe_bgl(&device);
-        let blur_bgl     = blur_bgl(&device);
+        let blur_bgl = blur_bgl(&device);
 
         // Pipeline layout for warp/comp
         let milk_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1203,7 +1527,7 @@ impl MilkdropRenderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
 
         // Comp pipeline
@@ -1235,7 +1559,7 @@ impl MilkdropRenderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
 
         // Blur pipeline
@@ -1268,7 +1592,7 @@ impl MilkdropRenderer {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: pipeline_cache,
             })
         };
         let blur_h_pipeline = make_blur_pipeline("blur-h-pipeline", "fs_blur_h");
@@ -1276,8 +1600,8 @@ impl MilkdropRenderer {
 
         // FXAA OUTPUT pass: reads the offscreen comp result, resolves edges → swapchain.
         // Same BGL pattern as blur (texture/sampler/UBO); own self-contained VS+FS.
-        // UBO = texsize vec4 (W, H, 1/W, 1/H). Static at construction size (internal
-        // targets aren't recreated on window resize — consistent with existing tex_a/b).
+        // UBO = texsize vec4 (W, H, 1/W, 1/H). Rewritten by `resize` when the
+        // internal targets are recreated.
         let fxaa_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("fxaa-ubo"),
             contents: bytemuck::cast_slice(&[w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32]),
@@ -1317,15 +1641,24 @@ impl MilkdropRenderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
         let fxaa_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fxaa-bg"),
             layout: &fxaa_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&comp_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&linear_samp) },
-                wgpu::BindGroupEntry { binding: 2, resource: fxaa_ubo.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&comp_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fxaa_ubo.as_entire_binding(),
+                },
             ],
         });
 
@@ -1342,20 +1675,42 @@ impl MilkdropRenderer {
 
         // Sampler bind groups (two, one per ping-pong side)
         let bg_read_a = build_sampler_bg(
-            &device, &sampler_bgl, &view_a,
-            &view_blur1, &view_blur2, &view_blur3,
+            &device,
+            &sampler_bgl,
+            &view_a_sample,
+            &view_blur1,
+            &view_blur2,
+            &view_blur3,
             &view_noise2d,
-            &view_noise_lq, &view_noise_mq, &view_noise_hq, &view_noise_lite,
-            &view_noisevol_lq, &view_noisevol_hq,
-            &linear_samp, &clamp_samp,
+            &view_noise_lq,
+            &view_noise_mq,
+            &view_noise_hq,
+            &view_noise_lite,
+            &view_noisevol_lq,
+            &view_noisevol_hq,
+            &linear_samp,
+            &clamp_samp,
+            &point_samp,
+            &point_clamp_samp,
         );
         let bg_read_b = build_sampler_bg(
-            &device, &sampler_bgl, &view_b,
-            &view_blur1, &view_blur2, &view_blur3,
+            &device,
+            &sampler_bgl,
+            &view_b_sample,
+            &view_blur1,
+            &view_blur2,
+            &view_blur3,
             &view_noise2d,
-            &view_noise_lq, &view_noise_mq, &view_noise_hq, &view_noise_lite,
-            &view_noisevol_lq, &view_noisevol_hq,
-            &linear_samp, &clamp_samp,
+            &view_noise_lq,
+            &view_noise_mq,
+            &view_noise_hq,
+            &view_noise_lite,
+            &view_noisevol_lq,
+            &view_noisevol_hq,
+            &linear_samp,
+            &clamp_samp,
+            &point_samp,
+            &point_clamp_samp,
         );
 
         // Blur bind groups — separable: each level does H (src→temp) then V (temp→level).
@@ -1365,17 +1720,26 @@ impl MilkdropRenderer {
                 label: None,
                 layout: &blur_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&clamp_samp) },
-                    wgpu::BindGroupEntry { binding: 2, resource: ubo.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&clamp_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: ubo.as_entire_binding(),
+                    },
                 ],
             })
         };
         // blur1 H reads the warp output (write_view) → rebuilt each frame in render().
         let blur1_v_bg = make_blur_bg(&view_btemp1, &blur1_ubo);
-        let blur2_h_bg = make_blur_bg(&view_blur1,  &blur2_ubo);
+        let blur2_h_bg = make_blur_bg(&view_blur1, &blur2_ubo);
         let blur2_v_bg = make_blur_bg(&view_btemp2, &blur2_ubo);
-        let blur3_h_bg = make_blur_bg(&view_blur2,  &blur3_ubo);
+        let blur3_h_bg = make_blur_bg(&view_blur2, &blur3_ubo);
         let blur3_v_bg = make_blur_bg(&view_btemp3, &blur3_ubo);
 
         // ── Warp mesh pipeline (used when no custom warp shader) ─────────────
@@ -1404,19 +1768,29 @@ impl MilkdropRenderer {
         });
 
         // bTexWrap: wrap=1 → repeat (linear_samp); wrap=0 → clamp (clamp_samp).
-        let mesh_samp: &wgpu::Sampler = if shaders.wrap { &linear_samp } else { &clamp_samp };
+        let mesh_samp: &wgpu::Sampler = if shaders.wrap {
+            &linear_samp
+        } else {
+            &clamp_samp
+        };
         let make_mesh_bg = |tv: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &warp_mesh_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(tv) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(mesh_samp) },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(tv),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(mesh_samp),
+                    },
                 ],
             })
         };
-        let warp_mesh_bg_a = make_mesh_bg(&view_a);
-        let warp_mesh_bg_b = make_mesh_bg(&view_b);
+        let warp_mesh_bg_a = make_mesh_bg(&view_a_sample);
+        let warp_mesh_bg_b = make_mesh_bg(&view_b_sample);
 
         let num_verts = (GRID_W + 1) * (GRID_H + 1);
         let warp_vert_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1449,9 +1823,21 @@ impl MilkdropRenderer {
             array_stride: std::mem::size_of::<WarpVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 8,  shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x4 },
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
             ],
         };
         let warp_mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1480,7 +1866,7 @@ impl MilkdropRenderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
 
         // ── Custom-warp pipeline: warped mesh VS + the per-preset custom warp FS.
@@ -1521,7 +1907,7 @@ impl MilkdropRenderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
 
         // ── Custom-shape pipelines/buffers ───────────────────────────────────
@@ -1564,7 +1950,9 @@ impl MilkdropRenderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<BorderU>() as u64),
+                    min_binding_size: std::num::NonZeroU64::new(
+                        std::mem::size_of::<BorderU>() as u64
+                    ),
                 },
                 count: None,
             }],
@@ -1585,18 +1973,46 @@ impl MilkdropRenderer {
             array_stride: std::mem::size_of::<ShapeVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 8,  shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
-                wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
             ],
         };
         let blend_alpha = wgpu::BlendState {
-            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
-            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
         };
         let blend_additive = wgpu::BlendState {
-            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
         };
         let make_shape_fill = |label: &str, blend: wgpu::BlendState| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1618,14 +2034,17 @@ impl MilkdropRenderer {
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
-                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: pipeline_cache,
             })
         };
-        let shapes_fill_pipeline_alpha    = make_shape_fill("shape-fill-alpha", blend_alpha);
+        let shapes_fill_pipeline_alpha = make_shape_fill("shape-fill-alpha", blend_alpha);
         let shapes_fill_pipeline_additive = make_shape_fill("shape-fill-additive", blend_additive);
 
         let border_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1636,33 +2055,41 @@ impl MilkdropRenderer {
         let border_vbl = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<BorderVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 }],
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            }],
         };
-        let shapes_border_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shape-border"),
-            layout: Some(&border_pl),
-            vertex: wgpu::VertexState {
-                module: &shapes_mod,
-                entry_point: Some("vs_border"),
-                compilation_options: Default::default(),
-                buffers: &[border_vbl],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shapes_mod,
-                entry_point: Some("fs_border"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(blend_alpha),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineStrip, ..Default::default() },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let shapes_border_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shape-border"),
+                layout: Some(&border_pl),
+                vertex: wgpu::VertexState {
+                    module: &shapes_mod,
+                    entry_point: Some("vs_border"),
+                    compilation_options: Default::default(),
+                    buffers: &[border_vbl],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shapes_mod,
+                    entry_point: Some("fs_border"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(blend_alpha),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache,
+            });
 
         let shape_vert_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shape-verts"),
@@ -1678,7 +2105,9 @@ impl MilkdropRenderer {
         });
         // Static fan triangulation: [0, k, k+1] for k in 1..=SIDES_MAX.
         let mut fan_idx: Vec<u32> = Vec::with_capacity(SHAPE_FAN_IDX_MAX);
-        for k in 1..=(SIDES_MAX as u32) { fan_idx.extend_from_slice(&[0, k, k + 1]); }
+        for k in 1..=(SIDES_MAX as u32) {
+            fan_idx.extend_from_slice(&[0, k, k + 1]);
+        }
         let shape_idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("shape-fan-idx"),
             contents: bytemuck::cast_slice(&fan_idx),
@@ -1690,10 +2119,10 @@ impl MilkdropRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // border dyn-offset uniform: 4 slots of 256 bytes
+        // border dyn-offset uniform: per-border color + up-to-4 thick offsets
         let border_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("border-u"),
-            size: 4 * 256,
+            size: (BORDER_UNIFORM_SLOTS * 256) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1703,7 +2132,8 @@ impl MilkdropRenderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &border_uniform_buf, offset: 0,
+                    buffer: &border_uniform_buf,
+                    offset: 0,
                     size: std::num::NonZeroU64::new(std::mem::size_of::<BorderU>() as u64),
                 }),
             }],
@@ -1713,34 +2143,47 @@ impl MilkdropRenderer {
                 label: Some("shape-bg"),
                 layout: &shape_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(tv) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&linear_samp) },
-                    wgpu::BindGroupEntry { binding: 2, resource: shape_uniform_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(tv),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&linear_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: shape_uniform_buf.as_entire_binding(),
+                    },
                 ],
             })
         };
-        let shape_bg_read_a = make_shape_bg(&view_a);
-        let shape_bg_read_b = make_shape_bg(&view_b);
+        let shape_bg_read_a = make_shape_bg(&view_a_sample);
+        let shape_bg_read_b = make_shape_bg(&view_b_sample);
 
         // Preset-wide gmegabuf, shared by every EEL pool (per-frame, per-pixel,
         // each shape, each wave). megabuf is per-pool (private to each EelState).
         let gmegabuf: Rc<RefCell<MegaBuf>> = Rc::new(RefCell::new(MegaBuf::default()));
 
         // build ShapeRT list from parsed shapes
-        let shapes: Vec<ShapeRT> = shaders.shapes.iter().map(|sc| {
-            let mut env = Env::new();
-            let mut state = EelState::with_gmegabuf(gmegabuf.clone());
-            // Run shape per-frame-init ONCE into the shape env/megabuf at load.
-            if let Some(init) = sc.per_frame_init.as_deref() {
-                EelProgram::parse(init).run_with(&mut env, &mut state);
-            }
-            ShapeRT {
-                base: sc.base.clone(),
-                prog: sc.per_frame.as_deref().map(EelProgram::parse),
-                env,
-                state,
-            }
-        }).collect();
+        let shapes: Vec<ShapeRT> = shaders
+            .shapes
+            .iter()
+            .map(|sc| {
+                let mut env = Env::new();
+                let mut state = EelState::with_gmegabuf(gmegabuf.clone());
+                // Run shape per-frame-init ONCE into the shape env/megabuf at load.
+                if let Some(init) = sc.per_frame_init.as_deref() {
+                    EelProgram::parse(init).run_with(&mut env, &mut state);
+                }
+                ShapeRT {
+                    base: sc.base.clone(),
+                    prog: sc.per_frame.as_deref().map(EelProgram::parse),
+                    env,
+                    state,
+                }
+            })
+            .collect();
 
         // ── Waveform pipelines/buffers ───────────────────────────────────────
         let wave_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1770,41 +2213,69 @@ impl MilkdropRenderer {
             array_stride: std::mem::size_of::<WaveVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
             ],
         };
-        let make_wave_pipeline = |label: &str, topo: wgpu::PrimitiveTopology, blend: wgpu::BlendState| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&wave_pl),
-                vertex: wgpu::VertexState {
-                    module: &wave_mod,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[wave_vbl.clone()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &wave_mod,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(blend),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState { topology: topo, ..Default::default() },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let wave_pipeline_lines_alpha     = make_wave_pipeline("wave-lines-alpha",  wgpu::PrimitiveTopology::LineStrip, blend_alpha);
-        let wave_pipeline_lines_additive  = make_wave_pipeline("wave-lines-add",    wgpu::PrimitiveTopology::LineStrip, blend_additive);
-        let wave_pipeline_points_alpha    = make_wave_pipeline("wave-points-alpha", wgpu::PrimitiveTopology::PointList, blend_alpha);
-        let wave_pipeline_points_additive = make_wave_pipeline("wave-points-add",   wgpu::PrimitiveTopology::PointList, blend_additive);
+        let make_wave_pipeline =
+            |label: &str, topo: wgpu::PrimitiveTopology, blend: wgpu::BlendState| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&wave_pl),
+                    vertex: wgpu::VertexState {
+                        module: &wave_mod,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[wave_vbl.clone()],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &wave_mod,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: topo,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: pipeline_cache,
+                })
+            };
+        let wave_pipeline_lines_alpha = make_wave_pipeline(
+            "wave-lines-alpha",
+            wgpu::PrimitiveTopology::LineStrip,
+            blend_alpha,
+        );
+        let wave_pipeline_lines_additive = make_wave_pipeline(
+            "wave-lines-add",
+            wgpu::PrimitiveTopology::LineStrip,
+            blend_additive,
+        );
+        let wave_pipeline_points_alpha = make_wave_pipeline(
+            "wave-points-alpha",
+            wgpu::PrimitiveTopology::PointList,
+            blend_alpha,
+        );
+        let wave_pipeline_points_additive = make_wave_pipeline(
+            "wave-points-add",
+            wgpu::PrimitiveTopology::PointList,
+            blend_additive,
+        );
 
         let wave_vert_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wave-verts"),
@@ -1814,7 +2285,7 @@ impl MilkdropRenderer {
         });
         let wave_off_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wave-off"),
-            size: 4 * 256,
+            size: (WAVE_THICK_DOT_PASSES * 256) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1824,7 +2295,8 @@ impl MilkdropRenderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &wave_off_buf, offset: 0,
+                    buffer: &wave_off_buf,
+                    offset: 0,
                     size: std::num::NonZeroU64::new(16),
                 }),
             }],
@@ -1857,17 +2329,24 @@ impl MilkdropRenderer {
         let mv_vbl = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MVVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 }],
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            }],
         };
         let mv_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("motion-vectors"),
             layout: Some(&mv_pl),
             vertex: wgpu::VertexState {
-                module: &mv_mod, entry_point: Some("vs_main"),
-                compilation_options: Default::default(), buffers: &[mv_vbl],
+                module: &mv_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[mv_vbl],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &mv_mod, entry_point: Some("fs_main"),
+                module: &mv_mod,
+                entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
@@ -1875,11 +2354,14 @@ impl MilkdropRenderer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
         let mv_vert_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mv-verts"),
@@ -1896,7 +2378,10 @@ impl MilkdropRenderer {
         let mv_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mv-bg"),
             layout: &mv_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: mv_color_buf.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mv_color_buf.as_entire_binding(),
+            }],
         });
 
         // ── Frame-border pipeline (TriangleList; reuses border_bgl / BorderU) ─
@@ -1908,30 +2393,41 @@ impl MilkdropRenderer {
         let frame_border_vbl = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<BorderVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 }],
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            }],
         };
-        let frame_border_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("frame-border"),
-            layout: Some(&frame_border_pl),
-            vertex: wgpu::VertexState {
-                module: &shapes_mod, entry_point: Some("vs_border"),
-                compilation_options: Default::default(), buffers: &[frame_border_vbl],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shapes_mod, entry_point: Some("fs_border"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(blend_alpha),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let frame_border_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("frame-border"),
+                layout: Some(&frame_border_pl),
+                vertex: wgpu::VertexState {
+                    module: &shapes_mod,
+                    entry_point: Some("vs_border"),
+                    compilation_options: Default::default(),
+                    buffers: &[frame_border_vbl],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shapes_mod,
+                    entry_point: Some("fs_border"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(blend_alpha),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache,
+            });
         // up to 2 borders (outer + inner), 24 verts each.
         let frame_border_vert_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame-border-verts"),
@@ -1952,7 +2448,8 @@ impl MilkdropRenderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &frame_border_uniform_buf, offset: 0,
+                    buffer: &frame_border_uniform_buf,
+                    offset: 0,
                     size: std::num::NonZeroU64::new(std::mem::size_of::<BorderU>() as u64),
                 }),
             }],
@@ -1973,19 +2470,30 @@ impl MilkdropRenderer {
             array_stride: std::mem::size_of::<DarkenVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
             ],
         };
         let darken_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("darken-center"),
             layout: Some(&darken_pl),
             vertex: wgpu::VertexState {
-                module: &darken_mod, entry_point: Some("vs_main"),
-                compilation_options: Default::default(), buffers: &[darken_vbl],
+                module: &darken_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[darken_vbl],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &darken_mod, entry_point: Some("fs_main"),
+                module: &darken_mod,
+                entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
@@ -1993,11 +2501,14 @@ impl MilkdropRenderer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
         // 4 fan triangles expanded to a triangle list = 12 verts.
         let darken_vert_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2007,29 +2518,43 @@ impl MilkdropRenderer {
             mapped_at_creation: false,
         });
 
-        let waves: Vec<WaveRT> = shaders.waves.iter().map(|wd| {
-            let mut env = Env::new();
-            let mut state = EelState::with_gmegabuf(gmegabuf.clone());
-            // Run wave per-frame-init ONCE into the wave env/megabuf at load.
-            if let Some(init) = wd.per_frame_init.as_deref() {
-                EelProgram::parse(init).run_with(&mut env, &mut state);
-            }
-            WaveRT {
-                def: CustomWaveDef {
-                    index: wd.index, enabled: wd.enabled, samples: wd.samples, sep: wd.sep,
-                    spectrum: wd.spectrum, use_dots: wd.use_dots, draw_thick: wd.draw_thick,
-                    additive: wd.additive, scaling: wd.scaling, smoothing: wd.smoothing,
-                    r: wd.r, g: wd.g, b: wd.b, a: wd.a,
-                    per_frame: wd.per_frame.clone(),
-                    per_frame_init: wd.per_frame_init.clone(),
-                    per_point: wd.per_point.clone(),
-                },
-                per_frame_prog: wd.per_frame.as_deref().map(EelProgram::parse),
-                per_point_prog: wd.per_point.as_deref().map(EelProgram::parse),
-                env,
-                state,
-            }
-        }).collect();
+        let waves: Vec<WaveRT> = shaders
+            .waves
+            .iter()
+            .map(|wd| {
+                let mut env = Env::new();
+                let mut state = EelState::with_gmegabuf(gmegabuf.clone());
+                // Run wave per-frame-init ONCE into the wave env/megabuf at load.
+                if let Some(init) = wd.per_frame_init.as_deref() {
+                    EelProgram::parse(init).run_with(&mut env, &mut state);
+                }
+                WaveRT {
+                    def: CustomWaveDef {
+                        index: wd.index,
+                        enabled: wd.enabled,
+                        samples: wd.samples,
+                        sep: wd.sep,
+                        spectrum: wd.spectrum,
+                        use_dots: wd.use_dots,
+                        draw_thick: wd.draw_thick,
+                        additive: wd.additive,
+                        scaling: wd.scaling,
+                        smoothing: wd.smoothing,
+                        r: wd.r,
+                        g: wd.g,
+                        b: wd.b,
+                        a: wd.a,
+                        per_frame: wd.per_frame.clone(),
+                        per_frame_init: wd.per_frame_init.clone(),
+                        per_point: wd.per_point.clone(),
+                    },
+                    per_frame_prog: wd.per_frame.as_deref().map(EelProgram::parse),
+                    per_point_prog: wd.per_point.as_deref().map(EelProgram::parse),
+                    env,
+                    state,
+                }
+            })
+            .collect();
 
         // EEL2 per-frame equations
         let eel_program = shaders.per_frame.as_deref().map(EelProgram::parse);
@@ -2038,10 +2563,11 @@ impl MilkdropRenderer {
         // Seed header echo/gamma defaults so header-only echo presets work and the
         // values persist across frames if the per-frame program never assigns them.
         // EEL/Butterchurn use the var name "echo_orient" (NOT "echo_orientation").
-        eel_env.insert("echo_zoom".into(),   shaders.echo_zoom   as f64);
-        eel_env.insert("echo_alpha".into(),  shaders.echo_alpha  as f64);
+        eel_env.insert("echo_zoom".into(), shaders.echo_zoom as f64);
+        eel_env.insert("echo_alpha".into(), shaders.echo_alpha as f64);
         eel_env.insert("echo_orient".into(), shaders.echo_orient as f64);
-        eel_env.insert("gamma".into(),       shaders.gamma_adj   as f64);
+        eel_env.insert("gamma".into(), shaders.gamma_adj as f64);
+        eel_env.insert("gammaadj".into(), shaders.gamma_adj as f64);
 
         // Run per-frame INIT equations ONCE before frame 0, into the persistent
         // per-frame env/megabuf. per_frame then sees the initialized vars. We then
@@ -2061,12 +2587,20 @@ impl MilkdropRenderer {
         let per_pixel_prog = shaders.per_pixel.as_deref().map(EelProgram::parse);
         let warp_state = EelState::with_gmegabuf(gmegabuf.clone());
         let base_warp = WarpBase {
-            zoom: shaders.zoom, zoomexp: shaders.zoomexp, rot: shaders.rot,
+            zoom: shaders.zoom,
+            zoomexp: shaders.zoomexp,
+            rot: shaders.rot,
             warp: shaders.warp_amount,
-            cx: shaders.cx, cy: shaders.cy, dx: shaders.dx, dy: shaders.dy,
-            sx: shaders.sx, sy: shaders.sy,
-            warpscale: shaders.warpscale, warpanimspeed: shaders.warpanimspeed,
-            decay: shaders.decay, wrap: shaders.wrap,
+            cx: shaders.cx,
+            cy: shaders.cy,
+            dx: shaders.dx,
+            dy: shaders.dy,
+            sx: shaders.sx,
+            sy: shaders.sy,
+            warpscale: shaders.warpscale,
+            warpanimspeed: shaders.warpanimspeed,
+            decay: shaders.decay,
+            wrap: shaders.wrap,
         };
         let warp_env = Env::new();
 
@@ -2079,26 +2613,67 @@ impl MilkdropRenderer {
         let rand_preset = preset_hue_seed(&seed_src);
 
         Ok(Self {
-            device, queue,
+            device,
+            queue,
             has_custom_warp,
             has_custom_comp,
             preset_decay: shaders.decay,
             rand_preset,
-            tex_a, tex_b, view_a, view_b,
+            tex_a,
+            tex_b,
+            view_a,
+            view_b,
+            view_a_sample,
+            view_b_sample,
+            feedback_mips_a,
+            feedback_mips_b,
+            feedback_mip_blitter,
             write_to_a: true,
-            blur1, blur2, blur3,
-            view_blur1, view_blur2, view_blur3,
-            btemp1, btemp2, btemp3,
-            view_btemp1, view_btemp2, view_btemp3,
-            noise2d, noise_lq, noise_mq, noise_hq, noise_lite, noisevol_lq, noisevol_hq,
-            view_noise2d, view_noise_lq, view_noise_mq, view_noise_hq, view_noise_lite,
-            view_noisevol_lq, view_noisevol_hq,
+            blur1,
+            blur2,
+            blur3,
+            view_blur1,
+            view_blur2,
+            view_blur3,
+            btemp1,
+            btemp2,
+            btemp3,
+            view_btemp1,
+            view_btemp2,
+            view_btemp3,
+            noise2d,
+            noise_lq,
+            noise_mq,
+            noise_hq,
+            noise_lite,
+            noisevol_lq,
+            noisevol_hq,
+            view_noise2d,
+            view_noise_lq,
+            view_noise_mq,
+            view_noise_hq,
+            view_noise_lite,
+            view_noisevol_lq,
+            view_noisevol_hq,
             linear_samp,
             clamp_samp,
+            point_samp,
+            point_clamp_samp,
             perframe_buf,
-            blur1_ubo, blur2_ubo, blur3_ubo,
-            warp_pipeline, warp_custom_pipeline, comp_pipeline, blur_h_pipeline, blur_v_pipeline,
-            comp_tex, comp_view, output_pipeline, fxaa_bgl, fxaa_ubo, fxaa_bg,
+            blur1_ubo,
+            blur2_ubo,
+            blur3_ubo,
+            warp_pipeline,
+            warp_custom_pipeline,
+            comp_pipeline,
+            blur_h_pipeline,
+            blur_v_pipeline,
+            comp_tex,
+            comp_view,
+            output_pipeline,
+            fxaa_bgl,
+            fxaa_ubo,
+            fxaa_bg,
             warp_mesh_pipeline,
             warp_mesh_bg_a,
             warp_mesh_bg_b,
@@ -2106,10 +2681,17 @@ impl MilkdropRenderer {
             warp_vert_buf,
             warp_idx_buf,
             warp_idx_count,
-            sampler_bgl, perframe_bgl, blur_bgl,
-            bg_read_a, bg_read_b,
+            sampler_bgl,
+            perframe_bgl,
+            blur_bgl,
+            bg_read_a,
+            bg_read_b,
             perframe_bg,
-            blur1_v_bg, blur2_h_bg, blur2_v_bg, blur3_h_bg, blur3_v_bg,
+            blur1_v_bg,
+            blur2_h_bg,
+            blur2_v_bg,
+            blur3_h_bg,
+            blur3_v_bg,
             eel_program,
             eel_env,
             eel_state,
@@ -2125,7 +2707,8 @@ impl MilkdropRenderer {
             audio: None,
             audio_att: None,
             freq_spectrum: Vec::new(),
-            width: w, height: h,
+            width: w,
+            height: h,
             surface_format,
 
             shapes,
@@ -2154,48 +2737,373 @@ impl MilkdropRenderer {
             wave_bg,
 
             bw_mode: shaders.wave_mode,
-            bw_x: shaders.wave_x, bw_y: shaders.wave_y,
-            bw_r: shaders.wave_r, bw_g: shaders.wave_g, bw_b: shaders.wave_b, bw_a: shaders.wave_a,
-            bw_mystery: shaders.wave_mystery, bw_scale: shaders.wave_scale, bw_smoothing: shaders.wave_smoothing,
-            bw_dots: shaders.wave_dots, bw_thick: shaders.wave_thick,
-            bw_additive: shaders.additive_wave, bw_brighten: shaders.wave_brighten,
+            bw_x: shaders.wave_x,
+            bw_y: shaders.wave_y,
+            bw_r: shaders.wave_r,
+            bw_g: shaders.wave_g,
+            bw_b: shaders.wave_b,
+            bw_a: shaders.wave_a,
+            bw_mystery: shaders.wave_mystery,
+            bw_scale: shaders.wave_scale,
+            bw_smoothing: shaders.wave_smoothing,
+            bw_dots: shaders.wave_dots,
+            bw_thick: shaders.wave_thick,
+            bw_additive: shaders.additive_wave,
+            bw_brighten: shaders.wave_brighten,
             bw_modalphavol: shaders.modwavealphabyvolume,
             bw_modalphastart: shaders.modwavealphastart,
             bw_modalphaend: shaders.modwavealphaend,
 
+            comp_gamma_adj: shaders.gamma_adj,
             comp_brighten: shaders.brighten,
-            comp_darken:   shaders.darken,
+            comp_darken: shaders.darken,
             comp_solarize: shaders.solarize,
-            comp_invert:   shaders.invert,
+            comp_invert: shaders.invert,
 
-            mv_pipeline, mv_bgl, mv_vert_buf, mv_color_buf, mv_bg,
-            mv_on: shaders.mv_on, mv_x: shaders.mv_x, mv_y: shaders.mv_y,
-            mv_dx: shaders.mv_dx, mv_dy: shaders.mv_dy, mv_l: shaders.mv_l,
-            mv_r: shaders.mv_r, mv_g: shaders.mv_g, mv_b: shaders.mv_b, mv_a: shaders.mv_a,
+            mv_pipeline,
+            mv_bgl,
+            mv_vert_buf,
+            mv_color_buf,
+            mv_bg,
+            mv_on: shaders.mv_on,
+            mv_x: shaders.mv_x,
+            mv_y: shaders.mv_y,
+            mv_dx: shaders.mv_dx,
+            mv_dy: shaders.mv_dy,
+            mv_l: shaders.mv_l,
+            mv_r: shaders.mv_r,
+            mv_g: shaders.mv_g,
+            mv_b: shaders.mv_b,
+            mv_a: shaders.mv_a,
 
-            frame_border_pipeline, frame_border_vert_buf,
-            frame_border_uniform_buf, frame_border_bg,
-            ob_size: shaders.ob_size, ob_r: shaders.ob_r, ob_g: shaders.ob_g,
-            ob_b: shaders.ob_b, ob_a: shaders.ob_a,
-            ib_size: shaders.ib_size, ib_r: shaders.ib_r, ib_g: shaders.ib_g,
-            ib_b: shaders.ib_b, ib_a: shaders.ib_a,
+            frame_border_pipeline,
+            frame_border_vert_buf,
+            frame_border_uniform_buf,
+            frame_border_bg,
+            ob_size: shaders.ob_size,
+            ob_r: shaders.ob_r,
+            ob_g: shaders.ob_g,
+            ob_b: shaders.ob_b,
+            ob_a: shaders.ob_a,
+            ib_size: shaders.ib_size,
+            ib_r: shaders.ib_r,
+            ib_g: shaders.ib_g,
+            ib_b: shaders.ib_b,
+            ib_a: shaders.ib_a,
 
-            darken_pipeline, darken_vert_buf,
+            darken_pipeline,
+            darken_vert_buf,
             darken_center: shaders.darken_center,
             vol_prev: 0.0,
 
-            b1n: shaders.b1n, b1x: shaders.b1x, b2n: shaders.b2n,
-            b2x: shaders.b2x, b3n: shaders.b3n, b3x: shaders.b3x,
+            b1n: shaders.b1n,
+            b1x: shaders.b1x,
+            b1ed: shaders.b1ed,
+            b2n: shaders.b2n,
+            b2x: shaders.b2x,
+            b3n: shaders.b3n,
+            b3x: shaders.b3x,
 
             wave_l: Vec::new(),
             wave_r: Vec::new(),
         })
     }
 
+    /// Resize the GPU targets without rebuilding the preset runtime.
+    ///
+    /// Shader programs, EEL environments, audio state, and frame counters stay
+    /// intact. The feedback ping-pong textures are recreated at the new size,
+    /// seeded with subtle noise, then the overlapping region of the previous
+    /// feedback is copied into them before mip generation.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        let (w, h) = (width.max(1), height.max(1));
+        if self.width == w && self.height == h {
+            return;
+        }
+
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+
+        let fb_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC;
+        let feedback_mip_levels = mip_level_count_2d(w, h);
+        let seed_a = noise_bytes_scaled((w * h) as usize, 32);
+        let seed_b = noise_bytes_scaled((w * h) as usize, 32);
+        let tex_a = make_tex2d_with_mips(
+            &device,
+            &queue,
+            w,
+            h,
+            fb_usage,
+            feedback_mip_levels,
+            Some(&seed_a),
+        );
+        let tex_b = make_tex2d_with_mips(
+            &device,
+            &queue,
+            w,
+            h,
+            fb_usage,
+            feedback_mip_levels,
+            Some(&seed_b),
+        );
+        let view_a = mip_level_view(&tex_a, 0);
+        let view_b = mip_level_view(&tex_b, 0);
+        let view_a_sample = tex_a.create_view(&Default::default());
+        let view_b_sample = tex_b.create_view(&Default::default());
+        let feedback_mips_a = mip_chain_views(&tex_a, feedback_mip_levels);
+        let feedback_mips_b = mip_chain_views(&tex_b, feedback_mip_levels);
+
+        let blur_usage =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let (bw1, bh1) = ((w / 2).max(1), (h / 2).max(1));
+        let (bw2, bh2) = ((w / 4).max(1), (h / 4).max(1));
+        let (bw3, bh3) = ((w / 8).max(1), (h / 8).max(1));
+
+        let blur1 = make_tex2d(&device, &queue, bw1, bh1, blur_usage, None);
+        let blur2 = make_tex2d(&device, &queue, bw2, bh2, blur_usage, None);
+        let blur3 = make_tex2d(&device, &queue, bw3, bh3, blur_usage, None);
+        let view_blur1 = blur1.create_view(&Default::default());
+        let view_blur2 = blur2.create_view(&Default::default());
+        let view_blur3 = blur3.create_view(&Default::default());
+
+        let btemp1 = make_tex2d(&device, &queue, bw1, bh1, blur_usage, None);
+        let btemp2 = make_tex2d(&device, &queue, bw2, bh2, blur_usage, None);
+        let btemp3 = make_tex2d(&device, &queue, bw3, bh3, blur_usage, None);
+        let view_btemp1 = btemp1.create_view(&Default::default());
+        let view_btemp2 = btemp2.create_view(&Default::default());
+        let view_btemp3 = btemp3.create_view(&Default::default());
+
+        let comp_tex = make_tex2d(&device, &queue, w, h, blur_usage, None);
+        let comp_view = comp_tex.create_view(&Default::default());
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("milkdrop-resize-feedback-copy"),
+        });
+        let copy_w = self.width.min(w);
+        let copy_h = self.height.min(h);
+        if copy_w > 0 && copy_h > 0 {
+            let extent = wgpu::Extent3d {
+                width: copy_w,
+                height: copy_h,
+                depth_or_array_layers: 1,
+            };
+            enc.copy_texture_to_texture(self.tex_a.as_image_copy(), tex_a.as_image_copy(), extent);
+            enc.copy_texture_to_texture(self.tex_b.as_image_copy(), tex_b.as_image_copy(), extent);
+        }
+        generate_mip_chain(
+            &device,
+            &self.feedback_mip_blitter,
+            &mut enc,
+            &feedback_mips_a,
+        );
+        generate_mip_chain(
+            &device,
+            &self.feedback_mip_blitter,
+            &mut enc,
+            &feedback_mips_b,
+        );
+        queue.submit(std::iter::once(enc.finish()));
+
+        let blur_texel = |src_w: u32, src_h: u32| -> [f32; 4] {
+            [1.0 / src_w as f32, 1.0 / src_h as f32, 0.0, 0.0]
+        };
+        queue.write_buffer(
+            &self.blur1_ubo,
+            0,
+            bytemuck::cast_slice(&blur_texel(w, bh1)),
+        );
+        queue.write_buffer(
+            &self.blur2_ubo,
+            0,
+            bytemuck::cast_slice(&blur_texel(bw1, bh2)),
+        );
+        queue.write_buffer(
+            &self.blur3_ubo,
+            0,
+            bytemuck::cast_slice(&blur_texel(bw2, bh3)),
+        );
+        queue.write_buffer(
+            &self.fxaa_ubo,
+            0,
+            bytemuck::cast_slice(&[w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32]),
+        );
+
+        let bg_read_a = build_sampler_bg(
+            &device,
+            &self.sampler_bgl,
+            &view_a_sample,
+            &view_blur1,
+            &view_blur2,
+            &view_blur3,
+            &self.view_noise2d,
+            &self.view_noise_lq,
+            &self.view_noise_mq,
+            &self.view_noise_hq,
+            &self.view_noise_lite,
+            &self.view_noisevol_lq,
+            &self.view_noisevol_hq,
+            &self.linear_samp,
+            &self.clamp_samp,
+            &self.point_samp,
+            &self.point_clamp_samp,
+        );
+        let bg_read_b = build_sampler_bg(
+            &device,
+            &self.sampler_bgl,
+            &view_b_sample,
+            &view_blur1,
+            &view_blur2,
+            &view_blur3,
+            &self.view_noise2d,
+            &self.view_noise_lq,
+            &self.view_noise_mq,
+            &self.view_noise_hq,
+            &self.view_noise_lite,
+            &self.view_noisevol_lq,
+            &self.view_noisevol_hq,
+            &self.linear_samp,
+            &self.clamp_samp,
+            &self.point_samp,
+            &self.point_clamp_samp,
+        );
+
+        let make_blur_bg = |src_view: &wgpu::TextureView, ubo: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.clamp_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: ubo.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let blur1_v_bg = make_blur_bg(&view_btemp1, &self.blur1_ubo);
+        let blur2_h_bg = make_blur_bg(&view_blur1, &self.blur2_ubo);
+        let blur2_v_bg = make_blur_bg(&view_btemp2, &self.blur2_ubo);
+        let blur3_h_bg = make_blur_bg(&view_blur2, &self.blur3_ubo);
+        let blur3_v_bg = make_blur_bg(&view_btemp3, &self.blur3_ubo);
+
+        let fxaa_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fxaa-bg"),
+            layout: &self.fxaa_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&comp_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.fxaa_ubo.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mesh_samp = if self.base_warp.wrap {
+            &self.linear_samp
+        } else {
+            &self.clamp_samp
+        };
+        let make_mesh_bg = |tv: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.warp_mesh_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(tv),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(mesh_samp),
+                    },
+                ],
+            })
+        };
+        let warp_mesh_bg_a = make_mesh_bg(&view_a_sample);
+        let warp_mesh_bg_b = make_mesh_bg(&view_b_sample);
+
+        let make_shape_bg = |tv: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shape-bg"),
+                layout: &self.shape_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(tv),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.shape_uniform_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let shape_bg_read_a = make_shape_bg(&view_a_sample);
+        let shape_bg_read_b = make_shape_bg(&view_b_sample);
+
+        self.tex_a = tex_a;
+        self.tex_b = tex_b;
+        self.view_a = view_a;
+        self.view_b = view_b;
+        self.view_a_sample = view_a_sample;
+        self.view_b_sample = view_b_sample;
+        self.feedback_mips_a = feedback_mips_a;
+        self.feedback_mips_b = feedback_mips_b;
+        self.blur1 = blur1;
+        self.blur2 = blur2;
+        self.blur3 = blur3;
+        self.view_blur1 = view_blur1;
+        self.view_blur2 = view_blur2;
+        self.view_blur3 = view_blur3;
+        self.btemp1 = btemp1;
+        self.btemp2 = btemp2;
+        self.btemp3 = btemp3;
+        self.view_btemp1 = view_btemp1;
+        self.view_btemp2 = view_btemp2;
+        self.view_btemp3 = view_btemp3;
+        self.comp_tex = comp_tex;
+        self.comp_view = comp_view;
+        self.fxaa_bg = fxaa_bg;
+        self.warp_mesh_bg_a = warp_mesh_bg_a;
+        self.warp_mesh_bg_b = warp_mesh_bg_b;
+        self.bg_read_a = bg_read_a;
+        self.bg_read_b = bg_read_b;
+        self.blur1_v_bg = blur1_v_bg;
+        self.blur2_h_bg = blur2_h_bg;
+        self.blur2_v_bg = blur2_v_bg;
+        self.blur3_h_bg = blur3_h_bg;
+        self.blur3_v_bg = blur3_v_bg;
+        self.shape_bg_read_a = shape_bg_read_a;
+        self.shape_bg_read_b = shape_bg_read_b;
+        self.width = w;
+        self.height = h;
+    }
+
     /// Switch to deterministic fixed-timestep timing (for offscreen animation
     /// export). Each rendered frame advances `time` by `1/fps` seconds.
     pub fn set_fixed_fps(&mut self, fps: f32) {
-        self.time_per_frame = Some(1.0 / fps.max(1.0));
+        self.time_per_frame = Some(1.0 / f64::from(fps.max(1.0)));
     }
 
     /// Feed live audio reactivity for the next frame. Values are MilkDrop-style
@@ -2224,17 +3132,28 @@ impl MilkdropRenderer {
     /// Feed per-sample PCM waveform for the next frame (range ~[-1,1]). Used by
     /// the built-in and custom waveforms. Length equals the audio buffer length.
     pub fn set_waveform(&mut self, left: &[f32], right: &[f32]) {
+        let n = left.len().min(right.len());
         self.wave_l.clear();
-        self.wave_l.extend_from_slice(left);
         self.wave_r.clear();
-        self.wave_r.extend_from_slice(right);
+        self.wave_l.extend(
+            left.iter()
+                .take(n)
+                .map(|v| finite_clamp(*v, -1.0, 1.0, 0.0)),
+        );
+        self.wave_r.extend(
+            right
+                .iter()
+                .take(n)
+                .map(|v| finite_clamp(*v, -1.0, 1.0, 0.0)),
+        );
     }
 
     /// Get the per-sample waveform for this frame, synthesizing a deterministic
     /// animated waveform when no real audio is available (headless/anim).
     fn frame_waveform(&self, t: f32) -> (Vec<f32>, Vec<f32>) {
-        if !self.wave_l.is_empty() {
-            return (self.wave_l.clone(), self.wave_r.clone());
+        let n = self.wave_l.len().min(self.wave_r.len());
+        if n > 0 {
+            return (self.wave_l[..n].to_vec(), self.wave_r[..n].to_vec());
         }
         // Synthesize 512 samples in [-1,1] that animate with time so the wave moves.
         // 512 (matching real butterchurn-parity feeds) is required so built-in modes
@@ -2246,11 +3165,11 @@ impl MilkdropRenderer {
         for i in 0..n {
             let fi = i as f32;
             let a = 0.5 * (t * 6.0 + fi * 0.49).sin()
-                  + 0.3 * (t * 2.1 + fi * 0.21).sin()
-                  + 0.18 * (t * 11.3 + fi * 0.83).sin();
+                + 0.3 * (t * 2.1 + fi * 0.21).sin()
+                + 0.18 * (t * 11.3 + fi * 0.83).sin();
             let b = 0.5 * (t * 5.3 + fi * 0.55 + 1.7).sin()
-                  + 0.3 * (t * 2.7 + fi * 0.19 + 0.4).sin()
-                  + 0.18 * (t * 9.1 + fi * 0.77 + 2.1).sin();
+                + 0.3 * (t * 2.7 + fi * 0.19 + 0.4).sin()
+                + 0.18 * (t * 9.1 + fi * 0.77 + 2.1).sin();
             l.push(a.clamp(-1.0, 1.0));
             r.push(b.clamp(-1.0, 1.0));
         }
@@ -2263,12 +3182,23 @@ impl MilkdropRenderer {
     #[allow(clippy::too_many_arguments)]
     fn build_shape_geometry(
         &mut self,
-        t: f32,
-        bass: f64, mid: f64, treb: f64, vol: f64,
-        bass_att: f64, mid_att: f64, treb_att: f64,
-        aspectx: f32, aspecty: f32,
+        t: f64,
+        bass: f64,
+        mid: f64,
+        treb: f64,
+        vol: f64,
+        bass_att: f64,
+        mid_att: f64,
+        treb_att: f64,
+        aspectx: f32,
+        aspecty: f32,
         q: &[f64; 32],
-    ) -> (Vec<ShapeVert>, Vec<ShapeFillDraw>, Vec<BorderVert>, Vec<BorderDraw>) {
+    ) -> (
+        Vec<ShapeVert>,
+        Vec<ShapeFillDraw>,
+        Vec<BorderVert>,
+        Vec<BorderDraw>,
+    ) {
         use std::f32::consts::PI;
         let mut fill_verts: Vec<ShapeVert> = Vec::new();
         let mut fill_draws: Vec<ShapeFillDraw> = Vec::new();
@@ -2276,15 +3206,37 @@ impl MilkdropRenderer {
         let mut border_draws: Vec<BorderDraw> = Vec::new();
 
         for s in self.shapes.iter_mut() {
-            if s.base.enabled == 0 { continue; }
+            if s.base.enabled == 0 {
+                continue;
+            }
             let num_inst = (s.base.num_inst.max(1)).min(1024);
 
             for j in 0..num_inst {
                 // Resolve per-instance vals: run per-frame eqs if present, else base.
-                let (sides_f, rad, ang, x, y,
-                     r, g, b, a, r2, g2, b2, a2,
-                     border_r, border_g, border_b, border_a,
-                     thick, textured, tex_ang, tex_zoom, additive);
+                let (
+                    sides_f,
+                    rad,
+                    ang,
+                    x,
+                    y,
+                    r,
+                    g,
+                    b,
+                    a,
+                    r2,
+                    g2,
+                    b2,
+                    a2,
+                    border_r,
+                    border_g,
+                    border_b,
+                    border_a,
+                    thick,
+                    textured,
+                    tex_ang,
+                    tex_zoom,
+                    additive,
+                );
 
                 if let Some(prog) = &s.prog {
                     // Reset shape vars from base each instance (butterchurn semantics).
@@ -2292,13 +3244,18 @@ impl MilkdropRenderer {
                     env.insert("time".into(), t as f64);
                     env.insert("frame".into(), self.frame_idx as f64);
                     env.insert("fps".into(), 60.0);
-                    env.insert("bass".into(), bass);  env.insert("bass_att".into(), bass_att);
-                    env.insert("mid".into(), mid);    env.insert("mid_att".into(), mid_att);
-                    env.insert("treb".into(), treb);  env.insert("treb_att".into(), treb_att);
+                    env.insert("bass".into(), bass);
+                    env.insert("bass_att".into(), bass_att);
+                    env.insert("mid".into(), mid);
+                    env.insert("mid_att".into(), mid_att);
+                    env.insert("treb".into(), treb);
+                    env.insert("treb_att".into(), treb_att);
                     env.insert("vol".into(), vol);
                     env.insert("aspectx".into(), aspectx as f64);
                     env.insert("aspecty".into(), aspecty as f64);
-                    for (i, qv) in q.iter().enumerate() { env.insert(format!("q{}", i + 1), *qv); }
+                    for (i, qv) in q.iter().enumerate() {
+                        env.insert(format!("q{}", i + 1), *qv);
+                    }
                     env.insert("instance".into(), j as f64);
                     env.insert("num_inst".into(), num_inst as f64);
                     let bv = &s.base;
@@ -2307,10 +3264,14 @@ impl MilkdropRenderer {
                     env.insert("ang".into(), bv.ang as f64);
                     env.insert("x".into(), bv.x as f64);
                     env.insert("y".into(), bv.y as f64);
-                    env.insert("r".into(), bv.r as f64);   env.insert("g".into(), bv.g as f64);
-                    env.insert("b".into(), bv.b as f64);   env.insert("a".into(), bv.a as f64);
-                    env.insert("r2".into(), bv.r2 as f64); env.insert("g2".into(), bv.g2 as f64);
-                    env.insert("b2".into(), bv.b2 as f64); env.insert("a2".into(), bv.a2 as f64);
+                    env.insert("r".into(), bv.r as f64);
+                    env.insert("g".into(), bv.g as f64);
+                    env.insert("b".into(), bv.b as f64);
+                    env.insert("a".into(), bv.a as f64);
+                    env.insert("r2".into(), bv.r2 as f64);
+                    env.insert("g2".into(), bv.g2 as f64);
+                    env.insert("b2".into(), bv.b2 as f64);
+                    env.insert("a2".into(), bv.a2 as f64);
                     env.insert("border_r".into(), bv.border_r as f64);
                     env.insert("border_g".into(), bv.border_g as f64);
                     env.insert("border_b".into(), bv.border_b as f64);
@@ -2327,10 +3288,14 @@ impl MilkdropRenderer {
                     ang = rd("ang", bv.ang as f64);
                     x = rd("x", bv.x as f64);
                     y = rd("y", bv.y as f64);
-                    r = rd("r", bv.r as f64); g = rd("g", bv.g as f64);
-                    b = rd("b", bv.b as f64); a = rd("a", bv.a as f64);
-                    r2 = rd("r2", bv.r2 as f64); g2 = rd("g2", bv.g2 as f64);
-                    b2 = rd("b2", bv.b2 as f64); a2 = rd("a2", bv.a2 as f64);
+                    r = rd("r", bv.r as f64);
+                    g = rd("g", bv.g as f64);
+                    b = rd("b", bv.b as f64);
+                    a = rd("a", bv.a as f64);
+                    r2 = rd("r2", bv.r2 as f64);
+                    g2 = rd("g2", bv.g2 as f64);
+                    b2 = rd("b2", bv.b2 as f64);
+                    a2 = rd("a2", bv.a2 as f64);
                     border_r = rd("border_r", bv.border_r as f64);
                     border_g = rd("border_g", bv.border_g as f64);
                     border_b = rd("border_b", bv.border_b as f64);
@@ -2342,12 +3307,28 @@ impl MilkdropRenderer {
                     additive = rd("additive", bv.additive as f64);
                 } else {
                     let bv = &s.base;
-                    sides_f = bv.sides; rad = bv.rad; ang = bv.ang; x = bv.x; y = bv.y;
-                    r = bv.r; g = bv.g; b = bv.b; a = bv.a;
-                    r2 = bv.r2; g2 = bv.g2; b2 = bv.b2; a2 = bv.a2;
-                    border_r = bv.border_r; border_g = bv.border_g; border_b = bv.border_b; border_a = bv.border_a;
-                    thick = bv.thick_outline as f32; textured = bv.textured as f32;
-                    tex_ang = bv.tex_ang; tex_zoom = bv.tex_zoom; additive = bv.additive as f32;
+                    sides_f = bv.sides;
+                    rad = bv.rad;
+                    ang = bv.ang;
+                    x = bv.x;
+                    y = bv.y;
+                    r = bv.r;
+                    g = bv.g;
+                    b = bv.b;
+                    a = bv.a;
+                    r2 = bv.r2;
+                    g2 = bv.g2;
+                    b2 = bv.b2;
+                    a2 = bv.a2;
+                    border_r = bv.border_r;
+                    border_g = bv.border_g;
+                    border_b = bv.border_b;
+                    border_a = bv.border_a;
+                    thick = bv.thick_outline as f32;
+                    textured = bv.textured as f32;
+                    tex_ang = bv.tex_ang;
+                    tex_zoom = bv.tex_zoom;
+                    additive = bv.additive as f32;
                 }
 
                 let blend_progress = 1.0f32;
@@ -2357,7 +3338,19 @@ impl MilkdropRenderer {
                 let is_additive = additive.abs() >= 1.0;
                 let is_textured = textured.abs() >= 1.0;
                 let is_thick = thick.abs() >= 1.0;
-                let border_alpha = border_a * blend_progress;
+                let fin = |v: f32, d: f32| if v.is_finite() { v } else { d };
+                let r = fin(r, 0.0).clamp(0.0, 1.0);
+                let g = fin(g, 0.0).clamp(0.0, 1.0);
+                let b = fin(b, 0.0).clamp(0.0, 1.0);
+                let a = fin(a, 0.0).clamp(0.0, 1.0);
+                let r2 = fin(r2, 0.0).clamp(0.0, 1.0);
+                let g2 = fin(g2, 0.0).clamp(0.0, 1.0);
+                let b2 = fin(b2, 0.0).clamp(0.0, 1.0);
+                let a2 = fin(a2, 0.0).clamp(0.0, 1.0);
+                let border_r = fin(border_r, 0.0).clamp(0.0, 1.0);
+                let border_g = fin(border_g, 0.0).clamp(0.0, 1.0);
+                let border_b = fin(border_b, 0.0).clamp(0.0, 1.0);
+                let border_alpha = fin(border_a, 0.0).clamp(0.0, 1.0) * blend_progress;
                 let has_border = border_alpha > 0.0;
                 let quarter_pi = PI * 0.25;
 
@@ -2367,7 +3360,11 @@ impl MilkdropRenderer {
                 fill_verts.push(ShapeVert {
                     pos: [x_ndc, y_ndc],
                     color: [r, g, b, a * blend_progress],
-                    uv: if is_textured { [0.5, 0.5] } else { [-1.0, -1.0] },
+                    uv: if is_textured {
+                        [0.5, 0.5]
+                    } else {
+                        [-1.0, -1.0]
+                    },
                 });
 
                 let border_start = border_verts.len() as u32;
@@ -2381,18 +3378,28 @@ impl MilkdropRenderer {
                     let (uu, vv) = if is_textured {
                         let tex_ang_sum = p_two_pi + tex_ang + quarter_pi;
                         let z = if tex_zoom.abs() < 1e-6 { 1.0 } else { tex_zoom };
-                        (0.5 + (0.5 * tex_ang_sum.cos() / z) * aspecty,
-                         0.5 + (0.5 * tex_ang_sum.sin() / z))
-                    } else { (-1.0, -1.0) };
+                        (
+                            0.5 + (0.5 * tex_ang_sum.cos() / z) * aspecty,
+                            0.5 + (0.5 * tex_ang_sum.sin() / z),
+                        )
+                    } else {
+                        (-1.0, -1.0)
+                    };
                     fill_verts.push(ShapeVert {
                         pos: [px, py],
                         color: [r2, g2, b2, a2 * blend_progress],
                         uv: [uu, vv],
                     });
-                    if has_border { border_verts.push(BorderVert { pos: [px, py] }); }
+                    if has_border {
+                        border_verts.push(BorderVert { pos: [px, py] });
+                    }
                 }
 
-                fill_draws.push(ShapeFillDraw { base_vertex, sides, additive: is_additive });
+                fill_draws.push(ShapeFillDraw {
+                    base_vertex,
+                    sides,
+                    additive: is_additive,
+                });
 
                 if has_border {
                     border_draws.push(BorderDraw {
@@ -2415,19 +3422,44 @@ impl MilkdropRenderer {
     #[allow(clippy::too_many_arguments)]
     fn build_wave_geometry(
         &mut self,
-        t: f32,
-        bass: f64, mid: f64, treb: f64, vol: f64,
-        bass_att: f64, mid_att: f64, treb_att: f64,
-        inv_aspectx: f32, inv_aspecty: f32,
-        wave_l: &[f32], wave_r: &[f32], freq: &[f32],
+        t: f64,
+        bass: f64,
+        mid: f64,
+        treb: f64,
+        vol: f64,
+        bass_att: f64,
+        mid_att: f64,
+        treb_att: f64,
+        basic_aspectx: f32,
+        basic_aspecty: f32,
+        inv_aspectx: f32,
+        inv_aspecty: f32,
+        wave_l: &[f32],
+        wave_r: &[f32],
+        freq: &[f32],
     ) -> (Vec<WaveVert>, Vec<WaveDraw>) {
         let mut verts: Vec<WaveVert> = Vec::new();
         let mut draws: Vec<WaveDraw> = Vec::new();
         let audio_len = wave_l.len();
 
         // ── Custom waveforms first (index order), then built-in last ─────────
-        self.build_custom_waves(t, bass, mid, treb, vol, bass_att, mid_att, treb_att,
-            inv_aspectx, inv_aspecty, wave_l, wave_r, freq, &mut verts, &mut draws);
+        self.build_custom_waves(
+            t,
+            bass,
+            mid,
+            treb,
+            vol,
+            bass_att,
+            mid_att,
+            treb_att,
+            inv_aspectx,
+            inv_aspecty,
+            wave_l,
+            wave_r,
+            freq,
+            &mut verts,
+            &mut draws,
+        );
 
         if audio_len > 0 {
             // Built-in waveform alpha is the post-per-frame `wave_a` (butterchurn reads
@@ -2435,10 +3467,26 @@ impl MilkdropRenderer {
             // set wave_a=0 in per-frame, which correctly gates the wave off — matching
             // butterchurn. Fall back to the parsed base fWaveAlpha when per-frame never
             // touched wave_a.
-            let live_wave_a = self.eel_env.get("wave_a").copied()
-                .map(|v| v as f32).unwrap_or(self.bw_a);
-            self.build_basic_waveform(t, bass, mid, treb, inv_aspectx, inv_aspecty,
-                live_wave_a, wave_l, wave_r, &mut verts, &mut draws);
+            let live_wave_a = self
+                .eel_env
+                .get("wave_a")
+                .copied()
+                .map(|v| v as f32)
+                .unwrap_or(self.bw_a);
+            let phase_t = shader_time_seconds(t);
+            self.build_basic_waveform(
+                phase_t,
+                bass,
+                mid,
+                treb,
+                basic_aspectx,
+                basic_aspecty,
+                live_wave_a,
+                wave_l,
+                wave_r,
+                &mut verts,
+                &mut draws,
+            );
         }
 
         (verts, draws)
@@ -2448,40 +3496,73 @@ impl MilkdropRenderer {
     fn build_basic_waveform(
         &self,
         t: f32,
-        bass: f64, mid: f64, treb: f64,
-        aspectx: f32, aspecty: f32,
+        bass: f64,
+        mid: f64,
+        treb: f64,
+        aspectx: f32,
+        aspecty: f32,
         live_wave_a: f32,
-        time_l: &[f32], time_r: &[f32],
-        verts: &mut Vec<WaveVert>, draws: &mut Vec<WaveDraw>,
+        time_l: &[f32],
+        time_r: &[f32],
+        verts: &mut Vec<WaveVert>,
+        draws: &mut Vec<WaveDraw>,
     ) {
         use std::f32::consts::PI;
         // alpha gate: built-in reads the post-per-frame wave_a (butterchurn behavior).
         let base_alpha = live_wave_a;
         let vol = ((bass + mid + treb) / 3.0) as f32;
-        if !(vol > -0.01 && base_alpha > 0.001 && !time_l.is_empty()) { return; }
+        if !(vol > -0.01 && base_alpha > 0.0 && !time_l.is_empty()) {
+            return;
+        }
+        let live = |k: &str, d: f32| {
+            self.eel_env
+                .get(k)
+                .copied()
+                .map(|v| v as f32)
+                .filter(|v| v.is_finite())
+                .unwrap_or(d)
+        };
+        let live_bool = |k: &str, d: bool| live(k, if d { 1.0 } else { 0.0 }) != 0.0;
+        let live_wave_mode = live("wave_mode", self.bw_mode);
+        let live_wave_x = live("wave_x", self.bw_x);
+        let live_wave_y = live("wave_y", self.bw_y);
+        let live_wave_mystery = live("wave_mystery", self.bw_mystery);
+        let live_wave_scale = live("wave_scale", self.bw_scale);
+        let live_wave_smoothing = live("wave_smoothing", self.bw_smoothing);
+        let live_dots = live_bool("wave_dots", self.bw_dots);
+        let live_thick = live_bool("wave_thick", self.bw_thick);
+        let live_additive = live_bool("additivewave", self.bw_additive);
+        let live_brighten = live_bool("wave_brighten", self.bw_brighten);
+        let live_modalphavol = live_bool("modwavealphabyvolume", self.bw_modalphavol);
+        let live_modalphastart = live("modwavealphastart", self.bw_modalphastart);
+        let live_modalphaend = live("modwavealphaend", self.bw_modalphaend);
 
         // processWaveform (butterchurn 4520-4533): scale = wave_scale/128 on Int8.
         // Our samples are f32 in [-1,1] (== Int8/128), so the effective scale on the
         // f32 data is simply wave_scale.
         let process = |src: &[f32]| -> Vec<f32> {
-            let scale = self.bw_scale;
-            let smooth = self.bw_smoothing;
+            let scale = live_wave_scale;
+            let smooth = live_wave_smoothing;
             let smooth2 = scale * (1.0 - smooth);
             let n = src.len();
             let mut out = vec![0.0f32; n];
-            if n == 0 { return out; }
+            if n == 0 {
+                return out;
+            }
             out[0] = src[0] * scale;
-            for i in 1..n { out[i] = src[i] * smooth2 + out[i - 1] * smooth; }
+            for i in 1..n {
+                out[i] = src[i] * smooth2 + out[i - 1] * smooth;
+            }
             out
         };
         let wave_l = process(time_l);
         let wave_r = process(time_r);
 
-        let new_wave_mode = (self.bw_mode.floor() as i32).rem_euclid(8);
-        let wave_pos_x = self.bw_x * 2.0 - 1.0;
-        let wave_pos_y = self.bw_y * 2.0 - 1.0;
+        let new_wave_mode = (live_wave_mode.floor() as i32).rem_euclid(8);
+        let wave_pos_x = live_wave_x * 2.0 - 1.0;
+        let wave_pos_y = live_wave_y * 2.0 - 1.0;
 
-        let mut param2 = self.bw_mystery;
+        let mut param2 = live_wave_mystery;
         if (new_wave_mode == 0 || new_wave_mode == 1 || new_wave_mode == 4) && param2.abs() > 1.0 {
             param2 = param2 * 0.5 + 0.5;
             param2 -= param2.floor();
@@ -2497,10 +3578,10 @@ impl MilkdropRenderer {
 
         // mod-wave-alpha-by-volume (every mode applies this). Guarded divide like mode 0.
         let mod_alpha = |alpha: &mut f32| {
-            if self.bw_modalphavol {
-                let diff = self.bw_modalphaend - self.bw_modalphastart;
+            if live_modalphavol {
+                let diff = live_modalphaend - live_modalphastart;
                 if diff.abs() > 1e-9 {
-                    *alpha *= (vol - self.bw_modalphastart) / diff;
+                    *alpha *= (vol - live_modalphastart) / diff;
                 }
             }
         };
@@ -2511,15 +3592,17 @@ impl MilkdropRenderer {
         match new_wave_mode {
             0 => {
                 // circle
-                if self.bw_modalphavol {
-                    let diff = self.bw_modalphaend - self.bw_modalphastart;
+                if live_modalphavol {
+                    let diff = live_modalphaend - live_modalphastart;
                     if diff.abs() > 1e-9 {
-                        alpha *= (vol - self.bw_modalphastart) / diff;
+                        alpha *= (vol - live_modalphastart) / diff;
                     }
                 }
                 alpha = alpha.clamp(0.0, 1.0);
                 let num_vert = (nlen / 2) + 1;
-                if num_vert < 2 { return; }
+                if num_vert < 2 {
+                    return;
+                }
                 let num_vert_inv = 1.0 / (num_vert - 1) as f32;
                 let sample_offset = (nlen.saturating_sub(num_vert)) / 2;
                 positions.resize(num_vert, [0.0, 0.0]);
@@ -2533,8 +3616,10 @@ impl MilkdropRenderer {
                         let rad2 = 0.5 + 0.4 * wave_r[idx2] + param2;
                         rad = (1.0 - mix) * rad2 + rad * mix;
                     }
-                    positions[i] = [rad * ang.cos() * aspecty + wave_pos_x,
-                                    rad * ang.sin() * aspectx + wave_pos_y];
+                    positions[i] = [
+                        rad * ang.cos() * aspecty + wave_pos_x,
+                        rad * ang.sin() * aspectx + wave_pos_y,
+                    ];
                 }
                 positions[num_vert - 1] = positions[0];
             }
@@ -2544,32 +3629,48 @@ impl MilkdropRenderer {
                 mod_alpha(&mut alpha);
                 alpha = alpha.clamp(0.0, 1.0);
                 let num_vert = nlen / 2;
-                if num_vert < 1 { return; }
+                if num_vert < 1 {
+                    return;
+                }
                 positions.resize(num_vert, [0.0, 0.0]);
                 for i in 0..num_vert {
                     let rad = 0.53 + 0.43 * wave_r[i] + param2;
                     let ang = wave_l[(i + 32).min(nlen - 1)] * 0.5 * PI + t * 2.3;
-                    positions[i] = [rad * ang.cos() * aspecty + wave_pos_x,
-                                    rad * ang.sin() * aspectx + wave_pos_y];
+                    positions[i] = [
+                        rad * ang.cos() * aspecty + wave_pos_x,
+                        rad * ang.sin() * aspectx + wave_pos_y,
+                    ];
                 }
             }
             2 => {
                 // X/Y scatter, faint
-                alpha *= if texsize_x < 1024.0 { 0.09 }
-                         else if texsize_x < 2048.0 { 0.11 } else { 0.13 };
+                alpha *= if texsize_x < 1024.0 {
+                    0.09
+                } else if texsize_x < 2048.0 {
+                    0.11
+                } else {
+                    0.13
+                };
                 mod_alpha(&mut alpha);
                 alpha = alpha.clamp(0.0, 1.0);
                 let num_vert = nlen;
                 positions.resize(num_vert, [0.0, 0.0]);
                 for i in 0..num_vert {
-                    positions[i] = [wave_r[i] * aspecty + wave_pos_x,
-                                    wave_l[(i + 32) % nlen] * aspectx + wave_pos_y];
+                    positions[i] = [
+                        wave_r[i] * aspecty + wave_pos_x,
+                        wave_l[(i + 32) % nlen] * aspectx + wave_pos_y,
+                    ];
                 }
             }
             3 => {
                 // X/Y scatter, treble-gated (same geometry as mode 2)
-                alpha *= if texsize_x < 1024.0 { 0.15 }
-                         else if texsize_x < 2048.0 { 0.22 } else { 0.33 };
+                alpha *= if texsize_x < 1024.0 {
+                    0.15
+                } else if texsize_x < 2048.0 {
+                    0.22
+                } else {
+                    0.33
+                };
                 alpha *= 1.3;
                 alpha *= (treb * treb) as f32;
                 mod_alpha(&mut alpha);
@@ -2577,8 +3678,10 @@ impl MilkdropRenderer {
                 let num_vert = nlen;
                 positions.resize(num_vert, [0.0, 0.0]);
                 for i in 0..num_vert {
-                    positions[i] = [wave_r[i] * aspecty + wave_pos_x,
-                                    wave_l[(i + 32) % nlen] * aspectx + wave_pos_y];
+                    positions[i] = [
+                        wave_r[i] * aspecty + wave_pos_x,
+                        wave_l[(i + 32) % nlen] * aspectx + wave_pos_y,
+                    ];
                 }
             }
             4 => {
@@ -2589,14 +3692,17 @@ impl MilkdropRenderer {
                 if num_vert > (texsize_x / 3.0) as usize {
                     num_vert = (texsize_x / 3.0).floor() as usize;
                 }
-                if num_vert < 2 { return; }
+                if num_vert < 2 {
+                    return;
+                }
                 let num_vert_inv = 1.0 / num_vert as f32; // NOT num_vert-1
                 let sample_offset = nlen.saturating_sub(num_vert) / 2;
                 let w1 = 0.45 + 0.5 * (param2 * 0.5 + 0.5);
                 let w2 = 1.0 - w1;
                 positions.resize(num_vert, [0.0, 0.0]);
                 for i in 0..num_vert {
-                    let mut x = 2.0 * (i as f32) * num_vert_inv + (wave_pos_x - 1.0)
+                    let mut x = 2.0 * (i as f32) * num_vert_inv
+                        + (wave_pos_x - 1.0)
                         + wave_r[(i + 25 + sample_offset) % nlen] * 0.44;
                     let mut y = wave_l[i + sample_offset] * 0.47 + wave_pos_y;
                     if i > 1 {
@@ -2608,8 +3714,13 @@ impl MilkdropRenderer {
             }
             5 => {
                 // Lissajous-ish rotating
-                alpha *= if texsize_x < 1024.0 { 0.09 }
-                         else if texsize_x < 2048.0 { 0.11 } else { 0.13 };
+                alpha *= if texsize_x < 1024.0 {
+                    0.09
+                } else if texsize_x < 2048.0 {
+                    0.11
+                } else {
+                    0.13
+                };
                 mod_alpha(&mut alpha);
                 alpha = alpha.clamp(0.0, 1.0);
                 let cos_rot = (t * 0.3).cos();
@@ -2620,8 +3731,10 @@ impl MilkdropRenderer {
                     let ioff = (i + 32) % nlen;
                     let x0 = wave_r[i] * wave_l[ioff] + wave_l[i] * wave_r[ioff];
                     let y0 = wave_r[i] * wave_r[i] - wave_l[ioff] * wave_l[ioff];
-                    positions[i] = [(x0 * cos_rot - y0 * sin_rot) * (aspecty + wave_pos_x),
-                                    (x0 * sin_rot + y0 * cos_rot) * (aspectx + wave_pos_y)];
+                    positions[i] = [
+                        (x0 * cos_rot - y0 * sin_rot) * (aspecty + wave_pos_x),
+                        (x0 * sin_rot + y0 * cos_rot) * (aspectx + wave_pos_y),
+                    ];
                 }
             }
             6 | 7 => {
@@ -2632,25 +3745,51 @@ impl MilkdropRenderer {
                 if num_vert > (texsize_x / 3.0) as usize {
                     num_vert = (texsize_x / 3.0).floor() as usize;
                 }
-                if num_vert < 1 { return; }
+                if num_vert < 1 {
+                    return;
+                }
                 let sample_offset = nlen.saturating_sub(num_vert) / 2;
                 let ang = PI * 0.5 * param2;
                 let mut dx = ang.cos();
                 let mut dy = ang.sin();
                 // Both edgex AND edgey seed from wave_pos_x (butterchurn quirk — literal).
-                let mut edgex = [wave_pos_x * (ang + PI * 0.5).cos() - dx * 3.0,
-                                 wave_pos_x * (ang + PI * 0.5).cos() + dx * 3.0];
-                let mut edgey = [wave_pos_x * (ang + PI * 0.5).sin() - dy * 3.0,
-                                 wave_pos_x * (ang + PI * 0.5).sin() + dy * 3.0];
+                let mut edgex = [
+                    wave_pos_x * (ang + PI * 0.5).cos() - dx * 3.0,
+                    wave_pos_x * (ang + PI * 0.5).cos() + dx * 3.0,
+                ];
+                let mut edgey = [
+                    wave_pos_x * (ang + PI * 0.5).sin() - dy * 3.0,
+                    wave_pos_x * (ang + PI * 0.5).sin() + dy * 3.0,
+                ];
                 for i in 0..2 {
                     for j in 0..4 {
                         let mut tt = 0.0f32;
                         let mut clip = false;
                         match j {
-                            0 => if edgex[i] >  1.1 { tt = ( 1.1 - edgex[1 - i]) / (edgex[i] - edgex[1 - i]); clip = true; },
-                            1 => if edgex[i] < -1.1 { tt = (-1.1 - edgex[1 - i]) / (edgex[i] - edgex[1 - i]); clip = true; },
-                            2 => if edgey[i] >  1.1 { tt = ( 1.1 - edgey[1 - i]) / (edgey[i] - edgey[1 - i]); clip = true; },
-                            3 => if edgey[i] < -1.1 { tt = (-1.1 - edgey[1 - i]) / (edgey[i] - edgey[1 - i]); clip = true; },
+                            0 => {
+                                if edgex[i] > 1.1 {
+                                    tt = (1.1 - edgex[1 - i]) / (edgex[i] - edgex[1 - i]);
+                                    clip = true;
+                                }
+                            }
+                            1 => {
+                                if edgex[i] < -1.1 {
+                                    tt = (-1.1 - edgex[1 - i]) / (edgex[i] - edgex[1 - i]);
+                                    clip = true;
+                                }
+                            }
+                            2 => {
+                                if edgey[i] > 1.1 {
+                                    tt = (1.1 - edgey[1 - i]) / (edgey[i] - edgey[1 - i]);
+                                    clip = true;
+                                }
+                            }
+                            3 => {
+                                if edgey[i] < -1.1 {
+                                    tt = (-1.1 - edgey[1 - i]) / (edgey[i] - edgey[1 - i]);
+                                    clip = true;
+                                }
+                            }
                             _ => {}
                         }
                         if clip {
@@ -2671,8 +3810,10 @@ impl MilkdropRenderer {
                     positions.resize(num_vert, [0.0, 0.0]);
                     for i in 0..num_vert {
                         let s = wave_l[i + sample_offset];
-                        positions[i] = [edgex[0] + dx * (i as f32) + perp_dx * 0.25 * s,
-                                        edgey[0] + dy * (i as f32) + perp_dy * 0.25 * s];
+                        positions[i] = [
+                            edgex[0] + dx * (i as f32) + perp_dx * 0.25 * s,
+                            edgey[0] + dy * (i as f32) + perp_dy * 0.25 * s,
+                        ];
                     }
                 } else {
                     // MODE 7: dual line — L line + R line separated by sep.
@@ -2681,13 +3822,17 @@ impl MilkdropRenderer {
                     let mut p2: Vec<[f32; 2]> = vec![[0.0, 0.0]; num_vert];
                     for i in 0..num_vert {
                         let s = wave_l[i + sample_offset];
-                        positions[i] = [edgex[0] + dx * (i as f32) + perp_dx * (0.25 * s + sep),
-                                        edgey[0] + dy * (i as f32) + perp_dy * (0.25 * s + sep)];
+                        positions[i] = [
+                            edgex[0] + dx * (i as f32) + perp_dx * (0.25 * s + sep),
+                            edgey[0] + dy * (i as f32) + perp_dy * (0.25 * s + sep),
+                        ];
                     }
                     for i in 0..num_vert {
                         let s = wave_r[i + sample_offset];
-                        p2[i] = [edgex[0] + dx * (i as f32) + perp_dx * (0.25 * s - sep),
-                                 edgey[0] + dy * (i as f32) + perp_dy * (0.25 * s - sep)];
+                        p2[i] = [
+                            edgex[0] + dx * (i as f32) + perp_dx * (0.25 * s - sep),
+                            edgey[0] + dy * (i as f32) + perp_dy * (0.25 * s - sep),
+                        ];
                     }
                     positions2 = Some(p2);
                 }
@@ -2702,29 +3847,40 @@ impl MilkdropRenderer {
         // post-per-frame wave_r/g/b (butterchurn basicWaveform.js:446-448 reads
         // mdVSFrame.wave_*), mirroring live_wave_a; fall back to the parsed base when
         // per-frame never wrote them (idx 9096 colors its waveform in per-frame eqs).
-        let lc = |k: &str, d: f32| self.eel_env.get(k).copied().map(|v| v as f32).unwrap_or(d);
-        let mut cr = lc("wave_r", self.bw_r).clamp(0.0, 1.0);
-        let mut cg = lc("wave_g", self.bw_g).clamp(0.0, 1.0);
-        let mut cb = lc("wave_b", self.bw_b).clamp(0.0, 1.0);
-        if self.bw_brighten {
+        let mut cr = live("wave_r", self.bw_r).clamp(0.0, 1.0);
+        let mut cg = live("wave_g", self.bw_g).clamp(0.0, 1.0);
+        let mut cb = live("wave_b", self.bw_b).clamp(0.0, 1.0);
+        if live_brighten {
             let maxc = cr.max(cg).max(cb);
-            if maxc > 0.01 { cr /= maxc; cg /= maxc; cb /= maxc; }
+            if maxc > 0.01 {
+                cr /= maxc;
+                cg /= maxc;
+                cb /= maxc;
+            }
         }
         let color = [cr, cg, cb, alpha];
 
-        if alpha <= 0.0 { return; }
+        if alpha <= 0.0 {
+            return;
+        }
 
         // Shared tail: Y-flip (butterchurn negates pos.y before smoothing), smooth,
         // push verts, push a WaveDraw. Called once for modes 0-6, twice for mode 7.
-        let dots = self.bw_dots;
-        let additive = self.bw_additive;
-        let thick = self.bw_thick || self.bw_dots;
+        let dots = live_dots;
+        let additive = live_additive;
+        let thick = live_thick || live_dots;
         let mut emit = |pos: &mut Vec<[f32; 2]>| {
-            for p in pos.iter_mut() { p[1] = -p[1]; }
+            for p in pos.iter_mut() {
+                p[1] = -p[1];
+            }
             let smoothed = smooth_wave(pos);
-            if smoothed.is_empty() { return; }
+            if smoothed.is_empty() {
+                return;
+            }
             let start = verts.len() as u32;
-            for p in &smoothed { verts.push(WaveVert { pos: *p, color }); }
+            for p in &smoothed {
+                verts.push(WaveVert { pos: *p, color });
+            }
             draws.push(WaveDraw {
                 start_vert: start,
                 count: smoothed.len() as u32,
@@ -2734,21 +3890,34 @@ impl MilkdropRenderer {
             });
         };
         emit(&mut positions);
-        if let Some(mut p2) = positions2 { emit(&mut p2); }
+        if let Some(mut p2) = positions2 {
+            emit(&mut p2);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_custom_waves(
         &mut self,
-        t: f32,
-        bass: f64, mid: f64, treb: f64, vol: f64,
-        bass_att: f64, mid_att: f64, treb_att: f64,
-        inv_aspectx: f32, inv_aspecty: f32,
-        time_l: &[f32], time_r: &[f32], freq: &[f32],
-        verts: &mut Vec<WaveVert>, draws: &mut Vec<WaveDraw>,
+        t: f64,
+        bass: f64,
+        mid: f64,
+        treb: f64,
+        vol: f64,
+        bass_att: f64,
+        mid_att: f64,
+        treb_att: f64,
+        inv_aspectx: f32,
+        inv_aspecty: f32,
+        time_l: &[f32],
+        time_r: &[f32],
+        freq: &[f32],
+        verts: &mut Vec<WaveVert>,
+        draws: &mut Vec<WaveDraw>,
     ) {
         let max_samples = time_l.len();
-        if max_samples == 0 { return; }
+        if max_samples == 0 {
+            return;
+        }
         let wave_scale_base = self.bw_scale;
         let frame_idx = self.frame_idx;
         // q1..q32 from the main per-frame EEL — custom waveforms read these (ORB's
@@ -2756,24 +3925,35 @@ impl MilkdropRenderer {
         // Full q1..q32 (was capped at q8) to match MilkDrop/Butterchurn shape/wave semantics.
         let mut qv = [0.0f64; 32];
         for i in 0..32 {
-            qv[i] = self.eel_env.get(format!("q{}", i + 1).as_str()).copied().unwrap_or(0.0);
+            qv[i] = self
+                .eel_env
+                .get(format!("q{}", i + 1).as_str())
+                .copied()
+                .unwrap_or(0.0);
         }
 
         for wv in self.waves.iter_mut() {
-            if !wv.def.enabled { continue; }
+            if !wv.def.enabled {
+                continue;
+            }
 
             // ── per-frame run ────────────────────────────────────────────────
             let env = &mut wv.env;
             env.insert("time".into(), t as f64);
             env.insert("frame".into(), frame_idx as f64);
             env.insert("fps".into(), 60.0);
-            env.insert("bass".into(), bass);  env.insert("bass_att".into(), bass_att);
-            env.insert("mid".into(), mid);    env.insert("mid_att".into(), mid_att);
-            env.insert("treb".into(), treb);  env.insert("treb_att".into(), treb_att);
+            env.insert("bass".into(), bass);
+            env.insert("bass_att".into(), bass_att);
+            env.insert("mid".into(), mid);
+            env.insert("mid_att".into(), mid_att);
+            env.insert("treb".into(), treb);
+            env.insert("treb_att".into(), treb_att);
             env.insert("vol".into(), vol);
             env.insert("aspectx".into(), inv_aspectx as f64);
             env.insert("aspecty".into(), inv_aspecty as f64);
-            for (i, q) in qv.iter().enumerate() { env.insert(format!("q{}", i + 1), *q); }
+            for (i, q) in qv.iter().enumerate() {
+                env.insert(format!("q{}", i + 1), *q);
+            }
             env.insert("samples".into(), wv.def.samples as f64);
             env.insert("sep".into(), wv.def.sep as f64);
             env.insert("scaling".into(), wv.def.scaling as f64);
@@ -2783,12 +3963,14 @@ impl MilkdropRenderer {
             env.insert("g".into(), wv.def.g as f64);
             env.insert("b".into(), wv.def.b as f64);
             env.insert("a".into(), wv.def.a as f64);
-            if let Some(p) = &wv.per_frame_prog { p.run_with(env, &mut wv.state); }
+            if let Some(p) = &wv.per_frame_prog {
+                p.run_with(env, &mut wv.state);
+            }
             let rd = |env: &Env, k: &str, d: f64| env.get(k).copied().unwrap_or(d);
             let pf_samples = rd(env, "samples", wv.def.samples as f64).floor().max(0.0) as usize;
             let pf_sep = rd(env, "sep", wv.def.sep as f64).floor() as i32;
             let pf_scaling = rd(env, "scaling", wv.def.scaling as f64) as f32;
-            let pf_spectrum = rd(env, "spectrum", if wv.def.spectrum {1.0} else {0.0}) != 0.0;
+            let pf_spectrum = rd(env, "spectrum", if wv.def.spectrum { 1.0 } else { 0.0 }) != 0.0;
             let pf_smoothing = rd(env, "smoothing", wv.def.smoothing as f64) as f32;
             let frame_r = rd(env, "r", wv.def.r as f64) as f32;
             let frame_g = rd(env, "g", wv.def.g as f64) as f32;
@@ -2799,7 +3981,9 @@ impl MilkdropRenderer {
             let mut samples = pf_samples.min(max_samples);
             let sep = pf_sep.max(0) as usize;
             samples = samples.saturating_sub(sep);
-            if !(samples >= 2 || (wv.def.use_dots && samples >= 1)) { continue; }
+            if !(samples >= 2 || (wv.def.use_dots && samples >= 1)) {
+                continue;
+            }
 
             // The *128 converts our normalized [-1,1] TIME samples to butterchurn's Int8
             // [-128,127] range that the 0.004 constant assumes. The SPECTRUM branch must
@@ -2807,12 +3991,12 @@ impl MilkdropRenderer {
             // and our synth freq array is already ~[0,1] — *128 shoves every bin off-screen
             // (idx 8548 went black; silent-audio control renders it at luma 0.30). Keep the
             // *128 on the time branch only.
-            let scale = (if pf_spectrum { 0.15 } else { 0.004 * 128.0 }) * pf_scaling * wave_scale_base;
+            let scale =
+                (if pf_spectrum { 0.15 } else { 0.004 * 128.0 }) * pf_scaling * wave_scale_base;
             // bSpectrum waveforms read the FFT freqArray (butterchurn customWaveform.js:
-            // pointsLeft = useSpectrum ? freqArrayL : timeArrayL). Our freq array is mono
-            // (512 bins, Butterchurn-shaped + equalized) so both channels read it. When no
-            // live freq is available (headless/synthetic), fall back to time data so those
-            // deterministic renders are unchanged.
+            // pointsLeft = useSpectrum ? freqArrayL : timeArrayL). Our freq array is still
+            // mono, but honor sep as an offset into that spectrum so value1/value2 do not
+            // collapse to the same bin. When no live freq is available, fall back to time data.
             let use_freq = pf_spectrum && freq.len() == max_samples;
             let (src_l, src_r): (&[f32], &[f32]) = if use_freq {
                 (freq, freq)
@@ -2820,10 +4004,18 @@ impl MilkdropRenderer {
                 (time_l, time_r)
             };
             let (j0, j1, step) = if pf_spectrum {
-                (0usize, 0usize, ((max_samples.saturating_sub(sep)).max(1) / samples.max(1)).max(1))
+                (
+                    0usize,
+                    sep.min(max_samples.saturating_sub(1)),
+                    ((max_samples.saturating_sub(sep)).max(1) / samples.max(1)).max(1),
+                )
             } else {
-                let j0 = ((max_samples as f32 - samples as f32) / 2.0 - sep as f32 / 2.0).floor().max(0.0) as usize;
-                let j1 = ((max_samples as f32 - samples as f32) / 2.0 + sep as f32 / 2.0).floor().max(0.0) as usize;
+                let j0 = ((max_samples as f32 - samples as f32) / 2.0 - sep as f32 / 2.0)
+                    .floor()
+                    .max(0.0) as usize;
+                let j1 = ((max_samples as f32 - samples as f32) / 2.0 + sep as f32 / 2.0)
+                    .floor()
+                    .max(0.0) as usize;
                 (j0, j1, 1usize)
             };
             let mix1 = (pf_smoothing * 0.98).max(0.0).powf(0.5);
@@ -2854,7 +4046,11 @@ impl MilkdropRenderer {
             for j in 0..samples {
                 let value1 = pts_l[j];
                 let value2 = pts_r[j];
-                let sample_t = if samples <= 1 { 0.0 } else { j as f64 / (samples - 1) as f64 };
+                let sample_t = if samples <= 1 {
+                    0.0
+                } else {
+                    j as f64 / (samples - 1) as f64
+                };
                 let env = &mut wv.env;
                 env.insert("sample".into(), sample_t);
                 env.insert("value1".into(), value1 as f64);
@@ -2865,7 +4061,9 @@ impl MilkdropRenderer {
                 env.insert("g".into(), frame_g as f64);
                 env.insert("b".into(), frame_b as f64);
                 env.insert("a".into(), frame_a as f64);
-                if let Some(p) = &wv.per_point_prog { p.run_with(env, &mut wv.state); }
+                if let Some(p) = &wv.per_point_prog {
+                    p.run_with(env, &mut wv.state);
+                }
                 let px = (rd(env, "x", 0.5) * 2.0 - 1.0) * inv_aspectx as f64;
                 let py = (rd(env, "y", 0.5) * -2.0 + 1.0) * inv_aspecty as f64;
                 // Clamp per-point color/alpha and guard NaN/inf (audio-gated point
@@ -2887,8 +4085,11 @@ impl MilkdropRenderer {
                     verts.push(WaveVert { pos: *p, color: *c });
                 }
                 draws.push(WaveDraw {
-                    start_vert: start, count: positions.len() as u32,
-                    points: true, additive: wv.def.additive, thick: wv.def.draw_thick,
+                    start_vert: start,
+                    count: positions.len() as u32,
+                    points: true,
+                    additive: wv.def.additive,
+                    thick: wv.def.draw_thick || wv.def.use_dots,
                 });
             } else {
                 let (sp, sc) = smooth_wave_and_color(&positions, &colors);
@@ -2897,8 +4098,11 @@ impl MilkdropRenderer {
                     verts.push(WaveVert { pos: *p, color: *c });
                 }
                 draws.push(WaveDraw {
-                    start_vert: start, count: sp.len() as u32,
-                    points: false, additive: wv.def.additive, thick: wv.def.draw_thick,
+                    start_vert: start,
+                    count: sp.len() as u32,
+                    points: false,
+                    additive: wv.def.additive,
+                    thick: wv.def.draw_thick,
                 });
             }
         }
@@ -2911,57 +4115,96 @@ impl MilkdropRenderer {
     fn compute_warp_verts(&mut self, t: f32, aspectx: f32, aspecty: f32) -> Vec<WarpVert> {
         let b = self.base_warp;
         // Resolve per-FRAME warp params: base, overridden by per-frame EEL writes.
-        let getf = |k: &str, def: f32| self.eel_env.get(k).copied().map(|v| v as f32).unwrap_or(def);
-        let fzoom    = getf("zoom",    b.zoom);
+        let getf = |k: &str, def: f32| {
+            self.eel_env
+                .get(k)
+                .copied()
+                .map(|v| v as f32)
+                .unwrap_or(def)
+        };
+        let fzoom = getf("zoom", b.zoom);
         let fzoomexp = getf("zoomexp", b.zoomexp);
-        let frot     = getf("rot",     b.rot);
-        let fwarp    = getf("warp",    b.warp);
-        let fcx      = getf("cx",      b.cx);
-        let fcy      = getf("cy",      b.cy);
-        let fdx      = getf("dx",      b.dx);
-        let fdy      = getf("dy",      b.dy);
-        let fsx      = getf("sx",      b.sx);
-        let fsy      = getf("sy",      b.sy);
-        let fdecay   = getf("decay",   b.decay);
-        let wscale   = getf("warpscale",     b.warpscale).max(1e-6);
-        let wanim    = getf("warpanimspeed", b.warpanimspeed);
+        let frot = getf("rot", b.rot);
+        let fwarp = getf("warp", b.warp);
+        let fcx = getf("cx", b.cx);
+        let fcy = getf("cy", b.cy);
+        let fdx = getf("dx", b.dx);
+        let fdy = getf("dy", b.dy);
+        let fsx = getf("sx", b.sx);
+        let fsy = getf("sy", b.sy);
+        let fdecay = getf("decay", b.decay);
+        let wscale = getf("warpscale", b.warpscale).max(1e-6);
+        let wanim = getf("warpanimspeed", b.warpanimspeed);
 
-        let warp_time_v   = t * wanim;
+        let warp_time_v = t * wanim;
         let warp_scale_inv = 1.0_f32 / wscale;
         let warpf0 = 11.68 + 4.0 * (warp_time_v * 1.413 + 10.0).cos();
-        let warpf1 =  8.77 + 3.0 * (warp_time_v * 1.113 +  7.0).cos();
-        let warpf2 = 10.54 + 3.0 * (warp_time_v * 1.233 +  3.0).cos();
-        let warpf3 = 11.49 + 4.0 * (warp_time_v * 0.933 +  5.0).cos();
+        let warpf1 = 8.77 + 3.0 * (warp_time_v * 1.113 + 7.0).cos();
+        let warpf2 = 10.54 + 3.0 * (warp_time_v * 1.233 + 3.0).cos();
+        let warpf3 = 11.49 + 4.0 * (warp_time_v * 0.933 + 5.0).cos();
 
         let ax = aspectx as f64;
         let ay = aspecty as f64;
         // EEL `aspectx`/`aspecty` are seeded INVERTED per butterchurn presetEquationRunner.
-        let inv_ax = if aspectx != 0.0 { 1.0 / aspectx as f64 } else { 1.0 };
-        let inv_ay = if aspecty != 0.0 { 1.0 / aspecty as f64 } else { 1.0 };
+        let inv_ax = if aspectx != 0.0 {
+            1.0 / aspectx as f64
+        } else {
+            1.0
+        };
+        let inv_ay = if aspecty != 0.0 {
+            1.0 / aspecty as f64
+        } else {
+            1.0
+        };
 
         let has_prog = self.per_pixel_prog.is_some();
 
-        // Seed constant per-frame inputs ONCE into the reusable scratch env.
-        if has_prog {
-            let qget = |k: &str| self.eel_env.get(k).copied().unwrap_or(0.0);
-            let consts: [(&str, f64); 21] = [
-                ("time", t as f64),
-                ("frame", self.frame_idx as f64),
-                ("fps", 60.0),
-                ("bass", self.eel_env.get("bass").copied().unwrap_or(0.0)),
-                ("mid",  self.eel_env.get("mid").copied().unwrap_or(0.0)),
-                ("treb", self.eel_env.get("treb").copied().unwrap_or(0.0)),
-                ("vol",  self.eel_env.get("vol").copied().unwrap_or(0.0)),
-                ("bass_att", self.eel_env.get("bass_att").copied().unwrap_or(0.0)),
-                ("mid_att",  self.eel_env.get("mid_att").copied().unwrap_or(0.0)),
-                ("treb_att", self.eel_env.get("treb_att").copied().unwrap_or(0.0)),
-                ("vol_att",  self.eel_env.get("vol_att").copied().unwrap_or(0.0)),
-                ("aspectx", inv_ax), ("aspecty", inv_ay),
-                ("q1", qget("q1")), ("q2", qget("q2")), ("q3", qget("q3")), ("q4", qget("q4")),
-                ("q5", qget("q5")), ("q6", qget("q6")), ("q7", qget("q7")), ("q8", qget("q8")),
-            ];
-            for (k, v) in consts { self.warp_env.insert(k.to_string(), v); }
-        }
+        // Per-pixel equations start from the post-per-frame env. This carries user
+        // vars like `v`, `mx`, q9..q32, etc.; reloading it per vertex also prevents
+        // temporary vars from leaking between mesh vertices.
+        let warp_frame_env: Option<Vec<(String, f64)>> = if has_prog {
+            let mut env = self.eel_env.clone();
+            env.insert("time".into(), t as f64);
+            env.insert("frame".into(), self.frame_idx as f64);
+            env.insert("fps".into(), 60.0);
+            env.insert(
+                "bass".into(),
+                self.eel_env.get("bass").copied().unwrap_or(0.0),
+            );
+            env.insert(
+                "mid".into(),
+                self.eel_env.get("mid").copied().unwrap_or(0.0),
+            );
+            env.insert(
+                "treb".into(),
+                self.eel_env.get("treb").copied().unwrap_or(0.0),
+            );
+            env.insert(
+                "vol".into(),
+                self.eel_env.get("vol").copied().unwrap_or(0.0),
+            );
+            env.insert(
+                "bass_att".into(),
+                self.eel_env.get("bass_att").copied().unwrap_or(0.0),
+            );
+            env.insert(
+                "mid_att".into(),
+                self.eel_env.get("mid_att").copied().unwrap_or(0.0),
+            );
+            env.insert(
+                "treb_att".into(),
+                self.eel_env.get("treb_att").copied().unwrap_or(0.0),
+            );
+            env.insert(
+                "vol_att".into(),
+                self.eel_env.get("vol_att").copied().unwrap_or(0.0),
+            );
+            env.insert("aspectx".into(), inv_ax);
+            env.insert("aspecty".into(), inv_ay);
+            Some(env.into_iter().collect())
+        } else {
+            None
+        };
 
         let vw = GRID_W + 1;
         let vh = GRID_H + 1;
@@ -2977,7 +4220,8 @@ impl MilkdropRenderer {
 
                 // Defaults (per-frame values) in case there's no program.
                 let (mut zoom, mut zoomexp, mut rot, mut warp) = (fzoom, fzoomexp, frot, fwarp);
-                let (mut cx, mut cy, mut dx, mut dy, mut sx, mut sy) = (fcx, fcy, fdx, fdy, fsx, fsy);
+                let (mut cx, mut cy, mut dx, mut dy, mut sx, mut sy) =
+                    (fcx, fcy, fdx, fdy, fsx, fsy);
                 let (mut dr, mut dg, mut db) = (fdecay, fdecay, fdecay);
 
                 if let Some(prog) = self.per_pixel_prog.as_ref() {
@@ -2987,37 +4231,56 @@ impl MilkdropRenderer {
                         (yf * ay).atan2(xf * ax)
                     };
                     let env = &mut self.warp_env;
-                    env.insert("x".into(),   xf * 0.5 * ax + 0.5);
-                    env.insert("y".into(),   yf * -0.5 * ay + 0.5);
+                    if let Some(base) = warp_frame_env.as_ref() {
+                        env.clear();
+                        for (k, v) in base {
+                            env.insert(k.clone(), *v);
+                        }
+                    }
+                    env.insert("x".into(), xf * 0.5 * ax + 0.5);
+                    env.insert("y".into(), yf * -0.5 * ay + 0.5);
                     env.insert("rad".into(), rad);
                     env.insert("ang".into(), ang);
-                    env.insert("zoom".into(),    fzoom as f64);
+                    env.insert("zoom".into(), fzoom as f64);
                     env.insert("zoomexp".into(), fzoomexp as f64);
-                    env.insert("rot".into(),     frot as f64);
-                    env.insert("warp".into(),    fwarp as f64);
-                    env.insert("cx".into(),      fcx as f64);
-                    env.insert("cy".into(),      fcy as f64);
-                    env.insert("dx".into(),      fdx as f64);
-                    env.insert("dy".into(),      fdy as f64);
-                    env.insert("sx".into(),      fsx as f64);
-                    env.insert("sy".into(),      fsy as f64);
-                    env.insert("decay".into(),   fdecay as f64);
+                    env.insert("rot".into(), frot as f64);
+                    env.insert("warp".into(), fwarp as f64);
+                    env.insert("cx".into(), fcx as f64);
+                    env.insert("cy".into(), fcy as f64);
+                    env.insert("dx".into(), fdx as f64);
+                    env.insert("dy".into(), fdy as f64);
+                    env.insert("sx".into(), fsx as f64);
+                    env.insert("sy".into(), fsy as f64);
+                    env.insert("decay".into(), fdecay as f64);
                     env.insert("decay_r".into(), fdecay as f64);
                     env.insert("decay_g".into(), fdecay as f64);
                     env.insert("decay_b".into(), fdecay as f64);
                     prog.run_with(env, &mut self.warp_state);
                     let g = |k: &str, d: f32| env.get(k).copied().map(|v| v as f32).unwrap_or(d);
-                    zoom = g("zoom", fzoom); zoomexp = g("zoomexp", fzoomexp);
-                    rot = g("rot", frot);    warp = g("warp", fwarp);
-                    cx = g("cx", fcx); cy = g("cy", fcy);
-                    dx = g("dx", fdx); dy = g("dy", fdy);
-                    sx = g("sx", fsx); sy = g("sy", fsy);
-                    dr = g("decay_r", fdecay); dg = g("decay_g", fdecay); db = g("decay_b", fdecay);
+                    zoom = g("zoom", fzoom);
+                    zoomexp = g("zoomexp", fzoomexp);
+                    rot = g("rot", frot);
+                    warp = g("warp", fwarp);
+                    cx = g("cx", fcx);
+                    cy = g("cy", fcy);
+                    dx = g("dx", fdx);
+                    dy = g("dy", fdy);
+                    sx = g("sx", fsx);
+                    sy = g("sy", fsy);
+                    dr = g("decay_r", fdecay);
+                    dg = g("decay_g", fdecay);
+                    db = g("decay_b", fdecay);
                 }
 
-                if zoom.abs() < 1e-6 { zoom = 1e-6; }
-                if sx.abs() < 1e-6 { sx = 1e-6; }
-                if sy.abs() < 1e-6 { sy = 1e-6; }
+                if zoom.abs() < 1e-6 {
+                    zoom = 1e-6;
+                }
+                if sx.abs() < 1e-6 {
+                    sx = 1e-6;
+                }
+                if sy.abs() < 1e-6 {
+                    sy = 1e-6;
+                }
 
                 // ── UV composition (butterchurn renderer.js runPixelEquations) ──
                 let zoom2v = zoom.powf(zoomexp.powf(rad as f32 * 2.0 - 1.0));
@@ -3029,10 +4292,18 @@ impl MilkdropRenderer {
                 v = (v - cy) / sy + cy;
                 // warp octaves
                 if warp.abs() > 1e-9 {
-                    u += warp * 0.0035 * (warp_time_v * 0.333 + warp_scale_inv * (x * warpf0 - y * warpf3)).sin();
-                    v += warp * 0.0035 * (warp_time_v * 0.375 - warp_scale_inv * (x * warpf2 + y * warpf1)).cos();
-                    u += warp * 0.0035 * (warp_time_v * 0.753 - warp_scale_inv * (x * warpf1 - y * warpf2)).cos();
-                    v += warp * 0.0035 * (warp_time_v * 0.825 + warp_scale_inv * (x * warpf0 + y * warpf3)).sin();
+                    u += warp
+                        * 0.0035
+                        * (warp_time_v * 0.333 + warp_scale_inv * (x * warpf0 - y * warpf3)).sin();
+                    v += warp
+                        * 0.0035
+                        * (warp_time_v * 0.375 - warp_scale_inv * (x * warpf2 + y * warpf1)).cos();
+                    u += warp
+                        * 0.0035
+                        * (warp_time_v * 0.753 - warp_scale_inv * (x * warpf1 - y * warpf2)).cos();
+                    v += warp
+                        * 0.0035
+                        * (warp_time_v * 0.825 + warp_scale_inv * (x * warpf0 + y * warpf3)).sin();
                 }
                 // rotate about (cx,cy)
                 let u2 = u - cx;
@@ -3050,19 +4321,41 @@ impl MilkdropRenderer {
 
                 let px = x;
                 let py = -y; // clip-space: top row (j=0, y=-1) -> py=+1
-                verts.push(WarpVert { pos: [px, py], uv: [u, v], decay: [dr, dg, db, 1.0] });
+                verts.push(WarpVert {
+                    pos: [px, py],
+                    uv: [u, v],
+                    decay: [dr, dg, db, 1.0],
+                });
             }
         }
         verts
     }
 
     pub fn render(&mut self, surface_view: &wgpu::TextureView) {
-        let t = match self.time_per_frame {
-            Some(dt) => self.frame_idx as f32 * dt,
-            None => self.start.elapsed().as_secs_f32(),
-        };
+        let t = deterministic_time_seconds(self.frame_idx, self.time_per_frame)
+            .unwrap_or_else(|| self.start.elapsed().as_secs_f64());
+        let shader_t = shader_time_seconds(t);
+        let shader_frame = shader_frame_index(self.frame_idx);
+        let progress = shader_progress(t);
         let (w, h) = (self.width as f32, self.height as f32);
-        let asp = w / h;
+        // Butterchurn shader uniform convention: aspect.xy hold the geometry aspect
+        // factors and aspect.zw hold their inverses. Geometry paths below use the
+        // same values, so custom shaders and CPU geometry agree.
+        let (shape_aspectx, shape_aspecty) = if self.width > self.height {
+            (1.0f32, self.height as f32 / self.width as f32)
+        } else {
+            (self.width as f32 / self.height as f32, 1.0f32)
+        };
+        let inv_aspectx = if shape_aspectx != 0.0 {
+            1.0 / shape_aspectx
+        } else {
+            1.0
+        };
+        let inv_aspecty = if shape_aspecty != 0.0 {
+            1.0 / shape_aspecty
+        } else {
+            1.0
+        };
 
         // Audio reactivity: live mic features when supplied, else synthetic sine
         // waves at different frequencies so offscreen/headless renders still animate.
@@ -3070,9 +4363,9 @@ impl MilkdropRenderer {
             Some([b, m, tr, v]) => (b as f64, m as f64, tr as f64, v as f64),
             None => {
                 let bass = (1.0 + (t * 1.3).sin()) as f64;
-                let mid  = (1.0 + (t * 2.1).sin()) as f64;
+                let mid = (1.0 + (t * 2.1).sin()) as f64;
                 let treb = (1.0 + (t * 3.7).sin()) as f64;
-                let vol  = (bass + mid + treb) / 3.0;
+                let vol = (bass + mid + treb) / 3.0;
                 (bass, mid, treb, vol)
             }
         };
@@ -3101,32 +4394,82 @@ impl MilkdropRenderer {
             // frame and run away: idx 313's zoom blows up by ~f70, the feedback then
             // samples a magnified central pixel, flattens, and collapses to black.
             let bw = self.base_warp;
-            env.insert("zoom".into(),          bw.zoom as f64);
-            env.insert("zoomexp".into(),       bw.zoomexp as f64);
-            env.insert("rot".into(),           bw.rot as f64);
-            env.insert("warp".into(),          bw.warp as f64);
-            env.insert("cx".into(),            bw.cx as f64);
-            env.insert("cy".into(),            bw.cy as f64);
-            env.insert("dx".into(),            bw.dx as f64);
-            env.insert("dy".into(),            bw.dy as f64);
-            env.insert("sx".into(),            bw.sx as f64);
-            env.insert("sy".into(),            bw.sy as f64);
-            env.insert("warpscale".into(),     bw.warpscale as f64);
+            env.insert("zoom".into(), bw.zoom as f64);
+            env.insert("zoomexp".into(), bw.zoomexp as f64);
+            env.insert("rot".into(), bw.rot as f64);
+            env.insert("warp".into(), bw.warp as f64);
+            env.insert("cx".into(), bw.cx as f64);
+            env.insert("cy".into(), bw.cy as f64);
+            env.insert("dx".into(), bw.dx as f64);
+            env.insert("dy".into(), bw.dy as f64);
+            env.insert("sx".into(), bw.sx as f64);
+            env.insert("sy".into(), bw.sy as f64);
+            env.insert("warpscale".into(), bw.warpscale as f64);
             env.insert("warpanimspeed".into(), bw.warpanimspeed as f64);
-            env.insert("decay".into(),         bw.decay as f64);
+            env.insert("decay".into(), bw.decay as f64);
+            // Reset built-in waveform fields from header baseVals each frame, then
+            // let per-frame EEL override them. Butterchurn's basic waveform reads
+            // these live mdVSFrame values, so fields like wave_x/wave_mystery should
+            // not persist as ordinary user variables from the previous frame.
+            env.insert("wave_mode".into(), self.bw_mode as f64);
+            env.insert("wave_x".into(), self.bw_x as f64);
+            env.insert("wave_y".into(), self.bw_y as f64);
+            env.insert("wave_r".into(), self.bw_r as f64);
+            env.insert("wave_g".into(), self.bw_g as f64);
+            env.insert("wave_b".into(), self.bw_b as f64);
+            env.insert("wave_a".into(), self.bw_a as f64);
+            env.insert("wave_mystery".into(), self.bw_mystery as f64);
+            env.insert("wave_scale".into(), self.bw_scale as f64);
+            env.insert("wave_smoothing".into(), self.bw_smoothing as f64);
+            env.insert("wave_dots".into(), if self.bw_dots { 1.0 } else { 0.0 });
+            env.insert("wave_thick".into(), if self.bw_thick { 1.0 } else { 0.0 });
+            env.insert(
+                "additivewave".into(),
+                if self.bw_additive { 1.0 } else { 0.0 },
+            );
+            env.insert(
+                "wave_brighten".into(),
+                if self.bw_brighten { 1.0 } else { 0.0 },
+            );
+            env.insert(
+                "modwavealphabyvolume".into(),
+                if self.bw_modalphavol { 1.0 } else { 0.0 },
+            );
+            env.insert("modwavealphastart".into(), self.bw_modalphastart as f64);
+            env.insert("modwavealphaend".into(), self.bw_modalphaend as f64);
+            env.insert("b1n".into(), self.b1n as f64);
+            env.insert("b1x".into(), self.b1x as f64);
+            env.insert("b1ed".into(), self.b1ed as f64);
+            env.insert("b2n".into(), self.b2n as f64);
+            env.insert("b2x".into(), self.b2x as f64);
+            env.insert("b3n".into(), self.b3n as f64);
+            env.insert("b3x".into(), self.b3x as f64);
+            // Reset comp post-FX flags from baseVals each frame so per-frame EEL
+            // can animate them without stale persistence. Butterchurn reads these
+            // uniforms from mdVSFrame after frame equations.
+            env.insert(
+                "brighten".into(),
+                if self.comp_brighten { 1.0 } else { 0.0 },
+            );
+            env.insert("darken".into(), if self.comp_darken { 1.0 } else { 0.0 });
+            env.insert(
+                "solarize".into(),
+                if self.comp_solarize { 1.0 } else { 0.0 },
+            );
+            env.insert("invert".into(), if self.comp_invert { 1.0 } else { 0.0 });
             // Seed read-only inputs before each frame
-            env.insert("time".into(),     t as f64);
-            env.insert("fps".into(),      60.0);
-            env.insert("frame".into(),    self.frame_idx as f64);
+            env.insert("time".into(), t as f64);
+            env.insert("fps".into(), 60.0);
+            env.insert("frame".into(), self.frame_idx as f64);
             env.insert("progress".into(), (t % 30.0) as f64 / 30.0);
-            env.insert("bass".into(),     bass);
-            env.insert("mid".into(),      mid);
-            env.insert("treb".into(),     treb);
-            env.insert("vol".into(),      vol);
+            env.insert("bass".into(), bass);
+            env.insert("mid".into(), mid);
+            env.insert("treb".into(), treb);
+            env.insert("vol".into(), vol);
             env.insert("bass_att".into(), bass_att);
-            env.insert("mid_att".into(),  mid_att);
+            env.insert("mid_att".into(), mid_att);
             env.insert("treb_att".into(), treb_att);
-            env.insert("vol_att".into(),  vol_att);
+            env.insert("vol_att".into(), vol_att);
             // MilkDrop pseudo-var `diff`: frame-to-frame volume delta. Not a standard
             // seeded EEL input, but presets like orb_waaa gate mv_a on above(diff,10),
             // so seed it from the volume change to honor the preset's intent.
@@ -3142,8 +4485,8 @@ impl MilkdropRenderer {
             };
             env.insert("aspectx".into(), if gax != 0.0 { 1.0 / gax } else { 1.0 });
             env.insert("aspecty".into(), if gay != 0.0 { 1.0 / gay } else { 1.0 });
-            env.insert("meshx".into(),   GRID_W as f64);
-            env.insert("meshy".into(),   GRID_H as f64);
+            env.insert("meshx".into(), GRID_W as f64);
+            env.insert("meshy".into(), GRID_H as f64);
             env.insert("pixelsx".into(), self.width as f64);
             env.insert("pixelsy".into(), self.height as f64);
             prog.run_with(env, &mut self.eel_state);
@@ -3151,248 +4494,415 @@ impl MilkdropRenderer {
         self.vol_prev = vol;
 
         // Helper: read f64 var from EEL env, default 0
-        let eq = |k: &str| self.eel_env.get(k).copied().unwrap_or(0.0) as f32;
+        let eq = |k: &str| {
+            let value = self.eel_env.get(k).copied().unwrap_or(0.0);
+            if value.is_finite() {
+                value as f32
+            } else {
+                0.0
+            }
+        };
         // Helper: read f64 var from EEL env, default to `def` if missing
-        let eqd = |k: &str, def: f64| self.eel_env.get(k).copied().unwrap_or(def) as f32;
+        let eqd = |k: &str, def: f64| {
+            let value = self.eel_env.get(k).copied().unwrap_or(def);
+            if value.is_finite() {
+                value as f32
+            } else {
+                def as f32
+            }
+        };
+        let base_gamma = self.comp_gamma_adj as f64;
+        let gamma = eqd("gamma", base_gamma);
+        let gammaadj = eqd("gammaadj", base_gamma);
+        let live_gamma = if (gammaadj - self.comp_gamma_adj).abs() > 1.0e-6 {
+            gammaadj
+        } else {
+            gamma
+        };
 
         // Snapshot live motion-vector / border / darken values from the per-frame EEL
         // env NOW (while eqd's immutable borrow is valid), before any &mut self call
         // (build_wave_geometry / compute_warp_verts). Used later to build geometry.
-        let live_mv_a  = eqd("mv_a",  self.mv_a as f64);
-        let live_mv_x  = eqd("mv_x",  self.mv_x as f64);
-        let live_mv_y  = eqd("mv_y",  self.mv_y as f64);
+        let live_mv_a = eqd("mv_a", self.mv_a as f64);
+        let live_mv_x = eqd("mv_x", self.mv_x as f64);
+        let live_mv_y = eqd("mv_y", self.mv_y as f64);
         let live_mv_dx = eqd("mv_dx", self.mv_dx as f64);
         let live_mv_dy = eqd("mv_dy", self.mv_dy as f64);
-        let live_mv_l  = eqd("mv_l",  self.mv_l as f64);
-        let live_mv_r  = eqd("mv_r",  self.mv_r as f64);
-        let live_mv_g  = eqd("mv_g",  self.mv_g as f64);
-        let live_mv_b  = eqd("mv_b",  self.mv_b as f64);
+        let live_mv_l = eqd("mv_l", self.mv_l as f64);
+        let live_mv_r = eqd("mv_r", self.mv_r as f64);
+        let live_mv_g = eqd("mv_g", self.mv_g as f64);
+        let live_mv_b = eqd("mv_b", self.mv_b as f64);
         let live_darken = eqd("darken_center", if self.darken_center { 1.0 } else { 0.0 }) != 0.0;
         let live_ob_size = eqd("ob_size", self.ob_size as f64);
-        let live_ob_a    = eqd("ob_a",    self.ob_a as f64);
+        let live_ob_a = eqd("ob_a", self.ob_a as f64);
         let live_ib_size = eqd("ib_size", self.ib_size as f64);
-        let live_ib_a    = eqd("ib_a",    self.ib_a as f64);
-        let live_outer_color = [eqd("ob_r", self.ob_r as f64), eqd("ob_g", self.ob_g as f64),
-                                eqd("ob_b", self.ob_b as f64), live_ob_a];
-        let live_inner_color = [eqd("ib_r", self.ib_r as f64), eqd("ib_g", self.ib_g as f64),
-                                eqd("ib_b", self.ib_b as f64), live_ib_a];
+        let live_ib_a = eqd("ib_a", self.ib_a as f64);
+        let live_outer_color = [
+            eqd("ob_r", self.ob_r as f64),
+            eqd("ob_g", self.ob_g as f64),
+            eqd("ob_b", self.ob_b as f64),
+            live_ob_a,
+        ];
+        let live_inner_color = [
+            eqd("ib_r", self.ib_r as f64),
+            eqd("ib_g", self.ib_g as f64),
+            eqd("ib_b", self.ib_b as f64),
+            live_ib_a,
+        ];
 
         // ── Blur min/max range remap (butterchurn getBlurValues + getScaleAndBias) ──
         // The blur shader normalizes each level into [0,1] (scale_n,bias_n); the
         // comp/warp GetBlurN helpers apply the inverse (scale1..3, bias1..3) to recover
         // the original range. At defaults (min 0, max 1) both halves are identity.
         let (blur_sb, comp_blur) = {
-            let mut bmin = [eqd("b1n", self.b1n as f64), eqd("b2n", self.b2n as f64), eqd("b3n", self.b3n as f64)];
-            let mut bmax = [eqd("b1x", self.b1x as f64), eqd("b2x", self.b2x as f64), eqd("b3x", self.b3x as f64)];
+            let mut bmin = [
+                eqd("b1n", self.b1n as f64),
+                eqd("b2n", self.b2n as f64),
+                eqd("b3n", self.b3n as f64),
+            ];
+            let mut bmax = [
+                eqd("b1x", self.b1x as f64),
+                eqd("b2x", self.b2x as f64),
+                eqd("b3x", self.b3x as f64),
+            ];
             let fmin_dist = 0.1f32;
             // Min-distance enforcement: when a level's [min,max] is narrower than
             // fmin_dist, WIDEN it to fmin_dist about the midpoint (min down, max UP).
             // Butterchurn's source sets BOTH to `a - fmin_dist*0.5` (a typo → max==min →
             // scale=1/0=Inf/NaN); MilkDrop's intent (and the references we score against)
             // is max = a + fmin_dist*0.5. Use PLUS for max to restore the 0.1 range.
-            if bmax[0] - bmin[0] < fmin_dist { let a = (bmin[0] + bmax[0]) * 0.5; bmin[0] = a - fmin_dist * 0.5; bmax[0] = a + fmin_dist * 0.5; }
-            bmax[1] = bmax[1].min(bmax[0]); bmin[1] = bmin[1].max(bmin[0]);
-            if bmax[1] - bmin[1] < fmin_dist { let a = (bmin[1] + bmax[1]) * 0.5; bmin[1] = a - fmin_dist * 0.5; bmax[1] = a + fmin_dist * 0.5; }
-            bmax[2] = bmax[2].min(bmax[1]); bmin[2] = bmin[2].max(bmin[1]);
-            if bmax[2] - bmin[2] < fmin_dist { let a = (bmin[2] + bmax[2]) * 0.5; bmin[2] = a - fmin_dist * 0.5; bmax[2] = a + fmin_dist * 0.5; }
+            if bmax[0] - bmin[0] < fmin_dist {
+                let a = (bmin[0] + bmax[0]) * 0.5;
+                bmin[0] = a - fmin_dist * 0.5;
+                bmax[0] = a + fmin_dist * 0.5;
+            }
+            bmax[1] = bmax[1].min(bmax[0]);
+            bmin[1] = bmin[1].max(bmin[0]);
+            if bmax[1] - bmin[1] < fmin_dist {
+                let a = (bmin[1] + bmax[1]) * 0.5;
+                bmin[1] = a - fmin_dist * 0.5;
+                bmax[1] = a + fmin_dist * 0.5;
+            }
+            bmax[2] = bmax[2].min(bmax[1]);
+            bmin[2] = bmin[2].max(bmin[1]);
+            if bmax[2] - bmin[2] < fmin_dist {
+                let a = (bmin[2] + bmax[2]) * 0.5;
+                bmin[2] = a - fmin_dist * 0.5;
+                bmax[2] = a + fmin_dist * 0.5;
+            }
             // blur-shader scale/bias (normalize into [0,1]) — butterchurn getScaleAndBias.
             let mut scale = [1.0f32; 3];
-            let mut bias  = [0.0f32; 3];
+            let mut bias = [0.0f32; 3];
             scale[0] = 1.0 / (bmax[0] - bmin[0]);
-            bias[0]  = -bmin[0] * scale[0];
+            bias[0] = -bmin[0] * scale[0];
             let t_min1 = (bmin[1] - bmin[0]) / (bmax[0] - bmin[0]);
             let t_max1 = (bmax[1] - bmin[0]) / (bmax[0] - bmin[0]);
             scale[1] = 1.0 / (t_max1 - t_min1);
-            bias[1]  = -t_min1 * scale[1];
+            bias[1] = -t_min1 * scale[1];
             let t_min2 = (bmin[2] - bmin[1]) / (bmax[1] - bmin[1]);
             let t_max2 = (bmax[2] - bmin[1]) / (bmax[1] - bmin[1]);
             scale[2] = 1.0 / (t_max2 - t_min2);
-            bias[2]  = -t_min2 * scale[2];
+            bias[2] = -t_min2 * scale[2];
             // comp/warp-side inverse (butterchurn comp.js): scaleN = maxN-minN, biasN = minN.
             // (level 2/3 use the level-1 base in butterchurn's comp; mirror its actual code.)
             (
                 [scale, bias],
                 // comp uniforms: blur1_min/max + scale1/2/3 + bias1/2/3
-                (bmin, bmax,
-                 [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]],
-                 [bmin[0], bmin[1], bmin[2]]),
+                (
+                    bmin,
+                    bmax,
+                    [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]],
+                    [bmin[0], bmin[1], bmin[2]],
+                ),
             )
         };
 
         // Build and upload PerFrame UBO
         let pf = PerFrame {
-            texsize:    [w, h, 1.0 / w, 1.0 / h],
-            aspect:     [asp, 1.0 / asp, 1.0, 1.0],
+            texsize: [w, h, 1.0 / w, 1.0 / h],
+            aspect: [shape_aspectx, shape_aspecty, inv_aspectx, inv_aspecty],
             // Time-based roam oscillators in [0,1] (butterchurn warp.js:838-861 / comp.js).
             // Were zeroed (..Zeroable) → roam-using warp/comp collapsed to grayscale/dim.
-            slow_roam_cos: [0.5 + 0.5 * (t * 0.005).cos(), 0.5 + 0.5 * (t * 0.008).cos(),
-                            0.5 + 0.5 * (t * 0.013).cos(), 0.5 + 0.5 * (t * 0.022).cos()],
-            roam_cos:      [0.5 + 0.5 * (t * 0.3).cos(),   0.5 + 0.5 * (t * 1.3).cos(),
-                            0.5 + 0.5 * (t * 5.0).cos(),   0.5 + 0.5 * (t * 20.0).cos()],
-            slow_roam_sin: [0.5 + 0.5 * (t * 0.005).sin(), 0.5 + 0.5 * (t * 0.008).sin(),
-                            0.5 + 0.5 * (t * 0.013).sin(), 0.5 + 0.5 * (t * 0.022).sin()],
-            roam_sin:      [0.5 + 0.5 * (t * 0.3).sin(),   0.5 + 0.5 * (t * 1.3).sin(),
-                            0.5 + 0.5 * (t * 5.0).sin(),   0.5 + 0.5 * (t * 20.0).sin()],
-            rand_frame: [pseudo_rand(self.frame_idx), pseudo_rand(self.frame_idx + 1),
-                         pseudo_rand(self.frame_idx + 2), pseudo_rand(self.frame_idx + 3)],
+            slow_roam_cos: [
+                0.5 + 0.5 * (shader_t * 0.005).cos(),
+                0.5 + 0.5 * (shader_t * 0.008).cos(),
+                0.5 + 0.5 * (shader_t * 0.013).cos(),
+                0.5 + 0.5 * (shader_t * 0.022).cos(),
+            ],
+            roam_cos: [
+                0.5 + 0.5 * (shader_t * 0.3).cos(),
+                0.5 + 0.5 * (shader_t * 1.3).cos(),
+                0.5 + 0.5 * (shader_t * 5.0).cos(),
+                0.5 + 0.5 * (shader_t * 20.0).cos(),
+            ],
+            slow_roam_sin: [
+                0.5 + 0.5 * (shader_t * 0.005).sin(),
+                0.5 + 0.5 * (shader_t * 0.008).sin(),
+                0.5 + 0.5 * (shader_t * 0.013).sin(),
+                0.5 + 0.5 * (shader_t * 0.022).sin(),
+            ],
+            roam_sin: [
+                0.5 + 0.5 * (shader_t * 0.3).sin(),
+                0.5 + 0.5 * (shader_t * 1.3).sin(),
+                0.5 + 0.5 * (shader_t * 5.0).sin(),
+                0.5 + 0.5 * (shader_t * 20.0).sin(),
+            ],
+            rand_frame: [
+                pseudo_rand(self.frame_idx),
+                pseudo_rand(self.frame_idx.wrapping_add(1)),
+                pseudo_rand(self.frame_idx.wrapping_add(2)),
+                pseudo_rand(self.frame_idx.wrapping_add(3)),
+            ],
             rand_preset: self.rand_preset,
             // q1-q32 mapped to _qa.._qh (slots already reserved in the UBO; the
             // q9-q32 #defines live in preprocess.rs milk_fs_preamble).
-            _qa: [eq("q1"),  eq("q2"),  eq("q3"),  eq("q4")],
-            _qb: [eq("q5"),  eq("q6"),  eq("q7"),  eq("q8")],
-            _qc: [eq("q9"),  eq("q10"), eq("q11"), eq("q12")],
+            _qa: [eq("q1"), eq("q2"), eq("q3"), eq("q4")],
+            _qb: [eq("q5"), eq("q6"), eq("q7"), eq("q8")],
+            _qc: [eq("q9"), eq("q10"), eq("q11"), eq("q12")],
             _qd: [eq("q13"), eq("q14"), eq("q15"), eq("q16")],
             _qe: [eq("q17"), eq("q18"), eq("q19"), eq("q20")],
             _qf: [eq("q21"), eq("q22"), eq("q23"), eq("q24")],
             _qg: [eq("q25"), eq("q26"), eq("q27"), eq("q28")],
             _qh: [eq("q29"), eq("q30"), eq("q31"), eq("q32")],
-            time:       t,
-            fps:        60.0,
-            frame:      self.frame_idx as f32,
-            progress:   (t % 30.0) / 30.0,
-            bass:     bass as f32,
-            mid:      mid  as f32,
-            treb:     treb as f32,
-            vol:      vol  as f32,
+            time: shader_t,
+            fps: 60.0,
+            frame: shader_frame,
+            progress,
+            bass: bass as f32,
+            mid: mid as f32,
+            treb: treb as f32,
+            vol: vol as f32,
             bass_att: bass_att as f32,
-            mid_att:  mid_att  as f32,
+            mid_att: mid_att as f32,
             treb_att: treb_att as f32,
-            vol_att:  vol_att  as f32,
+            vol_att: vol_att as f32,
             // EEL/Butterchurn per-frame var names are `gamma` and `fshader` (no
             // underscore); reading `gamma_adj`/`f_shader` always missed → gamma was a
             // no-op (1.0) and fshader stuck at 0 (so hue gating couldn't work).
-            gamma_adj: eqd("gamma", 1.0),
-            f_shader:   eq("fshader"),
-            echo_zoom:  eqd("echo_zoom",  1.0),
+            gamma_adj: live_gamma,
+            f_shader: eq("fshader"),
+            echo_zoom: eqd("echo_zoom", 1.0),
             echo_alpha: eq("echo_alpha"),
             // EEL/Butterchurn var name is "echo_orient" (the UBO field is named
             // echo_orientation). render() previously read "echo_orientation", a var no
             // preset ever sets via EEL2, so echo orientation was always silently 0.
             echo_orientation: eq("echo_orient"),
             // comp_blur = (mins, maxs, scales, biases) from the per-level blur remap.
-            blur1_min: comp_blur.0[0], blur1_max: comp_blur.1[0],
-            blur2_min: comp_blur.0[1], blur2_max: comp_blur.1[1],
-            blur3_min: comp_blur.0[2], blur3_max: comp_blur.1[2],
-            scale1: comp_blur.2[0], scale2: comp_blur.2[1], scale3: comp_blur.2[2],
-            bias1:  comp_blur.3[0], bias2:  comp_blur.3[1], bias3:  comp_blur.3[2],
-            brighten: if self.comp_brighten { 1.0 } else { 0.0 },
-            darken:   if self.comp_darken   { 1.0 } else { 0.0 },
-            solarize: if self.comp_solarize { 1.0 } else { 0.0 },
-            invert:   if self.comp_invert   { 1.0 } else { 0.0 },
+            blur1_min: comp_blur.0[0],
+            blur1_max: comp_blur.1[0],
+            blur2_min: comp_blur.0[1],
+            blur2_max: comp_blur.1[1],
+            blur3_min: comp_blur.0[2],
+            blur3_max: comp_blur.1[2],
+            scale1: comp_blur.2[0],
+            scale2: comp_blur.2[1],
+            scale3: comp_blur.2[2],
+            bias1: comp_blur.3[0],
+            bias2: comp_blur.3[1],
+            bias3: comp_blur.3[2],
+            brighten: eqd("brighten", if self.comp_brighten { 1.0 } else { 0.0 }),
+            darken: eqd("darken", if self.comp_darken { 1.0 } else { 0.0 }),
+            solarize: eqd("solarize", if self.comp_solarize { 1.0 } else { 0.0 }),
+            invert: eqd("invert", if self.comp_invert { 1.0 } else { 0.0 }),
             ..bytemuck::Zeroable::zeroed()
         };
-        self.queue.write_buffer(&self.perframe_buf, 0, bytemuck::bytes_of(&pf));
+        self.queue
+            .write_buffer(&self.perframe_buf, 0, bytemuck::bytes_of(&pf));
 
-        // ── Blur range-remap: write per-level sb (scale,bias) into the blur UBOs
-        // at offset 32 (the third vec4). The blur shader normalizes into [0,1]. ──
+        // ── Blur range-remap and edge fade: write live b1ed to level 1's vertical
+        // edge vector and per-level sb (scale,bias) to the blur UBOs. Butterchurn
+        // applies b1ed only to the first blur level; deeper levels use no edge fade.
         let scale = blur_sb[0];
-        let bias  = blur_sb[1];
-        for (ubo, lvl) in [(&self.blur1_ubo, 0usize), (&self.blur2_ubo, 1), (&self.blur3_ubo, 2)] {
+        let bias = blur_sb[1];
+        let live_b1ed_raw = eqd("b1ed", self.b1ed as f64);
+        let live_b1ed = if live_b1ed_raw.is_finite() {
+            live_b1ed_raw.clamp(0.0, 1.0)
+        } else {
+            self.b1ed.clamp(0.0, 1.0)
+        };
+        let edges = [
+            [1.0f32 - live_b1ed, live_b1ed, 5.0f32, 0.0f32],
+            [1.0f32, 0.0f32, 5.0f32, 0.0f32],
+            [1.0f32, 0.0f32, 5.0f32, 0.0f32],
+        ];
+        for (ubo, lvl) in [
+            (&self.blur1_ubo, 0usize),
+            (&self.blur2_ubo, 1),
+            (&self.blur3_ubo, 2),
+        ] {
             let sb = [scale[lvl], bias[lvl], 0.0f32, 0.0f32];
+            self.queue
+                .write_buffer(ubo, 16, bytemuck::cast_slice(&edges[lvl]));
             self.queue.write_buffer(ubo, 32, bytemuck::cast_slice(&sb));
         }
 
         // ── Build shape + waveform geometry (BEFORE any render pass opens) ────
         // Shapes use aspecty (landscape: h/w) to keep discs round. Custom waves use
         // the inverse-aspect convention (butterchurn invAspectx/invAspecty).
-        let (shape_aspectx, shape_aspecty) = if self.width > self.height {
-            (1.0f32, self.height as f32 / self.width as f32)
-        } else {
-            (self.width as f32 / self.height as f32, 1.0f32)
-        };
-        // butterchurn: aspectx=texsizeX>texsizeY?1:..., invAspectx=1/aspectx. For
-        // built-in waveform the formula multiplies x by aspecty and y by aspectx
-        // (the round-keeping factors). For custom waves it divides by aspect.
-        let inv_aspectx = if shape_aspectx != 0.0 { 1.0 / shape_aspectx } else { 1.0 };
-        let inv_aspecty = if shape_aspecty != 0.0 { 1.0 / shape_aspecty } else { 1.0 };
 
         // q1..q32 snapshot for shape per-frame programs (MilkDrop/Butterchurn pass the
         // full q1..q32 from mdVSQAfterFrame to custom shapes; capping at q8 left q9..q32
         // = 0 in shape eqs, e.g. idx 7550's `a = floor(rand(floor(q30)))/5` → alpha 0).
         let mut qsnap = [0.0f64; 32];
         for i in 0..32 {
-            qsnap[i] = self.eel_env.get(format!("q{}", i + 1).as_str()).copied().unwrap_or(0.0);
+            qsnap[i] = self
+                .eel_env
+                .get(format!("q{}", i + 1).as_str())
+                .copied()
+                .unwrap_or(0.0);
         }
 
-        let (fill_verts, fill_draws, border_verts, border_draws) =
-            self.build_shape_geometry(t, bass, mid, treb, vol,
-                bass_att, mid_att, treb_att, shape_aspectx, shape_aspecty, &qsnap);
+        let (fill_verts, fill_draws, border_verts, border_draws) = self.build_shape_geometry(
+            t,
+            bass,
+            mid,
+            treb,
+            vol,
+            bass_att,
+            mid_att,
+            treb_att,
+            shape_aspectx,
+            shape_aspecty,
+            &qsnap,
+        );
 
-        let (wave_l, wave_r) = self.frame_waveform(t);
+        let (wave_l, wave_r) = self.frame_waveform(shader_t);
         // freqArray for bSpectrum custom waves (mono, 512 bins). Empty in the
         // headless/synthetic path → build_custom_waves falls back to time data.
         let freq = self.freq_spectrum.clone();
         let (wave_verts, wave_draws) = self.build_wave_geometry(
-            t, bass, mid, treb, vol, bass_att, mid_att, treb_att,
-            inv_aspectx, inv_aspecty, &wave_l, &wave_r, &freq);
+            t,
+            bass,
+            mid,
+            treb,
+            vol,
+            bass_att,
+            mid_att,
+            treb_att,
+            shape_aspectx,
+            shape_aspecty,
+            inv_aspectx,
+            inv_aspecty,
+            &wave_l,
+            &wave_r,
+            &freq,
+        );
 
         // Upload all geometry up-front (no write_buffer inside a render pass).
         if !fill_verts.is_empty() {
             let n = fill_verts.len().min(SHAPE_VERT_CAP);
-            self.queue.write_buffer(&self.shape_vert_buf, 0, bytemuck::cast_slice(&fill_verts[..n]));
+            self.queue.write_buffer(
+                &self.shape_vert_buf,
+                0,
+                bytemuck::cast_slice(&fill_verts[..n]),
+            );
         }
         if !border_verts.is_empty() {
             let n = border_verts.len().min(BORDER_VERT_CAP);
-            self.queue.write_buffer(&self.border_vert_buf, 0, bytemuck::cast_slice(&border_verts[..n]));
+            self.queue.write_buffer(
+                &self.border_vert_buf,
+                0,
+                bytemuck::cast_slice(&border_verts[..n]),
+            );
         }
         if !wave_verts.is_empty() {
             let n = wave_verts.len().min(WAVE_VERT_CAP);
-            self.queue.write_buffer(&self.wave_vert_buf, 0, bytemuck::cast_slice(&wave_verts[..n]));
+            self.queue.write_buffer(
+                &self.wave_vert_buf,
+                0,
+                bytemuck::cast_slice(&wave_verts[..n]),
+            );
         }
         // ShapeU textured flag: untextured for now (jelly_space is untextured).
-        self.queue.write_buffer(&self.shape_uniform_buf, 0,
-            bytemuck::bytes_of(&ShapeU { textured: 0.0, _pad: [0.0; 3] }));
+        self.queue.write_buffer(
+            &self.shape_uniform_buf,
+            0,
+            bytemuck::bytes_of(&ShapeU {
+                textured: 0.0,
+                _pad: [0.0; 3],
+            }),
+        );
 
-        // Thick-offset slots for the waveform dyn-offset UBO (4 slots @ 256B).
+        // Thick-offset slots for the waveform dyn-offset UBO. The first four slots
+        // preserve the legacy line offsets; dot waves can use the extra slots for a
+        // fuller 3x3 point stamp.
         let tsx = 2.0 / self.width as f32;
         let tsy = 2.0 / self.height as f32;
-        let offsets = [[0.0f32, 0.0, 0.0, 0.0], [tsx, 0.0, 0.0, 0.0],
-                       [0.0, tsy, 0.0, 0.0], [tsx, tsy, 0.0, 0.0]];
-        let mut off_bytes = vec![0u8; 4 * 256];
+        let offsets = [
+            [0.0f32, 0.0, 0.0, 0.0],
+            [tsx, 0.0, 0.0, 0.0],
+            [0.0, tsy, 0.0, 0.0],
+            [tsx, tsy, 0.0, 0.0],
+            [-tsx, 0.0, 0.0, 0.0],
+            [0.0, -tsy, 0.0, 0.0],
+            [-tsx, -tsy, 0.0, 0.0],
+            [tsx, -tsy, 0.0, 0.0],
+            [-tsx, tsy, 0.0, 0.0],
+        ];
+        let mut off_bytes = vec![0u8; WAVE_THICK_DOT_PASSES * 256];
         for (k, o) in offsets.iter().enumerate() {
             off_bytes[k * 256..k * 256 + 16].copy_from_slice(bytemuck::cast_slice(o));
         }
         self.queue.write_buffer(&self.wave_off_buf, 0, &off_bytes);
 
-        // Border thick-offset + color slots: reuse the same 4 offsets but each slot
-        // holds a full BorderU. We overwrite color per border draw via a single slot 0
-        // path; for the up-to-4 thick passes we use slots 0..4 with offsets baked in.
-        let border_color_for_buf = border_draws.first().map(|d| d.color).unwrap_or([0.0; 4]);
-        let mut bu_bytes = vec![0u8; 4 * 256];
-        for (k, o) in offsets.iter().enumerate() {
-            let bu = BorderU { color: border_color_for_buf, offset: *o };
-            bu_bytes[k * 256..k * 256 + std::mem::size_of::<BorderU>()]
-                .copy_from_slice(bytemuck::bytes_of(&bu));
+        let border_slots_needed = border_draws.len().saturating_mul(BORDER_THICK_LINE_PASSES);
+        let border_slots = border_slots_needed.min(BORDER_UNIFORM_SLOTS);
+        if border_slots > 0 {
+            let mut bu_bytes = vec![0u8; border_slots * 256];
+            for (draw_idx, draw) in border_draws.iter().enumerate() {
+                let base_slot = draw_idx * BORDER_THICK_LINE_PASSES;
+                if base_slot >= border_slots {
+                    break;
+                }
+                let slots_for_draw = (border_slots - base_slot).min(BORDER_THICK_LINE_PASSES);
+                for (k, o) in offsets.iter().take(slots_for_draw).enumerate() {
+                    let bu = BorderU {
+                        color: draw.color,
+                        offset: *o,
+                    };
+                    let slot = base_slot + k;
+                    bu_bytes[slot * 256..slot * 256 + std::mem::size_of::<BorderU>()]
+                        .copy_from_slice(bytemuck::bytes_of(&bu));
+                }
+            }
+            self.queue
+                .write_buffer(&self.border_uniform_buf, 0, &bu_bytes);
         }
-        self.queue.write_buffer(&self.border_uniform_buf, 0, &bu_bytes);
 
         // --- WARP geometry: compute per-vertex warped UV + decay ONCE (both paths
         // now use the warped mesh). MUST upload before opening the render pass, and
         // BEFORE the immutable ping-pong borrows below (compute_warp_verts is &mut). ---
-        let warp_verts = self.compute_warp_verts(t, shape_aspectx, shape_aspecty);
-        self.queue.write_buffer(&self.warp_vert_buf, 0, bytemuck::cast_slice(&warp_verts));
+        let warp_verts = self.compute_warp_verts(shader_t, shape_aspectx, shape_aspecty);
+        self.queue
+            .write_buffer(&self.warp_vert_buf, 0, bytemuck::cast_slice(&warp_verts));
 
         // ── MOTION VECTORS geometry (butterchurn MotionVectors.generateMotionVectors)
         // Reuses warp_verts as the flow field. Built for BOTH warp paths (compute_warp_verts
         // produces a UV grid in all cases). Live mv_* read from the per-frame EEL env.
         let mv_count: u32 = {
-            let mv_on   = self.mv_on;
-            let mv_a    = live_mv_a;
-            let mv_x    = live_mv_x;
-            let mv_y    = live_mv_y;
-            let mv_dx   = live_mv_dx;
-            let mv_dy   = live_mv_dy;
-            let mv_l    = live_mv_l;
-            let mv_r    = live_mv_r;
-            let mv_g    = live_mv_g;
-            let mv_b    = live_mv_b;
+            let mv_on = self.mv_on;
+            let mv_a = live_mv_a;
+            let mv_x = live_mv_x;
+            let mv_y = live_mv_y;
+            let mv_dx = live_mv_dx;
+            let mv_dy = live_mv_dy;
+            let mv_l = live_mv_l;
+            let mv_r = live_mv_r;
+            let mv_g = live_mv_g;
+            let mv_b = live_mv_b;
             let mut n_x = mv_x.floor() as i32;
             let mut n_y = mv_y.floor() as i32;
             if mv_on && mv_a > 0.001 && n_x > 0 && n_y > 0 {
                 let mut dx = mv_x - n_x as f32;
                 let mut dy = mv_y - n_y as f32;
-                if n_x > 64 { n_x = 64; dx = 0.0; }
-                if n_y > 48 { n_y = 48; dy = 0.0; }
+                if n_x > 64 {
+                    n_x = 64;
+                    dx = 0.0;
+                }
+                if n_y > 48 {
+                    n_y = 48;
+                    dy = 0.0;
+                }
                 let dx2 = mv_dx;
                 let dy2 = mv_dy;
                 let len_mult = mv_l;
@@ -3411,8 +4921,12 @@ impl MilkdropRenderer {
                     // clamp to valid vertex indices [0, GRID]
                     let gx = GRID_W as i32;
                     let gy = GRID_H as i32;
-                    if x0 < 0 { x0 = 0; }
-                    if y0 < 0 { y0 = 0; }
+                    if x0 < 0 {
+                        x0 = 0;
+                    }
+                    if y0 < 0 {
+                        y0 = 0;
+                    }
                     let x1 = (x0 + 1).min(gx);
                     let y1 = (y0 + 1).min(gy);
                     let x0 = x0.min(gx);
@@ -3426,10 +4940,14 @@ impl MilkdropRenderer {
                     let (u10, v10) = uv(x1, y0);
                     let (u01, v01) = uv(x0, y1);
                     let (u11, v11) = uv(x1, y1);
-                    let fx2 = u00 * (1.0 - ddx) * (1.0 - ddy) + u10 * ddx * (1.0 - ddy)
-                            + u01 * (1.0 - ddx) * ddy        + u11 * ddx * ddy;
-                    let fy2 = v00 * (1.0 - ddx) * (1.0 - ddy) + v10 * ddx * (1.0 - ddy)
-                            + v01 * (1.0 - ddx) * ddy        + v11 * ddx * ddy;
+                    let fx2 = u00 * (1.0 - ddx) * (1.0 - ddy)
+                        + u10 * ddx * (1.0 - ddy)
+                        + u01 * (1.0 - ddx) * ddy
+                        + u11 * ddx * ddy;
+                    let fy2 = v00 * (1.0 - ddx) * (1.0 - ddy)
+                        + v10 * ddx * (1.0 - ddy)
+                        + v01 * (1.0 - ddx) * ddy
+                        + v11 * ddx * ddy;
                     (fx2, 1.0 - fy2)
                 };
 
@@ -3455,7 +4973,9 @@ impl MilkdropRenderer {
                                     // dxi = minLen twice; dyi is NOT reset (keeps its
                                     // scaled value). Replicated exactly for parity.
                                     #[allow(unused_assignments)]
-                                    { dxi = min_len; }
+                                    {
+                                        dxi = min_len;
+                                    }
                                     dxi = min_len;
                                 }
                                 let efx2 = fx + dxi;
@@ -3474,9 +4994,16 @@ impl MilkdropRenderer {
                 }
                 let cnt = mv_verts.len().min(MV_VERT_CAP);
                 if cnt > 0 {
-                    self.queue.write_buffer(&self.mv_vert_buf, 0, bytemuck::cast_slice(&mv_verts[..cnt]));
-                    let col = MVColor { color: [mv_r, mv_g, mv_b, mv_a] };
-                    self.queue.write_buffer(&self.mv_color_buf, 0, bytemuck::bytes_of(&col));
+                    self.queue.write_buffer(
+                        &self.mv_vert_buf,
+                        0,
+                        bytemuck::cast_slice(&mv_verts[..cnt]),
+                    );
+                    let col = MVColor {
+                        color: [mv_r, mv_g, mv_b, mv_a],
+                    };
+                    self.queue
+                        .write_buffer(&self.mv_color_buf, 0, bytemuck::bytes_of(&col));
                 }
                 cnt as u32
             } else {
@@ -3490,13 +5017,13 @@ impl MilkdropRenderer {
         if darken_on {
             let half = 0.05f32;
             let ax = shape_aspecty; // butterchurn applies aspecty to the x extents
-            // fan verts: [center, p1, p2, p3, p4, p5] with p5 == p1 (closing).
+                                    // fan verts: [center, p1, p2, p3, p4, p5] with p5 == p1 (closing).
             let center = ([0.0f32, 0.0f32], [0.0f32, 0.0, 0.0, 3.0 / 32.0]);
-            let p1 = ([-half * ax,  0.0f32], [0.0f32, 0.0, 0.0, 0.0]);
-            let p2 = ([ 0.0f32,    -half],   [0.0f32, 0.0, 0.0, 0.0]);
-            let p3 = ([ half * ax,  0.0f32], [0.0f32, 0.0, 0.0, 0.0]);
-            let p4 = ([ 0.0f32,     half],   [0.0f32, 0.0, 0.0, 0.0]);
-            let p5 = ([-half * ax,  0.0f32], [0.0f32, 0.0, 0.0, 0.0]);
+            let p1 = ([-half * ax, 0.0f32], [0.0f32, 0.0, 0.0, 0.0]);
+            let p2 = ([0.0f32, -half], [0.0f32, 0.0, 0.0, 0.0]);
+            let p3 = ([half * ax, 0.0f32], [0.0f32, 0.0, 0.0, 0.0]);
+            let p4 = ([0.0f32, half], [0.0f32, 0.0, 0.0, 0.0]);
+            let p5 = ([-half * ax, 0.0f32], [0.0f32, 0.0, 0.0, 0.0]);
             // TRIANGLE_FAN(6 verts) → 4 triangles, expanded to a triangle list.
             let fan = [center, p1, p2, p3, p4, p5];
             let tris = [(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 5)];
@@ -3507,62 +5034,70 @@ impl MilkdropRenderer {
                     dv.push(DarkenVert { pos, color });
                 }
             }
-            self.queue.write_buffer(&self.darken_vert_buf, 0, bytemuck::cast_slice(&dv));
+            self.queue
+                .write_buffer(&self.darken_vert_buf, 0, bytemuck::cast_slice(&dv));
         }
 
         // ── FRAME-BORDER geometry (butterchurn Border.generateBorder). Outer ring
         // (prevBorderSize 0) + inner ring (prevBorderSize = ob_size). NDC, no aspect.
         let ob_size = live_ob_size;
-        let ob_a    = live_ob_a;
+        let ob_a = live_ob_a;
         let ib_size = live_ib_size;
-        let ib_a    = live_ib_a;
+        let ib_a = live_ib_a;
         let outer_color = live_outer_color;
         let inner_color = live_inner_color;
         // generate_border(border_size, prev_border_size) → 24 NDC verts, or None.
-        let gen_border = |border_size: f32, prev_border_size: f32, alpha: f32| -> Option<Vec<BorderVert>> {
-            if !(border_size > 0.0 && alpha > 0.0) { return None; }
-            let width = 2.0f32;
-            let height = 2.0f32;
-            let wh = width / 2.0;
-            let hh = height / 2.0;
-            let pbw = prev_border_size / 2.0;
-            let bw = border_size / 2.0 + pbw;
-            let pbww = pbw * width;
-            let pbwh = pbw * height;
-            let bww = bw * width;
-            let bwh = bw * height;
-            let mut v: Vec<BorderVert> = Vec::with_capacity(24);
-            let mut tri = |p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]| {
-                v.push(BorderVert { pos: p1 });
-                v.push(BorderVert { pos: p2 });
-                v.push(BorderVert { pos: p3 });
+        let gen_border =
+            |border_size: f32, prev_border_size: f32, alpha: f32| -> Option<Vec<BorderVert>> {
+                if !(border_size > 0.0 && alpha > 0.0) {
+                    return None;
+                }
+                let width = 2.0f32;
+                let height = 2.0f32;
+                let wh = width / 2.0;
+                let hh = height / 2.0;
+                let pbw = prev_border_size / 2.0;
+                let bw = border_size / 2.0 + pbw;
+                let pbww = pbw * width;
+                let pbwh = pbw * height;
+                let bww = bw * width;
+                let bwh = bw * height;
+                let mut v: Vec<BorderVert> = Vec::with_capacity(24);
+                let mut tri = |p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]| {
+                    v.push(BorderVert { pos: p1 });
+                    v.push(BorderVert { pos: p2 });
+                    v.push(BorderVert { pos: p3 });
+                };
+                // 1st side (left)
+                let a1 = [-wh + pbww, -hh + bwh];
+                let a2 = [-wh + pbww, hh - bwh];
+                let a3 = [-wh + bww, hh - bwh];
+                let a4 = [-wh + bww, -hh + bwh];
+                tri(a4, a2, a1);
+                tri(a4, a3, a2);
+                // 2nd side (right)
+                let b1 = [wh - pbww, -hh + bwh];
+                let b2 = [wh - pbww, hh - bwh];
+                let b3 = [wh - bww, hh - bwh];
+                let b4 = [wh - bww, -hh + bwh];
+                tri(b1, b2, b4);
+                tri(b2, b3, b4);
+                // Top
+                let c1 = [-wh + pbww, -hh + pbwh];
+                let c2 = [-wh + pbww, bwh - hh];
+                let c3 = [wh - pbww, bwh - hh];
+                let c4 = [wh - pbww, -hh + pbwh];
+                tri(c4, c2, c1);
+                tri(c4, c3, c2);
+                // Bottom
+                let d1 = [-wh + pbww, hh - pbwh];
+                let d2 = [-wh + pbww, hh - bwh];
+                let d3 = [wh - pbww, hh - bwh];
+                let d4 = [wh - pbww, hh - pbwh];
+                tri(d1, d2, d4);
+                tri(d2, d3, d4);
+                Some(v)
             };
-            // 1st side (left)
-            let a1 = [-wh + pbww, -hh + bwh];
-            let a2 = [-wh + pbww,  hh - bwh];
-            let a3 = [-wh + bww,   hh - bwh];
-            let a4 = [-wh + bww,  -hh + bwh];
-            tri(a4, a2, a1); tri(a4, a3, a2);
-            // 2nd side (right)
-            let b1 = [ wh - pbww, -hh + bwh];
-            let b2 = [ wh - pbww,  hh - bwh];
-            let b3 = [ wh - bww,   hh - bwh];
-            let b4 = [ wh - bww,  -hh + bwh];
-            tri(b1, b2, b4); tri(b2, b3, b4);
-            // Top
-            let c1 = [-wh + pbww, -hh + pbwh];
-            let c2 = [-wh + pbww,  bwh - hh];
-            let c3 = [ wh - pbww,  bwh - hh];
-            let c4 = [ wh - pbww, -hh + pbwh];
-            tri(c4, c2, c1); tri(c4, c3, c2);
-            // Bottom
-            let d1 = [-wh + pbww,  hh - pbwh];
-            let d2 = [-wh + pbww,  hh - bwh];
-            let d3 = [ wh - pbww,  hh - bwh];
-            let d4 = [ wh - pbww,  hh - pbwh];
-            tri(d1, d2, d4); tri(d2, d3, d4);
-            Some(v)
-        };
         let outer_verts = gen_border(ob_size, 0.0, ob_a);
         let inner_verts = gen_border(ib_size, ob_size, ib_a);
         // Pack the two border draws contiguously; record (start_vert, color_slot).
@@ -3578,14 +5113,24 @@ impl MilkdropRenderer {
                 all.extend_from_slice(iv);
             }
             if !all.is_empty() {
-                self.queue.write_buffer(&self.frame_border_vert_buf, 0, bytemuck::cast_slice(&all));
+                self.queue
+                    .write_buffer(&self.frame_border_vert_buf, 0, bytemuck::cast_slice(&all));
                 // slot 0 = outer color, slot 1 = inner color (dyn-offset 256B each)
                 let mut fb_bytes = vec![0u8; 2 * 256];
-                let ou = BorderU { color: outer_color, offset: [0.0; 4] };
-                let iu = BorderU { color: inner_color, offset: [0.0; 4] };
-                fb_bytes[0..std::mem::size_of::<BorderU>()].copy_from_slice(bytemuck::bytes_of(&ou));
-                fb_bytes[256..256 + std::mem::size_of::<BorderU>()].copy_from_slice(bytemuck::bytes_of(&iu));
-                self.queue.write_buffer(&self.frame_border_uniform_buf, 0, &fb_bytes);
+                let ou = BorderU {
+                    color: outer_color,
+                    offset: [0.0; 4],
+                };
+                let iu = BorderU {
+                    color: inner_color,
+                    offset: [0.0; 4],
+                };
+                fb_bytes[0..std::mem::size_of::<BorderU>()]
+                    .copy_from_slice(bytemuck::bytes_of(&ou));
+                fb_bytes[256..256 + std::mem::size_of::<BorderU>()]
+                    .copy_from_slice(bytemuck::bytes_of(&iu));
+                self.queue
+                    .write_buffer(&self.frame_border_uniform_buf, 0, &fb_bytes);
             }
         }
 
@@ -3602,9 +5147,18 @@ impl MilkdropRenderer {
             label: None,
             layout: &self.blur_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(write_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.clamp_samp) },
-                wgpu::BindGroupEntry { binding: 2, resource: self.blur1_ubo.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(write_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.clamp_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blur1_ubo.as_entire_binding(),
+                },
             ],
         });
 
@@ -3618,7 +5172,10 @@ impl MilkdropRenderer {
                     view: write_view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -3628,11 +5185,15 @@ impl MilkdropRenderer {
             if self.has_custom_warp {
                 // Custom warp FS, driven by the warped mesh VS.
                 rp.set_pipeline(&self.warp_custom_pipeline);
-                rp.set_bind_group(0, read_bg, &[]);          // sampler set (prev frame)
+                rp.set_bind_group(0, read_bg, &[]); // sampler set (prev frame)
                 rp.set_bind_group(1, &self.perframe_bg, &[]);
             } else {
                 // Default warp mesh: sample prev at warped UV, multiply per-vertex decay.
-                let mesh_bg = if self.write_to_a { &self.warp_mesh_bg_b } else { &self.warp_mesh_bg_a };
+                let mesh_bg = if self.write_to_a {
+                    &self.warp_mesh_bg_b
+                } else {
+                    &self.warp_mesh_bg_a
+                };
                 rp.set_pipeline(&self.warp_mesh_pipeline);
                 rp.set_bind_group(0, mesh_bg, &[]);
             }
@@ -3641,37 +5202,7 @@ impl MilkdropRenderer {
             rp.draw_indexed(0..self.warp_idx_count, 0, 0..1);
         }
 
-        // --- BLUR passes (separable wide Gaussian, progressive chain) ---
-        // Each level: H (src → btemp) then V (btemp → level). blur1←warp, blur2←blur1, blur3←blur2.
-        {
-            let mut blur_pass = |label: &str, pipeline: &wgpu::RenderPipeline,
-                                 bg: &wgpu::BindGroup, target: &wgpu::TextureView| {
-                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(label),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                rp.set_pipeline(pipeline);
-                rp.set_bind_group(0, bg, &[]);
-                rp.draw(0..3, 0..1);
-            };
-            blur_pass("blur1-h", &self.blur_h_pipeline, &blur1_h_bg,       &self.view_btemp1);
-            blur_pass("blur1-v", &self.blur_v_pipeline, &self.blur1_v_bg, &self.view_blur1);
-            blur_pass("blur2-h", &self.blur_h_pipeline, &self.blur2_h_bg, &self.view_btemp2);
-            blur_pass("blur2-v", &self.blur_v_pipeline, &self.blur2_v_bg, &self.view_blur2);
-            blur_pass("blur3-h", &self.blur_h_pipeline, &self.blur3_h_bg, &self.view_btemp3);
-            blur_pass("blur3-v", &self.blur_v_pipeline, &self.blur3_v_bg, &self.view_blur3);
-        }
-
-        // --- MOTION VECTORS pass: drawn into the warped+blurred feedback target
+        // --- MOTION VECTORS pass: drawn into the warped feedback target
         // (write_view, LoadOp::Load) BEFORE shapes/waves, matching butterchurn order. ---
         if mv_count > 0 {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3680,7 +5211,10 @@ impl MilkdropRenderer {
                     view: write_view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -3693,14 +5227,18 @@ impl MilkdropRenderer {
             rp.draw(0..mv_count, 0..1);
         }
 
-        // --- SHAPES + WAVES pass: composite over the warped+blurred frame ---
+        // --- SHAPES + WAVES pass: composite over the warped frame ---
         // Drawn into write_view with Load/Store (NEVER Clear). comp reads write_view,
         // so shapes/waves appear AND feed back next frame (MilkDrop behavior).
         let has_shapes = !fill_draws.is_empty() || !border_draws.is_empty();
-        let has_waves  = !wave_draws.is_empty();
+        let has_waves = !wave_draws.is_empty();
         if has_shapes || has_waves {
             // prev-frame texture for textured shapes = the OTHER ping-pong side.
-            let shape_read_bg = if self.write_to_a { &self.shape_bg_read_b } else { &self.shape_bg_read_a };
+            let shape_read_bg = if self.write_to_a {
+                &self.shape_bg_read_b
+            } else {
+                &self.shape_bg_read_a
+            };
 
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shapes-waves"),
@@ -3708,7 +5246,10 @@ impl MilkdropRenderer {
                     view: write_view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -3725,8 +5266,14 @@ impl MilkdropRenderer {
                     // Clamp to the uploaded vertex count (truncated to SHAPE_VERT_CAP) so
                     // an over-cap shape never draws from a stale/zero buffer tail. The fan
                     // touches verts base_vertex..base_vertex+(sides+2) (center + sides+1 rim).
-                    if d.base_vertex as u32 + d.sides + 2 > SHAPE_VERT_CAP as u32 { continue; }
-                    let pipe = if d.additive { &self.shapes_fill_pipeline_additive } else { &self.shapes_fill_pipeline_alpha };
+                    if d.base_vertex as u32 + d.sides + 2 > SHAPE_VERT_CAP as u32 {
+                        continue;
+                    }
+                    let pipe = if d.additive {
+                        &self.shapes_fill_pipeline_additive
+                    } else {
+                        &self.shapes_fill_pipeline_alpha
+                    };
                     rp.set_pipeline(pipe);
                     rp.set_bind_group(0, shape_read_bg, &[]);
                     rp.draw_indexed(0..(d.sides * 3), d.base_vertex, 0..1);
@@ -3737,13 +5284,22 @@ impl MilkdropRenderer {
             if !border_draws.is_empty() {
                 rp.set_pipeline(&self.shapes_border_pipeline);
                 rp.set_vertex_buffer(0, self.border_vert_buf.slice(..));
-                // Note: all borders share the first border color (baked into the UBO);
-                // multi-color borders are a known limitation. jelly_space has no border.
-                let d = &border_draws[0];
-                let passes = if d.thick { 4 } else { 1 };
-                for k in 0..passes {
-                    rp.set_bind_group(0, &self.border_bg, &[(k * 256) as u32]);
-                    rp.draw(d.start_vert..(d.start_vert + d.count), 0..1);
+                for (draw_idx, d) in border_draws.iter().enumerate() {
+                    if d.start_vert >= BORDER_VERT_CAP as u32 {
+                        continue;
+                    }
+                    let base_slot = draw_idx * BORDER_THICK_LINE_PASSES;
+                    if base_slot >= BORDER_UNIFORM_SLOTS {
+                        continue;
+                    }
+                    let end = (d.start_vert + d.count).min(BORDER_VERT_CAP as u32);
+                    let passes = if d.thick { BORDER_THICK_LINE_PASSES } else { 1 }
+                        .min(BORDER_UNIFORM_SLOTS - base_slot);
+                    for k in 0..passes {
+                        let offset = ((base_slot + k) * 256) as u32;
+                        rp.set_bind_group(0, &self.border_bg, &[offset]);
+                        rp.draw(d.start_vert..end, 0..1);
+                    }
                 }
             }
 
@@ -3752,17 +5308,27 @@ impl MilkdropRenderer {
                 rp.set_vertex_buffer(0, self.wave_vert_buf.slice(..));
                 for d in &wave_draws {
                     let pipe = match (d.points, d.additive) {
-                        (true,  true)  => &self.wave_pipeline_points_additive,
-                        (true,  false) => &self.wave_pipeline_points_alpha,
-                        (false, true)  => &self.wave_pipeline_lines_additive,
+                        (true, true) => &self.wave_pipeline_points_additive,
+                        (true, false) => &self.wave_pipeline_points_alpha,
+                        (false, true) => &self.wave_pipeline_lines_additive,
                         (false, false) => &self.wave_pipeline_lines_alpha,
                     };
                     rp.set_pipeline(pipe);
                     // Clamp to the uploaded vertex count so an over-cap wave never
                     // draws from a stale/zero buffer tail.
-                    if d.start_vert >= WAVE_VERT_CAP as u32 { continue; }
+                    if d.start_vert >= WAVE_VERT_CAP as u32 {
+                        continue;
+                    }
                     let end = (d.start_vert + d.count).min(WAVE_VERT_CAP as u32);
-                    let passes = if d.thick { 4 } else { 1 };
+                    let passes = if d.thick {
+                        if d.points {
+                            WAVE_THICK_DOT_PASSES
+                        } else {
+                            WAVE_THICK_LINE_PASSES
+                        }
+                    } else {
+                        1
+                    };
                     for k in 0..passes {
                         rp.set_bind_group(0, &self.wave_bg, &[(k * 256) as u32]);
                         rp.draw(d.start_vert..end, 0..1);
@@ -3780,7 +5346,10 @@ impl MilkdropRenderer {
                     view: write_view,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -3804,6 +5373,84 @@ impl MilkdropRenderer {
             }
         }
 
+        let feedback_mips = if self.write_to_a {
+            &self.feedback_mips_a
+        } else {
+            &self.feedback_mips_b
+        };
+        generate_mip_chain(
+            &self.device,
+            &self.feedback_mip_blitter,
+            &mut enc,
+            feedback_mips,
+        );
+
+        // --- BLUR passes (separable wide Gaussian, progressive chain) ---
+        // Build GetBlur1/2/3 from the current composited feedback target, after
+        // waves/shapes/borders have seeded it and before custom comp samples blur.
+        {
+            let mut blur_pass = |label: &str,
+                                 pipeline: &wgpu::RenderPipeline,
+                                 bg: &wgpu::BindGroup,
+                                 target: &wgpu::TextureView| {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(label),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(pipeline);
+                rp.set_bind_group(0, bg, &[]);
+                rp.draw(0..3, 0..1);
+            };
+            blur_pass(
+                "blur1-h",
+                &self.blur_h_pipeline,
+                &blur1_h_bg,
+                &self.view_btemp1,
+            );
+            blur_pass(
+                "blur1-v",
+                &self.blur_v_pipeline,
+                &self.blur1_v_bg,
+                &self.view_blur1,
+            );
+            blur_pass(
+                "blur2-h",
+                &self.blur_h_pipeline,
+                &self.blur2_h_bg,
+                &self.view_btemp2,
+            );
+            blur_pass(
+                "blur2-v",
+                &self.blur_v_pipeline,
+                &self.blur2_v_bg,
+                &self.view_blur2,
+            );
+            blur_pass(
+                "blur3-h",
+                &self.blur_h_pipeline,
+                &self.blur3_h_bg,
+                &self.view_btemp3,
+            );
+            blur_pass(
+                "blur3-v",
+                &self.blur_v_pipeline,
+                &self.blur3_v_bg,
+                &self.view_blur3,
+            );
+        }
+
         // --- COMP pass: read from curr, write to offscreen comp target ---
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3820,7 +5467,7 @@ impl MilkdropRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
-                multiview_mask: None
+                multiview_mask: None,
             });
             rp.set_pipeline(&self.comp_pipeline);
             rp.set_bind_group(0, comp_bg, &[]);
@@ -3845,7 +5492,7 @@ impl MilkdropRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
-                multiview_mask: None
+                multiview_mask: None,
             });
             rp.set_pipeline(&self.output_pipeline);
             rp.set_bind_group(0, &self.fxaa_bg, &[]);
@@ -3862,8 +5509,13 @@ impl MilkdropRenderer {
 // `pts` is a flat list of (x,y); returns interleaved smoothed list of (n*2-1).
 fn smooth_wave(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
     let n = pts.len();
-    if n < 2 { return pts.to_vec(); }
-    let c1 = -0.15f32; let c2 = 1.15f32; let c3 = 1.15f32; let c4 = -0.15f32;
+    if n < 2 {
+        return pts.to_vec();
+    }
+    let c1 = -0.15f32;
+    let c2 = 1.15f32;
+    let c3 = 1.15f32;
+    let c4 = -0.15f32;
     let inv_sum = 1.0 / (c1 + c2 + c3 + c4); // = 0.5
     let mut out = vec![[0.0f32; 2]; n * 2 - 1];
     let mut j = 0usize;
@@ -3873,8 +5525,12 @@ fn smooth_wave(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
         let i_above = i_above2;
         i_above2 = (i + 2).min(n - 1);
         out[j] = pts[i];
-        out[j + 1][0] = (c1 * pts[i_below][0] + c2 * pts[i][0] + c3 * pts[i_above][0] + c4 * pts[i_above2][0]) * inv_sum;
-        out[j + 1][1] = (c1 * pts[i_below][1] + c2 * pts[i][1] + c3 * pts[i_above][1] + c4 * pts[i_above2][1]) * inv_sum;
+        out[j + 1][0] =
+            (c1 * pts[i_below][0] + c2 * pts[i][0] + c3 * pts[i_above][0] + c4 * pts[i_above2][0])
+                * inv_sum;
+        out[j + 1][1] =
+            (c1 * pts[i_below][1] + c2 * pts[i][1] + c3 * pts[i_above][1] + c4 * pts[i_above2][1])
+                * inv_sum;
         i_below = i;
         j += 2;
     }
@@ -3885,8 +5541,13 @@ fn smooth_wave(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
 // WaveUtils.smoothWaveAndColor — positions + held color. Returns (positions, colors).
 fn smooth_wave_and_color(pts: &[[f32; 2]], cols: &[[f32; 4]]) -> (Vec<[f32; 2]>, Vec<[f32; 4]>) {
     let n = pts.len();
-    if n < 2 { return (pts.to_vec(), cols.to_vec()); }
-    let c1 = -0.15f32; let c2 = 1.15f32; let c3 = 1.15f32; let c4 = -0.15f32;
+    if n < 2 {
+        return (pts.to_vec(), cols.to_vec());
+    }
+    let c1 = -0.15f32;
+    let c2 = 1.15f32;
+    let c3 = 1.15f32;
+    let c4 = -0.15f32;
     let inv_sum = 1.0 / (c1 + c2 + c3 + c4);
     let mut out_p = vec![[0.0f32; 2]; n * 2 - 1];
     let mut out_c = vec![[0.0f32; 4]; n * 2 - 1];
@@ -3897,8 +5558,12 @@ fn smooth_wave_and_color(pts: &[[f32; 2]], cols: &[[f32; 4]]) -> (Vec<[f32; 2]>,
         let i_above = i_above2;
         i_above2 = (i + 2).min(n - 1);
         out_p[j] = pts[i];
-        out_p[j + 1][0] = (c1 * pts[i_below][0] + c2 * pts[i][0] + c3 * pts[i_above][0] + c4 * pts[i_above2][0]) * inv_sum;
-        out_p[j + 1][1] = (c1 * pts[i_below][1] + c2 * pts[i][1] + c3 * pts[i_above][1] + c4 * pts[i_above2][1]) * inv_sum;
+        out_p[j + 1][0] =
+            (c1 * pts[i_below][0] + c2 * pts[i][0] + c3 * pts[i_above][0] + c4 * pts[i_above2][0])
+                * inv_sum;
+        out_p[j + 1][1] =
+            (c1 * pts[i_below][1] + c2 * pts[i][1] + c3 * pts[i_above][1] + c4 * pts[i_above2][1])
+                * inv_sum;
         out_c[j] = cols[i];
         out_c[j + 1] = cols[i];
         i_below = i;
@@ -3909,8 +5574,41 @@ fn smooth_wave_and_color(pts: &[[f32; 2]], cols: &[[f32; 4]]) -> (Vec<[f32; 2]>,
     (out_p, out_c)
 }
 
-fn pseudo_rand(seed: u32) -> f32 {
-    let mut x = seed.wrapping_mul(0x9e3779b9).wrapping_add(0x6c62272e);
-    x ^= x >> 16; x = x.wrapping_mul(0x45d9f3b); x ^= x >> 16;
-    (x as f32) / (u32::MAX as f32)
+fn pseudo_rand(seed: u64) -> f32 {
+    let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    ((x >> 40) as f32) / ((1u32 << 24) as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        deterministic_time_seconds, shader_frame_index, shader_progress, shader_time_seconds,
+        GPU_FRAME_WRAP, GPU_TIME_WRAP_SECONDS,
+    };
+
+    #[test]
+    fn deterministic_clock_preserves_sub_frame_steps_past_f32_cliff() {
+        let dt = 1.0 / 60.0;
+        let frame = 1_u64 << 24;
+        let t0 = deterministic_time_seconds(frame, Some(dt)).unwrap();
+        let t1 = deterministic_time_seconds(frame + 1, Some(dt)).unwrap();
+
+        assert!(((t1 - t0) - dt).abs() < 1.0e-10);
+
+        let old_f32_t0 = frame as f32 * dt as f32;
+        let old_f32_t1 = (frame + 1) as f32 * dt as f32;
+        assert_eq!(old_f32_t0, old_f32_t1);
+    }
+
+    #[test]
+    fn shader_time_and_frame_are_bounded_for_gpu_precision() {
+        let long_time = GPU_TIME_WRAP_SECONDS * 1000.0 + 12.25;
+
+        assert_eq!(shader_time_seconds(long_time), 12.25);
+        assert_eq!(shader_progress(75.0), 0.5);
+        assert_eq!(shader_frame_index(GPU_FRAME_WRAP + 42), 42.0);
+    }
 }

@@ -86,10 +86,21 @@ impl Biquad {
 
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
+        let x = if x.is_finite() { x } else { 0.0 };
+        if !(self.z1.is_finite() && self.z2.is_finite()) {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+        }
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
-        y
+        if y.is_finite() && self.z1.is_finite() && self.z2.is_finite() {
+            y
+        } else {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+            0.0
+        }
     }
 }
 
@@ -258,6 +269,39 @@ mod tests {
             bands.sub >= bands.mid && bands.sub >= bands.high && bands.sub >= bands.air,
             "60 Hz should dominate the sub band: {bands:?}"
         );
+    }
+
+    #[test]
+    fn nan_input_does_not_poison_lr4_state() {
+        let sr = 48_000.0;
+        let mut bank = LinkwitzRileyBank::new(sr);
+        let poisoned = bank.process(&[f32::NAN, f32::INFINITY, -f32::INFINITY], false);
+        for value in [
+            poisoned.sub,
+            poisoned.low,
+            poisoned.mid,
+            poisoned.high,
+            poisoned.air,
+        ] {
+            assert!(
+                value.is_finite(),
+                "poisoned output should be finite: {poisoned:?}"
+            );
+        }
+
+        let recovered = bank.process(&sine(1_000.0, sr, 512), false);
+        for value in [
+            recovered.sub,
+            recovered.low,
+            recovered.mid,
+            recovered.high,
+            recovered.air,
+        ] {
+            assert!(
+                value.is_finite(),
+                "recovered output should be finite: {recovered:?}"
+            );
+        }
     }
 
     #[test]

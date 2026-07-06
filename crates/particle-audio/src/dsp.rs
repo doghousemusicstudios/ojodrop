@@ -44,6 +44,15 @@ pub const HOP: usize = 512;
 /// mid 320-2800, treb 2800-11025. Deliberately wider than the 6 macro bands.
 const REACT_BAND_EDGES_HZ: [(f32, f32); 3] = [(20.0, 320.0), (320.0, 2800.0), (2800.0, 11025.0)];
 
+#[inline]
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 /// Parameters the worker needs that come from the live capture device.
 pub struct DspParams {
     pub sample_rate: u32,
@@ -101,10 +110,11 @@ pub fn run(
             let tail = FFT_LEN - HOP;
             let mut hop_mono = [0.0f32; HOP];
             for (i, frame) in pending.iter().take(HOP).enumerate() {
-                window[tail + i] = frame.mono;
-                window_left[tail + i] = frame.left;
-                window_right[tail + i] = frame.right;
-                hop_mono[i] = frame.mono;
+                let mono = finite_or_zero(frame.mono);
+                window[tail + i] = mono;
+                window_left[tail + i] = finite_or_zero(frame.left);
+                window_right[tail + i] = finite_or_zero(frame.right);
+                hop_mono[i] = mono;
             }
 
             let features = state.analyze_hop(&window, &hop_mono, &window_left, &window_right);
@@ -125,6 +135,100 @@ pub fn run(
     }
 
     log::info!("particle-audio: DSP worker exiting");
+}
+
+/// Synchronous, thread-free, cpal-free analyzer: push raw stereo PCM per frame
+/// and read the latest [`Features`]. Mirrors [`run`]'s windowing (2048-sample
+/// window, 512-sample hop, 75% overlap) but consumes host-supplied samples
+/// instead of a capture ring — for hosts that already capture audio and only
+/// want the analysis (e.g. an FFI seam feeding raw stereo across each frame).
+///
+/// STATEFUL: hold ONE instance for the whole session and feed it continuously.
+/// The tempo/onset/AGC/HPSS/structure trackers accumulate history across hops;
+/// recreating it per frame throws away all warm-up and beat tracking.
+pub struct Analyzer {
+    state: DspState,
+    // Sliding windows: `window` (mono) feeds the FFT/onset chain; left/right are
+    // kept for the sampled PCM scope / audio-texture fields.
+    window: Vec<f32>,
+    window_left: Vec<f32>,
+    window_right: Vec<f32>,
+    // Staging for pushed samples awaiting a whole hop.
+    pending: Vec<CaptureFrame>,
+    latest: Features,
+}
+
+impl Analyzer {
+    /// Create an analyzer for a fixed PCM `sample_rate` (Hz). `sensitivity`
+    /// matches [`DspParams::sensitivity`] (~0.1..3, 1.0 = neutral).
+    pub fn new(sample_rate: u32, sensitivity: f32) -> Self {
+        let sr = sample_rate as f32;
+        let hop_dt = HOP as f32 / sr;
+        Self {
+            state: DspState::new(sr, hop_dt, sensitivity),
+            window: vec![0.0f32; FFT_LEN],
+            window_left: vec![0.0f32; FFT_LEN],
+            window_right: vec![0.0f32; FFT_LEN],
+            pending: Vec::with_capacity(HOP * 4),
+            latest: Features::default(),
+        }
+    }
+
+    /// Push a block of PLANAR stereo samples (equal-length `left`/`right`). Runs
+    /// analysis for every whole hop the block completes and returns the most
+    /// recent [`Features`]; a block shorter than a hop is buffered and the
+    /// previous features are returned unchanged until a hop completes.
+    pub fn push_planar(&mut self, left: &[f32], right: &[f32]) -> &Features {
+        let n = left.len().min(right.len());
+        for i in 0..n {
+            let l = finite_or_zero(left[i]);
+            let r = finite_or_zero(right[i]);
+            // Same downmix as the cpal callback (channel mean; see `capture.rs`).
+            let mono = 0.5 * (l + r);
+            self.pending.push(CaptureFrame {
+                mono,
+                left: l,
+                right: r,
+            });
+            // Guard against unbounded growth if pushed faster than analyzed.
+            if self.pending.len() > FFT_LEN * 8 {
+                let drop_to = self.pending.len() - FFT_LEN * 4;
+                self.pending.drain(0..drop_to);
+            }
+        }
+        self.drain_hops();
+        &self.latest
+    }
+
+    /// Process every buffered whole hop, advancing the sliding window and the
+    /// analyzer state — identical to the inner loop of [`run`].
+    fn drain_hops(&mut self) {
+        while self.pending.len() >= HOP {
+            self.window.copy_within(HOP.., 0);
+            self.window_left.copy_within(HOP.., 0);
+            self.window_right.copy_within(HOP.., 0);
+            let tail = FFT_LEN - HOP;
+            let mut hop_mono = [0.0f32; HOP];
+            for (i, frame) in self.pending.iter().take(HOP).enumerate() {
+                self.window[tail + i] = frame.mono;
+                self.window_left[tail + i] = frame.left;
+                self.window_right[tail + i] = frame.right;
+                hop_mono[i] = frame.mono;
+            }
+            self.latest = self.state.analyze_hop(
+                &self.window,
+                &hop_mono,
+                &self.window_left,
+                &self.window_right,
+            );
+            self.pending.drain(0..HOP);
+        }
+    }
+
+    /// The most recent computed features (unchanged between completed hops).
+    pub fn latest(&self) -> &Features {
+        &self.latest
+    }
 }
 
 /// All cached buffers + per-feature smoothing state. One per worker.
@@ -842,10 +946,21 @@ impl Biquad {
 
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
+        let x = finite_or_zero(x);
+        if !(self.z1.is_finite() && self.z2.is_finite()) {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+        }
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
-        y
+        if y.is_finite() && self.z1.is_finite() && self.z2.is_finite() {
+            y
+        } else {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+            0.0
+        }
     }
 }
 

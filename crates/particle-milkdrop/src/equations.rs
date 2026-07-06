@@ -28,8 +28,13 @@ pub type Env = HashMap<String, f64>;
 const EPS: f64 = 1e-5;
 /// Maximum addressable megabuf/gmegabuf index (Butterchurn pre-fills 1<<20).
 const MEGABUF_MAX: i64 = 1_048_576;
-/// Hard iteration cap for loop/while to avoid hangs (matches Butterchurn).
-const LOOP_CAP: u64 = 1_048_576;
+/// Per-loop cap plus per-program cumulative budget for loop/while. Butterchurn's
+/// 1<<20 guard is too large for a render-thread evaluator; normal MilkDrop loops
+/// are tiny, and hostile/buggy presets should yield quickly.
+const LOOP_CAP: u64 = 16_384;
+const LOOP_ITERATION_BUDGET: u64 = 16_384;
+const EVAL_DEPTH_CAP: u32 = 256;
+const PARSE_DEPTH_CAP: u32 = 256;
 
 /// Sparse backing store for megabuf / gmegabuf (avoids 8 MB dense allocs).
 #[derive(Default)]
@@ -102,9 +107,20 @@ enum Expr {
 
 #[derive(Debug, Clone, Copy)]
 enum BinKind {
-    Add, Sub, Mul, Div, Mod, Pow,
-    Lt, Gt, Le, Ge, Eq, Ne,
-    And, Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Eq,
+    Ne,
+    And,
+    Or,
 }
 
 impl BinKind {
@@ -144,97 +160,161 @@ impl EelProgram {
     /// Run with explicit, caller-owned buffer state (megabuf persists across
     /// frames for a pool; gmegabuf is shared across pools).
     pub fn run_with(&self, env: &mut Env, state: &mut EelState) {
+        let mut budget = EvalBudget::default();
         for s in &self.stmts {
-            eval(s, env, state);
+            eval(s, env, state, &mut budget);
         }
     }
 }
 
 // ── Evaluator ────────────────────────────────────────────────────────────────
 
-fn eval(e: &Expr, env: &mut Env, st: &mut EelState) -> f64 {
-    match e {
+struct EvalBudget {
+    depth: u32,
+    remaining_loop_iters: u64,
+}
+
+impl Default for EvalBudget {
+    fn default() -> Self {
+        Self {
+            depth: 0,
+            remaining_loop_iters: LOOP_ITERATION_BUDGET,
+        }
+    }
+}
+
+impl EvalBudget {
+    fn enter(&mut self) -> bool {
+        if self.depth >= EVAL_DEPTH_CAP {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    fn exit(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn spend_loop_iter(&mut self) -> bool {
+        if self.remaining_loop_iters == 0 {
+            return false;
+        }
+        self.remaining_loop_iters -= 1;
+        true
+    }
+}
+
+fn eval(e: &Expr, env: &mut Env, st: &mut EelState, budget: &mut EvalBudget) -> f64 {
+    if !budget.enter() {
+        return 0.0;
+    }
+    let value = match e {
         Expr::Num(v) => *v,
         Expr::Var(n) => *env.get(n.as_str()).unwrap_or(&0.0),
         Expr::Assign(n, rhs) => {
-            let v = eval(rhs, env, st);
+            let v = eval(rhs, env, st, budget);
             env.insert(n.clone(), v);
             v
         }
         Expr::BufAssign(is_global, idx, val) => {
-            let i = eval(idx, env, st);
-            let v = eval(val, env, st);
+            let i = eval(idx, env, st, budget);
+            let v = eval(val, env, st, budget);
             if *is_global {
                 st.gmegabuf.borrow_mut().write(i, v)
             } else {
                 st.megabuf.write(i, v)
             }
         }
-        Expr::Neg(e) => -eval(e, env, st),
-        Expr::Not(e) => if eval(e, env, st).abs() > EPS { 0.0 } else { 1.0 },
+        Expr::Neg(e) => -eval(e, env, st, budget),
+        Expr::Not(e) => {
+            if eval(e, env, st, budget).abs() > EPS {
+                0.0
+            } else {
+                1.0
+            }
+        }
         Expr::BinOp(op, l, r) => {
-            let lv = eval(l, env, st);
-            let rv = eval(r, env, st);
+            let lv = eval(l, env, st, budget);
+            let rv = eval(r, env, st, budget);
             match op {
                 BinKind::Add => lv + rv,
                 BinKind::Sub => lv - rv,
                 BinKind::Mul => lv * rv,
                 // ns-eel2 div(): y==0 ? 0 : x/y
-                BinKind::Div => if rv == 0.0 { 0.0 } else { lv / rv },
+                BinKind::Div => {
+                    if rv == 0.0 {
+                        0.0
+                    } else {
+                        lv / rv
+                    }
+                }
                 // ns-eel2 mod(): INTEGER mod — y==0 ? 0 : floor(x) % floor(y)
                 BinKind::Mod => {
                     let d = rv.floor();
                     // checked_rem avoids the `i64::MIN % -1` overflow panic (debug/test builds);
                     // 0 is the correct result for any `x % -1`.
-                    if d == 0.0 { 0.0 } else { (lv.floor() as i64).checked_rem(d as i64).unwrap_or(0) as f64 }
+                    if d == 0.0 {
+                        0.0
+                    } else {
+                        (lv.floor() as i64).checked_rem(d as i64).unwrap_or(0) as f64
+                    }
                 }
                 BinKind::Pow => lv.powf(rv),
-                BinKind::Lt  => (lv <  rv) as i32 as f64,
-                BinKind::Gt  => (lv >  rv) as i32 as f64,
-                BinKind::Le  => (lv <= rv) as i32 as f64,
-                BinKind::Ge  => (lv >= rv) as i32 as f64,
+                BinKind::Lt => (lv < rv) as i32 as f64,
+                BinKind::Gt => (lv > rv) as i32 as f64,
+                BinKind::Le => (lv <= rv) as i32 as f64,
+                BinKind::Ge => (lv >= rv) as i32 as f64,
                 // ns-eel2 ==/!= use EPSILON tolerance
-                BinKind::Eq  => ((lv - rv).abs() < EPS) as i32 as f64,
-                BinKind::Ne  => ((lv - rv).abs() >= EPS) as i32 as f64,
+                BinKind::Eq => ((lv - rv).abs() < EPS) as i32 as f64,
+                BinKind::Ne => ((lv - rv).abs() >= EPS) as i32 as f64,
                 BinKind::And => ((lv != 0.0) && (rv != 0.0)) as i32 as f64,
-                BinKind::Or  => ((lv != 0.0) || (rv != 0.0)) as i32 as f64,
+                BinKind::Or => ((lv != 0.0) || (rv != 0.0)) as i32 as f64,
             }
         }
-        Expr::Call(name, args) => eval_call_node(name, args, env, st),
-    }
+        Expr::Call(name, args) => eval_call_node(name, args, env, st, budget),
+    };
+    budget.exit();
+    value
 }
 
 /// Handles control-flow functions that need LAZY / ordered evaluation, then
 /// falls back to eager math functions in `eval_call`.
-fn eval_call_node(name: &str, args: &[Expr], env: &mut Env, st: &mut EelState) -> f64 {
+fn eval_call_node(
+    name: &str,
+    args: &[Expr],
+    env: &mut Env,
+    st: &mut EelState,
+    budget: &mut EvalBudget,
+) -> f64 {
     match name {
         // if(c, t, f): only the taken branch runs (side-effect safety).
         "if" | "If" | "IF" => {
-            let c = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st);
+            let c = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st, budget);
             if c.abs() > EPS {
-                eval(args.get(1).unwrap_or(&Expr::Num(0.0)), env, st)
+                eval(args.get(1).unwrap_or(&Expr::Num(0.0)), env, st, budget)
             } else {
-                eval(args.get(2).unwrap_or(&Expr::Num(0.0)), env, st)
+                eval(args.get(2).unwrap_or(&Expr::Num(0.0)), env, st, budget)
             }
         }
         // exec2(a, b) → eval in order, return last. exec3(a, b, c) likewise.
         "exec2" | "exec3" => {
             let mut last = 0.0;
             for a in args {
-                last = eval(a, env, st);
+                last = eval(a, env, st, budget);
             }
             last
         }
         // loop(n, body...) → for(i=0; i<n; i++) body. n evaluated ONCE.
         // Multi-statement bodies parse as args[1..].
         "loop" => {
-            let n = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st);
+            let n = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st, budget);
             let mut last = 0.0;
             let mut i = 0u64;
             // Butterchurn compares i<n with float n (loop(3.9,..) → 4 iters).
-            while (i as f64) < n && i < LOOP_CAP {
+            while (i as f64) < n && i < LOOP_CAP && budget.spend_loop_iter() {
                 for a in &args[1..] {
-                    last = eval(a, env, st);
+                    last = eval(a, env, st, budget);
                 }
                 i += 1;
             }
@@ -245,8 +325,11 @@ fn eval_call_node(name: &str, args: &[Expr], env: &mut Env, st: &mut EelState) -
             let mut last = 0.0;
             let mut c = 0u64;
             loop {
+                if !budget.spend_loop_iter() {
+                    break;
+                }
                 for a in args {
-                    last = eval(a, env, st);
+                    last = eval(a, env, st, budget);
                 }
                 c += 1;
                 if last.abs() <= EPS || c >= LOOP_CAP {
@@ -257,16 +340,16 @@ fn eval_call_node(name: &str, args: &[Expr], env: &mut Env, st: &mut EelState) -
         }
         // megabuf/gmegabuf READ (write form is handled via BufAssign at parse).
         "megabuf" => {
-            let i = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st);
+            let i = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st, budget);
             st.megabuf.read(i)
         }
         "gmegabuf" => {
-            let i = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st);
+            let i = eval(args.first().unwrap_or(&Expr::Num(0.0)), env, st, budget);
             st.gmegabuf.borrow().read(i)
         }
         // Everything else: eager args.
         _ => {
-            let a: Vec<f64> = args.iter().map(|e| eval(e, env, st)).collect();
+            let a: Vec<f64> = args.iter().map(|e| eval(e, env, st, budget)).collect();
             eval_call(name, &a)
         }
     }
@@ -275,55 +358,96 @@ fn eval_call_node(name: &str, args: &[Expr], env: &mut Env, st: &mut EelState) -
 fn eval_call(name: &str, a: &[f64]) -> f64 {
     let get = |i: usize| a.get(i).copied().unwrap_or(0.0);
     match name {
-        "above"  => (get(0) > get(1)) as i32 as f64,
-        "below"  => (get(0) < get(1)) as i32 as f64,
-        "equal"  => ((get(0) - get(1)).abs() < EPS) as i32 as f64,
+        "above" => (get(0) > get(1)) as i32 as f64,
+        "below" => (get(0) < get(1)) as i32 as f64,
+        "equal" => ((get(0) - get(1)).abs() < EPS) as i32 as f64,
         // ns-eel2 div(x,y): y==0 ? 0 : x/y (matches the `/` BinKind::Div semantics).
         // Butterchurn's JS transpiler emits `div(a,b)` for `a/b` (EEL division).
-        "div"    => { let y = get(1); if y == 0.0 { 0.0 } else { get(0) / y } }
+        "div" => {
+            let y = get(1);
+            if y == 0.0 {
+                0.0
+            } else {
+                get(0) / y
+            }
+        }
         // ns-eel2 mod(x,y): INTEGER mod — y==0 ? 0 : floor(x) % floor(y).
         // Mirrors the `%` BinKind::Mod logic exactly.
-        "mod"    => {
+        "mod" => {
             let d = get(1).floor();
             // checked_rem avoids the `i64::MIN % -1` overflow panic; 0 is correct for `x % -1`.
-            if d == 0.0 { 0.0 } else { (get(0).floor() as i64).checked_rem(d as i64).unwrap_or(0) as f64 }
+            if d == 0.0 {
+                0.0
+            } else {
+                (get(0).floor() as i64).checked_rem(d as i64).unwrap_or(0) as f64
+            }
         }
         // ns-eel2 boolean ops (bnot was missing → ORB's edge-detect collapsed q3,
         // killing the warp-feedback tunnel accumulation).
-        "bnot"   => (get(0).abs() < EPS) as i32 as f64,
-        "band"   => ((get(0) != 0.0) && (get(1) != 0.0)) as i32 as f64,
-        "bor"    => ((get(0) != 0.0) || (get(1) != 0.0)) as i32 as f64,
-        "abs"    => get(0).abs(),
-        "sin"    => get(0).sin(),
-        "cos"    => get(0).cos(),
-        "tan"    => get(0).tan(),
-        "asin"   => get(0).asin(),
-        "acos"   => get(0).acos(),
-        "atan"   => get(0).atan(),
-        "atan2"  => get(0).atan2(get(1)),
+        "bnot" => (get(0).abs() < EPS) as i32 as f64,
+        "band" => ((get(0) != 0.0) && (get(1) != 0.0)) as i32 as f64,
+        "bor" => ((get(0) != 0.0) || (get(1) != 0.0)) as i32 as f64,
+        "abs" => get(0).abs(),
+        "sin" => get(0).sin(),
+        "cos" => get(0).cos(),
+        "tan" => get(0).tan(),
+        "asin" => get(0).asin(),
+        "acos" => get(0).acos(),
+        "atan" => get(0).atan(),
+        "atan2" => get(0).atan2(get(1)),
         // ns-eel2 sqrt(): sqrt(abs(x))
-        "sqrt"   => get(0).abs().sqrt(),
-        "invsqrt"=> { let s = get(0).sqrt(); if s == 0.0 { 0.0 } else { 1.0 / s } }
-        "sqr"    => get(0) * get(0),
-        "pow"    => { let z = get(0).powf(get(1)); if z.is_finite() { z } else { 0.0 } }
-        "exp"    => get(0).exp(),
-        "log"    => get(0).ln(),
-        "log10"  => get(0).log10(),
-        "min"    => get(0).min(get(1)),
-        "max"    => get(0).max(get(1)),
-        "floor"  => get(0).floor(),
-        "ceil"   => get(0).ceil(),
-        "int"    => get(0).trunc(),
+        "sqrt" => get(0).abs().sqrt(),
+        "invsqrt" => {
+            let s = get(0).sqrt();
+            if s == 0.0 {
+                0.0
+            } else {
+                1.0 / s
+            }
+        }
+        "sqr" => get(0) * get(0),
+        "pow" => {
+            let z = get(0).powf(get(1));
+            if z.is_finite() {
+                z
+            } else {
+                0.0
+            }
+        }
+        "exp" => get(0).exp(),
+        "log" => get(0).ln(),
+        "log10" => get(0).log10(),
+        "min" => get(0).min(get(1)),
+        "max" => get(0).max(get(1)),
+        "floor" => get(0).floor(),
+        "ceil" => get(0).ceil(),
+        "int" => get(0).trunc(),
         // ns-eel2 sign(): x>0?1 : x<0?-1 : 0  (signum() returns ±1 at 0 — differs)
-        "sign"   => { let x = get(0); if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 } }
-        "clamp"  => get(0).clamp(get(1), get(2)),
-        "lerp"   => get(0) + (get(1) - get(0)) * get(2),
+        "sign" => {
+            let x = get(0);
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        }
+        "clamp" => get(0).clamp(get(1), get(2)),
+        "lerp" => get(0) + (get(1) - get(0)) * get(2),
         // ns-eel2 sigmoid(x,y): t=1+exp(-x*y); |t|>1e-5 ? 1/t : 0
-        "sigmoid"=> { let t = 1.0 + (-get(0) * get(1)).exp(); if t.abs() > EPS { 1.0 / t } else { 0.0 } }
-        "bitor"  => ((get(0).floor() as i64) | (get(1).floor() as i64)) as f64,
+        "sigmoid" => {
+            let t = 1.0 + (-get(0) * get(1)).exp();
+            if t.abs() > EPS {
+                1.0 / t
+            } else {
+                0.0
+            }
+        }
+        "bitor" => ((get(0).floor() as i64) | (get(1).floor() as i64)) as f64,
         "bitand" => ((get(0).floor() as i64) & (get(1).floor() as i64)) as f64,
-        "rand"   => rand_eel(get(0)),
-        "randint"=> rand_eel(get(0)).floor(),
+        "rand" => rand_eel(get(0)),
+        "randint" => rand_eel(get(0)).floor(),
         _ => 0.0,
     }
 }
@@ -340,7 +464,11 @@ fn rand_eel(x: f64) -> f64 {
     // Uniform [0,1) from the high bits.
     let u = (new >> 11) as f64 / (1u64 << 53) as f64;
     let xf = x.floor();
-    if xf < 1.0 { u } else { u * xf }
+    if xf < 1.0 {
+        u
+    } else {
+        u * xf
+    }
 }
 
 // ── Tokenizer ────────────────────────────────────────────────────────────────
@@ -349,7 +477,7 @@ fn rand_eel(x: f64) -> f64 {
 enum Tok {
     Num(f64),
     Ident(String),
-    Op(String),  // multi-char operators stored as string
+    Op(String), // multi-char operators stored as string
     LParen,
     RParen,
     Comma,
@@ -359,29 +487,43 @@ enum Tok {
 
 struct Lexer {
     chars: Vec<char>,
-    pos:   usize,
+    pos: usize,
 }
 
 impl Lexer {
     fn new(src: &str) -> Self {
-        Self { chars: src.chars().collect(), pos: 0 }
+        Self {
+            chars: src.chars().collect(),
+            pos: 0,
+        }
     }
 
-    fn peek(&self) -> char { self.chars.get(self.pos).copied().unwrap_or('\0') }
+    fn peek(&self) -> char {
+        self.chars.get(self.pos).copied().unwrap_or('\0')
+    }
     fn next(&mut self) -> char {
         let c = self.peek();
         self.pos += 1;
         c
     }
     fn eat_if(&mut self, c: char) -> bool {
-        if self.peek() == c { self.pos += 1; true } else { false }
+        if self.peek() == c {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
     }
 
     fn skip_whitespace_and_comments(&mut self) {
         loop {
-            while self.peek().is_ascii_whitespace() { self.next(); }
+            while self.peek().is_ascii_whitespace() {
+                self.next();
+            }
             if self.peek() == '/' && self.chars.get(self.pos + 1) == Some(&'/') {
-                while self.peek() != '\n' && self.peek() != '\0' { self.next(); }
+                while self.peek() != '\n' && self.peek() != '\0' {
+                    self.next();
+                }
             } else {
                 break;
             }
@@ -391,16 +533,31 @@ impl Lexer {
     fn next_tok(&mut self) -> Tok {
         self.skip_whitespace_and_comments();
         let c = self.peek();
-        if c == '\0' { return Tok::Eof; }
+        if c == '\0' {
+            return Tok::Eof;
+        }
 
         // Number
-        if c.is_ascii_digit() || (c == '.' && self.chars.get(self.pos + 1).map(|x| x.is_ascii_digit()).unwrap_or(false)) {
+        if c.is_ascii_digit()
+            || (c == '.'
+                && self
+                    .chars
+                    .get(self.pos + 1)
+                    .map(|x| x.is_ascii_digit())
+                    .unwrap_or(false))
+        {
             let start = self.pos;
-            while self.peek().is_ascii_digit() || self.peek() == '.' { self.next(); }
+            while self.peek().is_ascii_digit() || self.peek() == '.' {
+                self.next();
+            }
             if self.peek() == 'e' || self.peek() == 'E' {
                 self.next();
-                if self.peek() == '+' || self.peek() == '-' { self.next(); }
-                while self.peek().is_ascii_digit() { self.next(); }
+                if self.peek() == '+' || self.peek() == '-' {
+                    self.next();
+                }
+                while self.peek().is_ascii_digit() {
+                    self.next();
+                }
             }
             let s: String = self.chars[start..self.pos].iter().collect();
             return Tok::Num(s.parse().unwrap_or(0.0));
@@ -409,7 +566,9 @@ impl Lexer {
         // Identifier
         if c.is_ascii_alphabetic() || c == '_' {
             let start = self.pos;
-            while self.peek().is_ascii_alphanumeric() || self.peek() == '_' { self.next(); }
+            while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
+                self.next();
+            }
             let s: String = self.chars[start..self.pos].iter().collect();
             return Tok::Ident(s);
         }
@@ -421,18 +580,84 @@ impl Lexer {
             ',' => Tok::Comma,
             ';' => Tok::Semi,
             // Compound-assignment operators desugar in the parser.
-            '+' => if self.eat_if('=') { Tok::Op("+=".into()) } else { Tok::Op("+".into()) },
-            '-' => if self.eat_if('=') { Tok::Op("-=".into()) } else { Tok::Op("-".into()) },
-            '*' => if self.eat_if('=') { Tok::Op("*=".into()) } else { Tok::Op("*".into()) },
-            '/' => if self.eat_if('=') { Tok::Op("/=".into()) } else { Tok::Op("/".into()) },
-            '%' => if self.eat_if('=') { Tok::Op("%=".into()) } else { Tok::Op("%".into()) },
+            '+' => {
+                if self.eat_if('=') {
+                    Tok::Op("+=".into())
+                } else {
+                    Tok::Op("+".into())
+                }
+            }
+            '-' => {
+                if self.eat_if('=') {
+                    Tok::Op("-=".into())
+                } else {
+                    Tok::Op("-".into())
+                }
+            }
+            '*' => {
+                if self.eat_if('=') {
+                    Tok::Op("*=".into())
+                } else {
+                    Tok::Op("*".into())
+                }
+            }
+            '/' => {
+                if self.eat_if('=') {
+                    Tok::Op("/=".into())
+                } else {
+                    Tok::Op("/".into())
+                }
+            }
+            '%' => {
+                if self.eat_if('=') {
+                    Tok::Op("%=".into())
+                } else {
+                    Tok::Op("%".into())
+                }
+            }
             '^' => Tok::Op("^".into()),
-            '!' => if self.eat_if('=') { Tok::Op("!=".into()) } else { Tok::Op("!".into()) },
-            '<' => if self.eat_if('=') { Tok::Op("<=".into()) } else { Tok::Op("<".into()) },
-            '>' => if self.eat_if('=') { Tok::Op(">=".into()) } else { Tok::Op(">".into()) },
-            '=' => if self.eat_if('=') { Tok::Op("==".into()) } else { Tok::Op("=".into()) },
-            '&' => if self.eat_if('&') { Tok::Op("&&".into()) } else { Tok::Op("&".into()) },
-            '|' => if self.eat_if('|') { Tok::Op("||".into()) } else { Tok::Op("|".into()) },
+            '!' => {
+                if self.eat_if('=') {
+                    Tok::Op("!=".into())
+                } else {
+                    Tok::Op("!".into())
+                }
+            }
+            '<' => {
+                if self.eat_if('=') {
+                    Tok::Op("<=".into())
+                } else {
+                    Tok::Op("<".into())
+                }
+            }
+            '>' => {
+                if self.eat_if('=') {
+                    Tok::Op(">=".into())
+                } else {
+                    Tok::Op(">".into())
+                }
+            }
+            '=' => {
+                if self.eat_if('=') {
+                    Tok::Op("==".into())
+                } else {
+                    Tok::Op("=".into())
+                }
+            }
+            '&' => {
+                if self.eat_if('&') {
+                    Tok::Op("&&".into())
+                } else {
+                    Tok::Op("&".into())
+                }
+            }
+            '|' => {
+                if self.eat_if('|') {
+                    Tok::Op("||".into())
+                } else {
+                    Tok::Op("|".into())
+                }
+            }
             // Ternary punctuation (handled by parse_ternary).
             '?' => Tok::Op("?".into()),
             ':' => Tok::Op(":".into()),
@@ -446,7 +671,8 @@ impl Lexer {
 
 struct Parser {
     tokens: Vec<Tok>,
-    pos:    usize,
+    pos: usize,
+    parse_depth: u32,
 }
 
 fn is_assign_op(s: &str) -> bool {
@@ -461,13 +687,23 @@ impl Parser {
             let t = lex.next_tok();
             let done = t == Tok::Eof;
             tokens.push(t);
-            if done { break; }
+            if done {
+                break;
+            }
         }
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            parse_depth: 0,
+        }
     }
 
-    fn peek(&self) -> &Tok { self.tokens.get(self.pos).unwrap_or(&Tok::Eof) }
-    fn peek2(&self) -> &Tok { self.tokens.get(self.pos + 1).unwrap_or(&Tok::Eof) }
+    fn peek(&self) -> &Tok {
+        self.tokens.get(self.pos).unwrap_or(&Tok::Eof)
+    }
+    fn peek2(&self) -> &Tok {
+        self.tokens.get(self.pos + 1).unwrap_or(&Tok::Eof)
+    }
 
     fn eat(&mut self) -> Tok {
         let t = self.tokens.get(self.pos).cloned().unwrap_or(Tok::Eof);
@@ -476,14 +712,51 @@ impl Parser {
     }
 
     fn eat_semi(&mut self) {
-        while matches!(self.peek(), Tok::Semi) { self.eat(); }
+        while matches!(self.peek(), Tok::Semi) {
+            self.eat();
+        }
+    }
+
+    fn enter_parse(&mut self) -> bool {
+        if self.parse_depth >= PARSE_DEPTH_CAP {
+            return false;
+        }
+        self.parse_depth += 1;
+        true
+    }
+
+    fn exit_parse(&mut self) {
+        self.parse_depth = self.parse_depth.saturating_sub(1);
+    }
+
+    fn skip_depth_limited_expr(&mut self) {
+        let mut depth = 0i32;
+        while !matches!(self.peek(), Tok::Eof) {
+            match self.peek() {
+                Tok::Comma | Tok::Semi if depth == 0 => break,
+                Tok::RParen if depth == 0 => break,
+                Tok::LParen => {
+                    depth += 1;
+                    self.eat();
+                }
+                Tok::RParen => {
+                    depth -= 1;
+                    self.eat();
+                }
+                _ => {
+                    self.eat();
+                }
+            }
+        }
     }
 
     fn parse_program(&mut self) -> Vec<Expr> {
         let mut stmts = Vec::new();
         while !matches!(self.peek(), Tok::Eof) {
             self.eat_semi();
-            if matches!(self.peek(), Tok::Eof) { break; }
+            if matches!(self.peek(), Tok::Eof) {
+                break;
+            }
             let e = self.parse_expr();
             stmts.push(e);
             self.eat_semi();
@@ -493,6 +766,16 @@ impl Parser {
 
     // Highest-level: assignment (right-assoc). Handles `=` and compound `+= …`.
     fn parse_expr(&mut self) -> Expr {
+        if !self.enter_parse() {
+            self.skip_depth_limited_expr();
+            return Expr::Num(0.0);
+        }
+        let expr = self.parse_expr_inner();
+        self.exit_parse();
+        expr
+    }
+
+    fn parse_expr_inner(&mut self) -> Expr {
         // Look-ahead: `IDENT <assign-op> ...`  (plain var assignment).
         if let Tok::Ident(name) = self.peek().clone() {
             if let Tok::Op(op) = self.peek2().clone() {
@@ -505,11 +788,7 @@ impl Parser {
                         // x += rhs  →  x = x <op> rhs
                         Some(k) => Expr::Assign(
                             name.clone(),
-                            Box::new(Expr::BinOp(
-                                k,
-                                Box::new(Expr::Var(name)),
-                                Box::new(rhs),
-                            )),
+                            Box::new(Expr::BinOp(k, Box::new(Expr::Var(name)), Box::new(rhs))),
                         ),
                         None => Expr::Assign(name, Box::new(rhs)), // plain '='
                     };
@@ -519,9 +798,7 @@ impl Parser {
 
         // Look-ahead: buffer assignment `megabuf(idx) <assign-op> rhs`.
         if let Tok::Ident(name) = self.peek().clone() {
-            if (name == "megabuf" || name == "gmegabuf")
-                && matches!(self.peek2(), Tok::LParen)
-            {
+            if (name == "megabuf" || name == "gmegabuf") && matches!(self.peek2(), Tok::LParen) {
                 if let Some(close) = self.matching_paren(self.pos + 1) {
                     if let Tok::Op(op) = self.tokens.get(close + 1).cloned().unwrap_or(Tok::Eof) {
                         if is_assign_op(&op) {
@@ -529,16 +806,15 @@ impl Parser {
                             self.eat(); // ident
                             self.eat(); // '('
                             let idx = self.parse_expr();
-                            if matches!(self.peek(), Tok::RParen) { self.eat(); }
+                            if matches!(self.peek(), Tok::RParen) {
+                                self.eat();
+                            }
                             self.eat(); // assign-op
                             let rhs = self.parse_expr();
                             return match BinKind::from_assign_op(&op) {
                                 Some(k) => {
                                     // buf(i) op= rhs → buf(i) = buf(i) op rhs
-                                    let read = Expr::Call(
-                                        name.clone(),
-                                        vec![idx.clone()],
-                                    );
+                                    let read = Expr::Call(name.clone(), vec![idx.clone()]);
                                     Expr::BufAssign(
                                         is_global,
                                         Box::new(idx),
@@ -565,16 +841,13 @@ impl Parser {
         let cond = self.parse_or();
         if matches!(self.peek(), Tok::Op(s) if s == "?") {
             self.eat(); // '?'
-            // Branches can themselves contain assignments/ternaries.
+                        // Branches can themselves contain assignments/ternaries.
             let then_branch = self.parse_expr();
             if matches!(self.peek(), Tok::Op(s) if s == ":") {
                 self.eat(); // ':'
             }
             let else_branch = self.parse_expr();
-            Expr::Call(
-                "if".to_string(),
-                vec![cond, then_branch, else_branch],
-            )
+            Expr::Call("if".to_string(), vec![cond, then_branch, else_branch])
         } else {
             cond
         }
@@ -589,7 +862,9 @@ impl Parser {
                 Tok::LParen => depth += 1,
                 Tok::RParen => {
                     depth -= 1;
-                    if depth == 0 { return Some(i); }
+                    if depth == 0 {
+                        return Some(i);
+                    }
                 }
                 Tok::Eof => return None,
                 _ => {}
@@ -623,8 +898,8 @@ impl Parser {
         let mut lhs = self.parse_add();
         loop {
             let op = match self.peek() {
-                Tok::Op(s) if s == "<"  => BinKind::Lt,
-                Tok::Op(s) if s == ">"  => BinKind::Gt,
+                Tok::Op(s) if s == "<" => BinKind::Lt,
+                Tok::Op(s) if s == ">" => BinKind::Gt,
                 Tok::Op(s) if s == "<=" => BinKind::Le,
                 Tok::Op(s) if s == ">=" => BinKind::Ge,
                 Tok::Op(s) if s == "==" => BinKind::Eq,
@@ -671,8 +946,14 @@ impl Parser {
 
     fn parse_unary(&mut self) -> Expr {
         match self.peek() {
-            Tok::Op(s) if s == "-" => { self.eat(); Expr::Neg(Box::new(self.parse_unary())) }
-            Tok::Op(s) if s == "!" => { self.eat(); Expr::Not(Box::new(self.parse_unary())) }
+            Tok::Op(s) if s == "-" => {
+                self.eat();
+                Expr::Neg(Box::new(self.parse_unary()))
+            }
+            Tok::Op(s) if s == "!" => {
+                self.eat();
+                Expr::Not(Box::new(self.parse_unary()))
+            }
             _ => self.parse_pow(),
         }
     }
@@ -690,11 +971,16 @@ impl Parser {
 
     fn parse_atom(&mut self) -> Expr {
         match self.peek().clone() {
-            Tok::Num(v) => { self.eat(); Expr::Num(v) }
+            Tok::Num(v) => {
+                self.eat();
+                Expr::Num(v)
+            }
             Tok::LParen => {
                 self.eat();
                 let e = self.parse_expr();
-                if matches!(self.peek(), Tok::RParen) { self.eat(); }
+                if matches!(self.peek(), Tok::RParen) {
+                    self.eat();
+                }
                 e
             }
             Tok::Ident(name) => {
@@ -704,9 +990,13 @@ impl Parser {
                     let mut args = Vec::new();
                     while !matches!(self.peek(), Tok::RParen | Tok::Eof) {
                         args.push(self.parse_expr());
-                        if matches!(self.peek(), Tok::Comma) { self.eat(); }
+                        if matches!(self.peek(), Tok::Comma) {
+                            self.eat();
+                        }
                     }
-                    if matches!(self.peek(), Tok::RParen) { self.eat(); }
+                    if matches!(self.peek(), Tok::RParen) {
+                        self.eat();
+                    }
                     Expr::Call(name, args)
                 } else {
                     Expr::Var(name)
@@ -838,12 +1128,16 @@ mod tests {
     #[test]
     fn if_laziness_skips_untaken_branch() {
         // Only the taken branch should execute its side effects.
-        let env = run("taken = 0; skipped = 0; r = if(1, exec2(taken = 1, 100), exec2(skipped = 1, 200));");
+        let env = run(
+            "taken = 0; skipped = 0; r = if(1, exec2(taken = 1, 100), exec2(skipped = 1, 200));",
+        );
         assert_eq!(env["r"], 100.0);
         assert_eq!(env["taken"], 1.0);
         assert_eq!(env["skipped"], 0.0, "untaken branch ran its side effect");
 
-        let env = run("taken = 0; skipped = 0; r = if(0, exec2(taken = 1, 100), exec2(skipped = 1, 200));");
+        let env = run(
+            "taken = 0; skipped = 0; r = if(0, exec2(taken = 1, 100), exec2(skipped = 1, 200));",
+        );
         assert_eq!(env["r"], 200.0);
         assert_eq!(env["taken"], 0.0, "untaken branch ran its side effect");
         assert_eq!(env["skipped"], 1.0);
@@ -907,6 +1201,34 @@ mod tests {
         let env = run("a = 0; b = 0; loop(3, a = a + 1, b = b + 2);");
         assert_eq!(env["a"], 3.0);
         assert_eq!(env["b"], 6.0);
+    }
+
+    #[test]
+    fn loops_are_capped_by_cumulative_render_budget() {
+        let env = run("n = 0; loop(1048576, n = n + 1);");
+        assert_eq!(env["n"], LOOP_ITERATION_BUDGET as f64);
+
+        let env = run("n = 0; loop(1048576, loop(1048576, n = n + 1));");
+        assert_eq!(
+            env["n"],
+            (LOOP_ITERATION_BUDGET - 1) as f64,
+            "outer loop consumes one iteration budget entry before inner body runs"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_parse_and_eval_are_bounded() {
+        let mut src = String::from("x = ");
+        for _ in 0..(PARSE_DEPTH_CAP + 64) {
+            src.push_str("if(1,");
+        }
+        src.push('7');
+        for _ in 0..(PARSE_DEPTH_CAP + 64) {
+            src.push_str(",0)");
+        }
+        src.push(';');
+        let env = run(&src);
+        assert!(env.get("x").copied().unwrap_or(0.0).is_finite());
     }
 
     #[test]
@@ -982,10 +1304,14 @@ mod tests {
     #[test]
     fn ternary_is_lazy() {
         // Only the taken branch should run its side effects.
-        let env = run("taken = 0; skipped = 0; r = 1 ? exec2(taken = 1, 100) : exec2(skipped = 1, 200);");
+        let env =
+            run("taken = 0; skipped = 0; r = 1 ? exec2(taken = 1, 100) : exec2(skipped = 1, 200);");
         assert_eq!(env["r"], 100.0);
         assert_eq!(env["taken"], 1.0);
-        assert_eq!(env["skipped"], 0.0, "untaken ternary branch ran its side effect");
+        assert_eq!(
+            env["skipped"], 0.0,
+            "untaken ternary branch ran its side effect"
+        );
     }
 
     #[test]
@@ -1009,7 +1335,7 @@ mod tests {
         // mod(x,y) is integer mod: floor(x) % floor(y).
         let env = run("x = mod(7.8, 3.2);");
         assert_eq!(env["x"], 1.0); // 7 % 3 = 1
-        // mod by zero → 0.
+                                   // mod by zero → 0.
         let env = run("x = mod(7, 0);");
         assert_eq!(env["x"], 0.0);
     }

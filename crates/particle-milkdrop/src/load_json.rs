@@ -78,7 +78,10 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
     let bv = &p.base_vals;
     // Lookup with the SAME defaults as parse_milk for absent keys. Butterchurn JSON
     // keys are lowercase (gammaadj, decay, …); match case-insensitively to be safe.
-    let lc: HashMap<String, f64> = bv.iter().map(|(k, v)| (k.to_ascii_lowercase(), *v)).collect();
+    let lc: HashMap<String, f64> = bv
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), *v))
+        .collect();
     let f = |key: &str, default: f32| -> f32 {
         lc.get(&key.to_ascii_lowercase())
             .map(|v| *v as f32)
@@ -174,6 +177,7 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
 
         b1n: f("b1n", 0.0),
         b1x: f("b1x", 1.0),
+        b1ed: f("b1ed", 0.25),
         b2n: f("b2n", 0.0),
         b2x: f("b2x", 1.0),
         b3n: f("b3n", 0.0),
@@ -187,34 +191,85 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
 fn parse_json_shapes(shapes: &[JsonSubObj]) -> Vec<ShapeCode> {
     let mut out = Vec::new();
     for s in shapes {
-        let lc: HashMap<String, f64> =
-            s.base_vals.iter().map(|(k, v)| (k.to_ascii_lowercase(), *v)).collect();
+        let lc: HashMap<String, f64> = s
+            .base_vals
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), *v))
+            .collect();
         let g = |key: &str| lc.get(&key.to_ascii_lowercase()).copied();
         let mut base = ShapeBaseVals::default();
-        if let Some(v) = g("enabled")      { base.enabled = v as i32; }
-        if let Some(v) = g("sides")        { base.sides = v as f32; }
-        if let Some(v) = g("additive")     { base.additive = v as i32; }
-        if let Some(v) = g("thickoutline") { base.thick_outline = v as i32; }
-        if let Some(v) = g("textured")     { base.textured = v as i32; }
-        if let Some(v) = g("num_inst")     { base.num_inst = v as i32; }
-        if let Some(v) = g("x")            { base.x = v as f32; }
-        if let Some(v) = g("y")            { base.y = v as f32; }
-        if let Some(v) = g("rad")          { base.rad = v as f32; }
-        if let Some(v) = g("ang")          { base.ang = v as f32; }
-        if let Some(v) = g("tex_ang")      { base.tex_ang = v as f32; }
-        if let Some(v) = g("tex_zoom")     { base.tex_zoom = v as f32; }
-        if let Some(v) = g("r")            { base.r = v as f32; }
-        if let Some(v) = g("g")            { base.g = v as f32; }
-        if let Some(v) = g("b")            { base.b = v as f32; }
-        if let Some(v) = g("a")            { base.a = v as f32; }
-        if let Some(v) = g("r2")           { base.r2 = v as f32; }
-        if let Some(v) = g("g2")           { base.g2 = v as f32; }
-        if let Some(v) = g("b2")           { base.b2 = v as f32; }
-        if let Some(v) = g("a2")           { base.a2 = v as f32; }
-        if let Some(v) = g("border_r")     { base.border_r = v as f32; }
-        if let Some(v) = g("border_g")     { base.border_g = v as f32; }
-        if let Some(v) = g("border_b")     { base.border_b = v as f32; }
-        if let Some(v) = g("border_a")     { base.border_a = v as f32; }
+        if let Some(v) = g("enabled") {
+            base.enabled = v as i32;
+        }
+        if let Some(v) = g("sides") {
+            base.sides = v as f32;
+        }
+        if let Some(v) = g("additive") {
+            base.additive = v as i32;
+        }
+        if let Some(v) = g("thickoutline") {
+            base.thick_outline = v as i32;
+        }
+        if let Some(v) = g("textured") {
+            base.textured = v as i32;
+        }
+        if let Some(v) = g("num_inst") {
+            base.num_inst = v as i32;
+        }
+        if let Some(v) = g("x") {
+            base.x = v as f32;
+        }
+        if let Some(v) = g("y") {
+            base.y = v as f32;
+        }
+        if let Some(v) = g("rad") {
+            base.rad = v as f32;
+        }
+        if let Some(v) = g("ang") {
+            base.ang = v as f32;
+        }
+        if let Some(v) = g("tex_ang") {
+            base.tex_ang = v as f32;
+        }
+        if let Some(v) = g("tex_zoom") {
+            base.tex_zoom = v as f32;
+        }
+        if let Some(v) = g("r") {
+            base.r = v as f32;
+        }
+        if let Some(v) = g("g") {
+            base.g = v as f32;
+        }
+        if let Some(v) = g("b") {
+            base.b = v as f32;
+        }
+        if let Some(v) = g("a") {
+            base.a = v as f32;
+        }
+        if let Some(v) = g("r2") {
+            base.r2 = v as f32;
+        }
+        if let Some(v) = g("g2") {
+            base.g2 = v as f32;
+        }
+        if let Some(v) = g("b2") {
+            base.b2 = v as f32;
+        }
+        if let Some(v) = g("a2") {
+            base.a2 = v as f32;
+        }
+        if let Some(v) = g("border_r") {
+            base.border_r = v as f32;
+        }
+        if let Some(v) = g("border_g") {
+            base.border_g = v as f32;
+        }
+        if let Some(v) = g("border_b") {
+            base.border_b = v as f32;
+        }
+        if let Some(v) = g("border_a") {
+            base.border_a = v as f32;
+        }
         out.push(ShapeCode {
             base,
             per_frame: pick_eqs(&s.frame_eqs_eel, &s.frame_eqs_str),
@@ -227,27 +282,59 @@ fn parse_json_shapes(shapes: &[JsonSubObj]) -> Vec<ShapeCode> {
 fn parse_json_waves(waves: &[JsonSubObj]) -> Vec<CustomWaveDef> {
     let mut out = Vec::new();
     for (n, w) in waves.iter().enumerate() {
-        let lc: HashMap<String, f64> =
-            w.base_vals.iter().map(|(k, v)| (k.to_ascii_lowercase(), *v)).collect();
+        let lc: HashMap<String, f64> = w
+            .base_vals
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), *v))
+            .collect();
         let g = |key: &str| lc.get(&key.to_ascii_lowercase()).copied();
-        let mut cw = CustomWaveDef { index: n as u32, ..Default::default() };
-        if let Some(v) = g("enabled")    { cw.enabled = v != 0.0; }
-        if let Some(v) = g("samples")    { cw.samples = v.max(0.0) as u32; }
-        if let Some(v) = g("sep")        { cw.sep = v as i32; }
+        let mut cw = CustomWaveDef {
+            index: n as u32,
+            ..Default::default()
+        };
+        if let Some(v) = g("enabled") {
+            cw.enabled = v != 0.0;
+        }
+        if let Some(v) = g("samples") {
+            cw.samples = v.max(0.0) as u32;
+        }
+        if let Some(v) = g("sep") {
+            cw.sep = v as i32;
+        }
         // The native-converter JSON stores these wave flags WITHOUT the `b` prefix
         // (spectrum/usedots/thick/additive); the b-prefixed names matched nothing, so
         // ~6,800 corpus waves silently lost `additive` — the glow that bootstraps the
         // feedback buffer. Read the un-prefixed key first, fall back to b-prefixed.
-        if let Some(v) = g("spectrum").or_else(|| g("bspectrum"))  { cw.spectrum = v != 0.0; }
-        if let Some(v) = g("usedots").or_else(|| g("busedots"))    { cw.use_dots = v != 0.0; }
-        if let Some(v) = g("thick").or_else(|| g("bdrawthick"))    { cw.draw_thick = v != 0.0; }
-        if let Some(v) = g("additive").or_else(|| g("badditive"))  { cw.additive = v != 0.0; }
-        if let Some(v) = g("scaling")    { cw.scaling = v as f32; }
-        if let Some(v) = g("smoothing")  { cw.smoothing = v as f32; }
-        if let Some(v) = g("r")          { cw.r = v as f32; }
-        if let Some(v) = g("g")          { cw.g = v as f32; }
-        if let Some(v) = g("b")          { cw.b = v as f32; }
-        if let Some(v) = g("a")          { cw.a = v as f32; }
+        if let Some(v) = g("spectrum").or_else(|| g("bspectrum")) {
+            cw.spectrum = v != 0.0;
+        }
+        if let Some(v) = g("usedots").or_else(|| g("busedots")) {
+            cw.use_dots = v != 0.0;
+        }
+        if let Some(v) = g("thick").or_else(|| g("bdrawthick")) {
+            cw.draw_thick = v != 0.0;
+        }
+        if let Some(v) = g("additive").or_else(|| g("badditive")) {
+            cw.additive = v != 0.0;
+        }
+        if let Some(v) = g("scaling") {
+            cw.scaling = v as f32;
+        }
+        if let Some(v) = g("smoothing") {
+            cw.smoothing = v as f32;
+        }
+        if let Some(v) = g("r") {
+            cw.r = v as f32;
+        }
+        if let Some(v) = g("g") {
+            cw.g = v as f32;
+        }
+        if let Some(v) = g("b") {
+            cw.b = v as f32;
+        }
+        if let Some(v) = g("a") {
+            cw.a = v as f32;
+        }
         cw.per_frame_init = pick_eqs(&w.init_eqs_eel, &w.init_eqs_str);
         cw.per_frame = pick_eqs(&w.frame_eqs_eel, &w.frame_eqs_str);
         cw.per_point = pick_eqs(&w.point_eqs_eel, &w.point_eqs_str);
@@ -372,7 +459,11 @@ mod tests {
         assert!(s.warp.is_some());
         assert!(s.comp.is_some());
         // gammaadj 1.56, decay 1, echo_zoom 0.362, warpscale 0.107, zoomexp 0.1584.
-        assert!((s.gamma_adj - 1.56).abs() < 1e-4, "gamma_adj={}", s.gamma_adj);
+        assert!(
+            (s.gamma_adj - 1.56).abs() < 1e-4,
+            "gamma_adj={}",
+            s.gamma_adj
+        );
         assert!((s.decay - 1.0).abs() < 1e-4);
         assert!((s.echo_zoom - 0.362).abs() < 1e-4);
         assert!((s.warpscale - 0.107).abs() < 1e-4);

@@ -33,7 +33,10 @@ pub mod renderer;
 use std::path::Path;
 
 pub use parse_milk::{parse, CustomWaveDef, MilkShaders, ShapeBaseVals, ShapeCode};
-pub use renderer::{compile_glsl, MilkdropRenderer};
+pub use renderer::{
+    compile_glsl, compile_milkdrop_shader_bodies, compile_milkdrop_shader_bodies_from_parts,
+    CompiledMilkdropShaderBodies, MilkdropRenderer,
+};
 
 /// Whether this build can ingest raw `.milk` presets — i.e. the native
 /// HLSL→GLSL converter (hlsl2glslfork + glsl-optimizer) was compiled and linked.
@@ -74,12 +77,20 @@ pub fn load_preset_str(content: &str, is_json: bool) -> Result<MilkShaders, Stri
 /// Load a preset from disk, dispatching on file extension (`.json` → Butterchurn
 /// loader, anything else → raw `.milk` parser). See [`load_preset_str`].
 pub fn load_preset_path(path: &Path) -> Result<MilkShaders, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     // Match the `.json` predicate used at the call sites (and the foundation
     // `load_preset`): a full, case-insensitive ".json" suffix, so dispatch and the
     // UI/CLI gates never disagree on a pathological name.
-    let is_json = path.to_string_lossy().to_ascii_lowercase().ends_with(".json");
+    let is_json = path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".json");
+    let content = if is_json {
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?
+    } else {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
     load_preset_str(&content, is_json).map_err(|e| format!("{} ({})", e, path.display()))
 }
 

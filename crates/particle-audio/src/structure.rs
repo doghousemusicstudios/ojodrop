@@ -61,24 +61,29 @@ impl StructureTracker {
     ) -> StructureFeatures {
         let gate = if is_silent { 0.0 } else { 1.0 };
         let embedding = make_embedding(spectrum, chroma, rms, brightness, flux, harmonic_ratio);
-        let raw = self.checkerboard_novelty(&embedding) * gate;
+        let raw = finite_clamp(self.checkerboard_novelty(&embedding), 0.0, 1.0, 0.0) * gate;
         self.push(embedding);
 
-        let novelty = (raw * 2.4).clamp(0.0, 1.0);
-        self.novelty_lp = self.novelty_lp * 0.72 + novelty * 0.28;
-        self.baseline = self.baseline * 0.985 + self.novelty_lp * 0.015;
+        let novelty = finite_clamp(raw * 2.4, 0.0, 1.0, 0.0);
+        self.novelty_lp = finite_or_zero(self.novelty_lp) * 0.72 + novelty * 0.28;
+        self.baseline = finite_or_zero(self.baseline) * 0.985 + self.novelty_lp * 0.015;
 
-        let hit = ((self.novelty_lp - self.baseline - 0.055) * 5.0).clamp(0.0, 1.0) * gate;
-        self.change_env = (self.change_env * 0.82).max(hit);
+        let hit = finite_clamp(
+            (self.novelty_lp - self.baseline - 0.055) * 5.0,
+            0.0,
+            1.0,
+            0.0,
+        ) * gate;
+        self.change_env = (finite_or_zero(self.change_env) * 0.82).max(hit);
         if is_silent {
             self.change_env *= 0.8;
         }
 
         let history_conf = (self.len as f32 / (WINDOW * 2) as f32).clamp(0.0, 1.0);
-        let energy_conf = (rms * 2.0).clamp(0.0, 1.0);
+        let energy_conf = finite_clamp(rms * 2.0, 0.0, 1.0, 0.0);
         StructureFeatures {
-            novelty: self.novelty_lp * gate,
-            change: self.change_env,
+            novelty: finite_clamp(self.novelty_lp * gate, 0.0, 1.0, 0.0),
+            change: finite_clamp(self.change_env, 0.0, 1.0, 0.0),
             confidence: history_conf * energy_conf * gate,
         }
     }
@@ -119,7 +124,7 @@ impl StructureTracker {
 
         let same = (left + right) / same_count.max(1.0);
         let cross = cross / cross_count.max(1.0);
-        (same - cross).clamp(0.0, 1.0)
+        finite_clamp(same - cross, 0.0, 1.0, 0.0)
     }
 }
 
@@ -135,20 +140,20 @@ fn make_embedding(
     for group in 0..SPEC_GROUPS {
         let mut sum = 0.0;
         for i in 0..4 {
-            sum += spectrum[group * 4 + i].clamp(0.0, 2.0);
+            sum += finite_clamp(spectrum[group * 4 + i], 0.0, 2.0, 0.0);
         }
         out[group] = sum * 0.25;
     }
     for i in 0..CHROMA_BINS {
-        out[SPEC_GROUPS + i] = chroma[i].clamp(0.0, 1.0);
+        out[SPEC_GROUPS + i] = finite_clamp(chroma[i], 0.0, 1.0, 0.0);
     }
-    out[20] = rms.clamp(0.0, 1.0);
-    out[21] = brightness.clamp(0.0, 1.0);
-    out[22] = flux.clamp(0.0, 1.0);
-    out[23] = harmonic_ratio.clamp(0.0, 1.0);
+    out[20] = finite_clamp(rms, 0.0, 1.0, 0.0);
+    out[21] = finite_clamp(brightness, 0.0, 1.0, 0.0);
+    out[22] = finite_clamp(flux, 0.0, 1.0, 0.0);
+    out[23] = finite_clamp(harmonic_ratio, 0.0, 1.0, 0.0);
 
     let energy = out.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if energy > 1e-5 {
+    if energy.is_finite() && energy > 1e-5 {
         for v in &mut out {
             *v /= energy;
         }
@@ -157,7 +162,26 @@ fn make_embedding(
 }
 
 fn dot(a: &[f32; EMBED_DIM], b: &[f32; EMBED_DIM]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| finite_or_zero(*x) * finite_or_zero(*y))
+        .sum()
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn finite_clamp(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback.clamp(min, max)
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +237,58 @@ mod tests {
         let out = tracker.process(&spectrum, &chroma, 0.8, 0.2, 0.1, 0.9, true);
         assert_eq!(out.novelty, 0.0);
         assert_eq!(out.confidence, 0.0);
+    }
+
+    #[test]
+    fn non_finite_inputs_do_not_poison_structure_state() {
+        let mut tracker = StructureTracker::new();
+        let mut spectrum = [0.1; 32];
+        let mut chroma = [0.1; CHROMA_BINS];
+        spectrum[3] = f32::NAN;
+        spectrum[7] = f32::INFINITY;
+        chroma[2] = f32::NAN;
+        chroma[6] = f32::NEG_INFINITY;
+
+        for _ in 0..24 {
+            let out = tracker.process(
+                &spectrum,
+                &chroma,
+                f32::NAN,
+                f32::INFINITY,
+                f32::NAN,
+                f32::NEG_INFINITY,
+                false,
+            );
+            assert!(out.novelty.is_finite());
+            assert!(out.change.is_finite());
+            assert!(out.confidence.is_finite());
+        }
+
+        let (clean_spectrum, clean_chroma) = frame(false);
+        let out = tracker.process(&clean_spectrum, &clean_chroma, 0.8, 0.5, 0.2, 0.9, false);
+        assert!(out.novelty.is_finite());
+        assert!(out.change.is_finite());
+        assert!(out.confidence.is_finite());
+    }
+
+    #[test]
+    fn poisoned_history_is_sanitized_by_similarity_dot_product() {
+        let mut tracker = StructureTracker::new();
+        tracker.len = HISTORY;
+        tracker.write = 0;
+        tracker.history[0][0] = f32::NAN;
+        tracker.history[1][1] = f32::INFINITY;
+        tracker.novelty_lp = f32::NAN;
+        tracker.baseline = f32::NAN;
+        tracker.change_env = f32::NAN;
+
+        let (spectrum, chroma) = frame(true);
+        let out = tracker.process(&spectrum, &chroma, 0.8, 0.5, 0.2, 0.9, false);
+        assert!(out.novelty.is_finite());
+        assert!(out.change.is_finite());
+        assert!(out.confidence.is_finite());
+        assert!(tracker.novelty_lp.is_finite());
+        assert!(tracker.baseline.is_finite());
+        assert!(tracker.change_env.is_finite());
     }
 }

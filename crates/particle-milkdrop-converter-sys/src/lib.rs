@@ -22,8 +22,17 @@ use std::os::raw::{c_char, c_int};
 
 #[cfg(milk_converter_native)]
 extern "C" {
-    fn milk_convert_shader(hlsl: *const c_char, optimize: c_int, out_glsl: *mut *mut c_char) -> c_int;
-    fn milk_convert_shader_ex(file_globals: *const c_char, hlsl: *const c_char, optimize: c_int, out_glsl: *mut *mut c_char) -> c_int;
+    fn milk_convert_shader(
+        hlsl: *const c_char,
+        optimize: c_int,
+        out_glsl: *mut *mut c_char,
+    ) -> c_int;
+    fn milk_convert_shader_ex(
+        file_globals: *const c_char,
+        hlsl: *const c_char,
+        optimize: c_int,
+        out_glsl: *mut *mut c_char,
+    ) -> c_int;
     fn milk_convert_free(p: *mut c_char);
 }
 
@@ -49,7 +58,11 @@ pub fn convert_milk_shader_raw(hlsl_body: &str, optimize: bool) -> Result<String
 /// They are inserted between the MilkDrop HLSL prefix and the `shader_body()`
 /// wrapper at file scope — matching MilkDrop's original HLSL layout and
 /// preventing redeclaration errors when the inner body reuses the same names.
-pub fn convert_milk_shader_ex(file_globals: &str, body_inner: &str, optimize: bool) -> Result<String, String> {
+pub fn convert_milk_shader_ex(
+    file_globals: &str,
+    body_inner: &str,
+    optimize: bool,
+) -> Result<String, String> {
     let glsl_es300 = call_c_convert(Some(file_globals), body_inner, optimize)?;
     Ok(process_native_glsl(&glsl_es300))
 }
@@ -58,15 +71,25 @@ pub fn convert_milk_shader_ex(file_globals: &str, body_inner: &str, optimize: bo
 /// absent at build time). Keeps the crate linkable with no C++ dependency; the
 /// host falls back to JSON-only ingestion.
 #[cfg(not(milk_converter_native))]
-fn call_c_convert(_file_globals: Option<&str>, _hlsl_body: &str, _optimize: bool) -> Result<String, String> {
-    Err("native .milk converter not built into this binary (hlsl2glslfork + \
+fn call_c_convert(
+    _file_globals: Option<&str>,
+    _hlsl_body: &str,
+    _optimize: bool,
+) -> Result<String, String> {
+    Err(
+        "native .milk converter not built into this binary (hlsl2glslfork + \
          glsl-optimizer sources were absent at build time). Load a pre-converted \
          .json preset, or rebuild with the converter sources present."
-        .to_string())
+            .to_string(),
+    )
 }
 
 #[cfg(milk_converter_native)]
-fn call_c_convert(file_globals: Option<&str>, hlsl_body: &str, optimize: bool) -> Result<String, String> {
+fn call_c_convert(
+    file_globals: Option<&str>,
+    hlsl_body: &str,
+    optimize: bool,
+) -> Result<String, String> {
     // QA: dump the exact HLSL handed to the native converter (MILK_DUMP_NATIVE_IN=1).
     if std::env::var("MILK_DUMP_NATIVE_IN").is_ok() {
         eprintln!(
@@ -75,25 +98,29 @@ fn call_c_convert(file_globals: Option<&str>, hlsl_body: &str, optimize: bool) -
             hlsl_body
         );
     }
-    let c_hlsl = CString::new(hlsl_body)
-        .map_err(|e| format!("CString::new failed: {e}"))?;
+    let c_hlsl = CString::new(hlsl_body).map_err(|e| format!("CString::new failed: {e}"))?;
     let mut out_ptr: *mut c_char = std::ptr::null_mut();
 
     let rc = match file_globals {
-        None => unsafe {
-            milk_convert_shader(c_hlsl.as_ptr(), optimize as c_int, &mut out_ptr)
-        },
+        None => unsafe { milk_convert_shader(c_hlsl.as_ptr(), optimize as c_int, &mut out_ptr) },
         Some(globals) => {
-            let c_globals = CString::new(globals)
-                .map_err(|e| format!("CString::new (globals) failed: {e}"))?;
+            let c_globals =
+                CString::new(globals).map_err(|e| format!("CString::new (globals) failed: {e}"))?;
             unsafe {
-                milk_convert_shader_ex(c_globals.as_ptr(), c_hlsl.as_ptr(), optimize as c_int, &mut out_ptr)
+                milk_convert_shader_ex(
+                    c_globals.as_ptr(),
+                    c_hlsl.as_ptr(),
+                    optimize as c_int,
+                    &mut out_ptr,
+                )
             }
         }
     };
 
     if out_ptr.is_null() {
-        return Err(format!("milk_convert_shader returned null output (rc={rc})"));
+        return Err(format!(
+            "milk_convert_shader returned null output (rc={rc})"
+        ));
     }
 
     // Copy the C string out (as checked UTF-8 where it matters) BEFORE freeing it.
@@ -205,7 +232,10 @@ pub fn process_native_glsl(glsl: &str) -> String {
         let mut l = line.to_string();
 
         // Strip precision qualifiers.
-        l = l.replace("lowp ", "").replace("highp ", "").replace("mediump ", "");
+        l = l
+            .replace("lowp ", "")
+            .replace("highp ", "")
+            .replace("mediump ", "");
 
         // Rename TEXCOORD0 varying to `uv`.
         l = l.replace("xlv_TEXCOORD0", "uv");
@@ -215,7 +245,6 @@ pub fn process_native_glsl(glsl: &str) -> String {
         // shader that writes it (`xlat_mutabletexsize.x = …`) would then store into the
         // read-only `texsize` uniform → naga "pointer … not a valid store destination".
         // Keeping the local name makes reads and writes consistent.
-
 
         out.push_str(&l);
         out.push('\n');
@@ -278,7 +307,10 @@ fn try_expand_swizzle_store(line: &str, counter: &mut usize) -> Option<String> {
     let comps = [b'x', b'y', b'z', b'w'];
     let mut s = format!("{indent}{vtype} {tmp} = {rhs};");
     for (k, sc) in swiz.bytes().enumerate() {
-        s.push_str(&format!(" {place}.{} = {tmp}.{};", sc as char, comps[k] as char));
+        s.push_str(&format!(
+            " {place}.{} = {tmp}.{};",
+            sc as char, comps[k] as char
+        ));
     }
     Some(s)
 }

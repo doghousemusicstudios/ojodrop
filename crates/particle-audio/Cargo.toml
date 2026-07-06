@@ -6,8 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 description = "Self-contained real-time audio capture + DSP for an audio-reactive visual engine."
 
+[features]
+default = ["capture"]
+capture = ["dep:cpal"]
+
 [dependencies]
-cpal.workspace = true
+cpal = { workspace = true, optional = true }
 realfft.workspace = true
 rtrb.workspace = true
 log.workspace = true

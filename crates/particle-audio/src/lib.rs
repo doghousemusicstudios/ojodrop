@@ -26,8 +26,9 @@
 
 mod analysis;
 pub mod butterchurn;
+#[cfg(feature = "capture")]
 mod capture;
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "capture", target_os = "macos"))]
 mod capture_macos;
 mod complex_onset;
 mod dsp;
@@ -46,7 +47,9 @@ mod triple_buffer;
 pub use butterchurn::{
     AudioLevels as ButterchurnAudioLevels, ButterchurnLevels, DEFAULT_SAMPLE_RATE,
 };
+#[cfg(feature = "capture")]
 pub use capture::{CaptureConfig, CaptureSource};
+pub use dsp::Analyzer;
 pub use hpss_bus::{HpssBus, HpssLevels};
 pub use spectrogram::{
     SpectrogramSnapshot, SpectrogramTrail, DEFAULT_BINS as SPECTROGRAM_DEFAULT_BINS,
@@ -343,12 +346,14 @@ impl std::error::Error for AudioError {}
 
 /// Ring capacity in samples. ~1 s at 48 kHz mono — generous headroom so a brief
 /// DSP-thread stall never overflows the realtime capture callback.
+#[cfg(feature = "capture")]
 const RING_CAPACITY: usize = 48_000;
 
 /// Real-time audio analysis engine.
 ///
 /// [`AudioEngine::new`] starts capture + DSP immediately on background threads.
 /// Dropping the engine stops capture and joins the worker.
+#[cfg(feature = "capture")]
 pub struct AudioEngine {
     reader: triple_buffer::Reader<Features>,
     /// Scrolling-spectrogram trail snapshot, published by the DSP worker once per
@@ -366,6 +371,7 @@ pub struct AudioEngine {
     source: CaptureSource,
 }
 
+#[cfg(feature = "capture")]
 impl AudioEngine {
     /// Start capture + DSP on the default input device with default settings.
     pub fn new() -> Result<Self, AudioError> {
@@ -376,9 +382,10 @@ impl AudioEngine {
     /// `sensitivity` ~`0.1..3`; higher = onsets fire more readily.
     pub fn with_config(cfg: CaptureConfig, sensitivity: f32) -> Result<Self, AudioError> {
         let (producer, consumer) = rtrb::RingBuffer::<CaptureFrame>::new(RING_CAPACITY);
+        let running = Arc::new(AtomicBool::new(true));
 
         // Start capture first so we know the actual device sample rate (spec §2).
-        let cap = capture::start(producer, cfg)?;
+        let cap = capture::start(producer, cfg, running.clone())?;
         let sample_rate = cap.sample_rate;
         let device_name = cap.device_name.clone();
         let source = cap.source;
@@ -399,8 +406,6 @@ impl AudioEngine {
         let spectrogram = Arc::new(Mutex::new(
             SpectrogramTrail::new(FFT_LEN, sample_rate as f32).snapshot(),
         ));
-        let running = Arc::new(AtomicBool::new(true));
-
         let worker = {
             let running = running.clone();
             let spectrogram = spectrogram.clone();
@@ -475,6 +480,7 @@ impl AudioEngine {
     }
 }
 
+#[cfg(feature = "capture")]
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         // Signal the worker to stop, then drop the capture stream (stops capture

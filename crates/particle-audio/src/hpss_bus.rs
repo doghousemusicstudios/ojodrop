@@ -88,6 +88,15 @@ const FREQ_MEDIAN_RADIUS: usize = 8;
 /// Wiener-style soft-mask exponent (power-domain ratio), per Fitzgerald 2010.
 const MASK_POWER: f32 = 2.0;
 
+#[inline]
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 impl HpssBus {
     /// Build a separator for an analyzer producing `n_bins` (= `FFT_LEN/2 + 1`)
     /// magnitude bins at a hop period of `hop_dt` seconds. The time-median window
@@ -147,20 +156,20 @@ impl HpssBus {
 
         for bin in 0..self.n_bins {
             // Harmonic estimate: median across time at this frequency.
-            let harmonic_ref = self.time_median(bin);
+            let harmonic_ref = finite_or_zero(self.time_median(bin)).max(0.0);
             // Percussive estimate: median across frequency in this frame.
-            let percussive_ref = self.frequency_median(mag, bin);
+            let percussive_ref = finite_or_zero(self.frequency_median(mag, bin)).max(0.0);
 
             // Soft (Wiener-style) mask from the relative power of the two
             // medians, per Fitzgerald 2010 eq. for the soft mask:
             //   M_h = H^p / (H^p + P^p),  M_p = P^p / (H^p + P^p)
             let h = harmonic_ref.powf(self.mask_power);
             let p = percussive_ref.powf(self.mask_power);
-            let denom = h + p + 1e-12;
-            let harm_mask = h / denom;
-            let perc_mask = p / denom;
+            let denom = finite_or_zero(h + p).max(0.0) + 1e-12;
+            let harm_mask = finite_or_zero(h / denom).clamp(0.0, 1.0);
+            let perc_mask = finite_or_zero(p / denom).clamp(0.0, 1.0);
 
-            let m = mag[bin];
+            let m = finite_or_zero(mag[bin]).max(0.0);
             let hm = m * harm_mask;
             let pm = m * perc_mask;
             harm_energy += hm * hm;
@@ -203,7 +212,12 @@ impl HpssBus {
     /// Overwrite the oldest history frame with the newest magnitude frame.
     fn push_history(&mut self, mag: &[f32]) {
         let offset = self.write * self.n_bins;
-        self.history[offset..offset + self.n_bins].copy_from_slice(mag);
+        for (dst, &src) in self.history[offset..offset + self.n_bins]
+            .iter_mut()
+            .zip(mag.iter())
+        {
+            *dst = finite_or_zero(src).max(0.0);
+        }
         self.write = (self.write + 1) % self.time_frames;
         self.filled = (self.filled + 1).min(self.time_frames);
     }
@@ -227,7 +241,12 @@ impl HpssBus {
         let lo = bin.saturating_sub(self.freq_radius);
         let hi = (bin + self.freq_radius + 1).min(mag.len());
         let count = hi - lo;
-        self.freq_scratch[..count].copy_from_slice(&mag[lo..hi]);
+        for (dst, &src) in self.freq_scratch[..count]
+            .iter_mut()
+            .zip(mag[lo..hi].iter())
+        {
+            *dst = finite_or_zero(src).max(0.0);
+        }
         median(&mut self.freq_scratch[..count])
     }
 }

@@ -19,16 +19,21 @@ pub fn butterchurn_to_naga(src: &str) -> String {
 
     // Pass 1: collect all uniform declarations
     let mut samplers: Vec<SamplerDecl> = Vec::new();
-    let mut scalars:  Vec<ScalarDecl>  = Vec::new();
-    let mut in_vars:  Vec<IoVar>       = Vec::new();
-    let mut out_vars: Vec<IoVar>       = Vec::new();
+    let mut scalars: Vec<ScalarDecl> = Vec::new();
+    let mut in_vars: Vec<IoVar> = Vec::new();
+    let mut out_vars: Vec<IoVar> = Vec::new();
 
     for line in &lines {
         let t = line.trim();
-        if let Some(s) = parse_sampler(t) { samplers.push(s); }
-        else if let Some(s) = parse_scalar(t) { scalars.push(s); }
-        else if let Some(v) = parse_io(t, "in")  { in_vars.push(v); }
-        else if let Some(v) = parse_io(t, "out") { out_vars.push(v); }
+        if let Some(s) = parse_sampler(t) {
+            samplers.push(s);
+        } else if let Some(s) = parse_scalar(t) {
+            scalars.push(s);
+        } else if let Some(v) = parse_io(t, "in") {
+            in_vars.push(v);
+        } else if let Some(v) = parse_io(t, "out") {
+            out_vars.push(v);
+        }
     }
 
     // Pass 2: rewrite line-by-line
@@ -43,18 +48,30 @@ pub fn butterchurn_to_naga(src: &str) -> String {
 
     let mut ubo_binding = sampler_binding; // UBO goes after all texture slots
 
-    let mut in_loc  = 0u32;
+    let mut in_loc = 0u32;
     let mut out_loc = 0u32;
     // Build maps for in/out location assignment (order of appearance)
-    let mut in_locs:  HashMap<String, u32> = HashMap::new();
+    let mut in_locs: HashMap<String, u32> = HashMap::new();
     let mut out_locs: HashMap<String, u32> = HashMap::new();
-    for v in &in_vars  { in_locs.entry(v.name.clone()).or_insert_with(|| { let l = in_loc; in_loc += 1; l }); }
-    for v in &out_vars { out_locs.entry(v.name.clone()).or_insert_with(|| { let l = out_loc; out_loc += 1; l }); }
+    for v in &in_vars {
+        in_locs.entry(v.name.clone()).or_insert_with(|| {
+            let l = in_loc;
+            in_loc += 1;
+            l
+        });
+    }
+    for v in &out_vars {
+        out_locs.entry(v.name.clone()).or_insert_with(|| {
+            let l = out_loc;
+            out_loc += 1;
+            l
+        });
+    }
 
     let mut result: Vec<String> = Vec::new();
-    let mut ubo_emitted   = false;
-    let mut in_out_done:   std::collections::HashSet<String> = Default::default();
-    let mut sampler_done:  std::collections::HashSet<String> = Default::default();
+    let mut ubo_emitted = false;
+    let mut in_out_done: std::collections::HashSet<String> = Default::default();
+    let mut sampler_done: std::collections::HashSet<String> = Default::default();
     let mut skipping_scalar_uniforms = false;
 
     for line in &lines {
@@ -98,8 +115,15 @@ pub fn butterchurn_to_naga(src: &str) -> String {
                 } else {
                     ("texture2D", "sampler")
                 };
-                result.push(format!("layout(set = 0, binding = {b}) uniform {tex_ty} {};", s.name));
-                result.push(format!("layout(set = 0, binding = {}) uniform {samp_ty} {}_samp;", b + 1, s.name));
+                result.push(format!(
+                    "layout(set = 0, binding = {b}) uniform {tex_ty} {};",
+                    s.name
+                ));
+                result.push(format!(
+                    "layout(set = 0, binding = {}) uniform {samp_ty} {}_samp;",
+                    b + 1,
+                    s.name
+                ));
                 sampler_done.insert(s.name);
             }
             continue;
@@ -145,7 +169,9 @@ pub fn butterchurn_to_naga(src: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn emit_ubo(scalars: &[ScalarDecl], binding: u32, out: &mut Vec<String>) {
-    out.push(format!("layout(set = 1, binding = {binding}) uniform PerFrame {{"));
+    out.push(format!(
+        "layout(set = 1, binding = {binding}) uniform PerFrame {{"
+    ));
     // Emit in std140-friendly order: vec4 first, then vec3 (aligns as vec4), then
     // vec2, then float, then int (avoids alignment padding issues)
     for ty_order in &["vec4", "vec3", "vec2", "float", "int"] {
@@ -189,20 +215,38 @@ fn rewrite_texture_calls(src: &str, sampler_map: &HashMap<String, u32>) -> Strin
 // Line classifiers
 // ---------------------------------------------------------------------------
 
-struct SamplerDecl { name: String, ty: String }
-struct ScalarDecl  { name: String, ty: String }
-struct IoVar       { name: String, ty: String }
+struct SamplerDecl {
+    name: String,
+    ty: String,
+}
+struct ScalarDecl {
+    name: String,
+    ty: String,
+}
+struct IoVar {
+    name: String,
+    ty: String,
+}
 
 fn parse_sampler(line: &str) -> Option<SamplerDecl> {
     // `uniform sampler2D name;` or `uniform sampler3D name;`
     let l = line.trim_end_matches(';').trim();
     let rest = l.strip_prefix("uniform ")?;
-    let ty = if rest.starts_with("sampler2D ") { "sampler2D" }
-             else if rest.starts_with("sampler3D ") { "sampler3D" }
-             else { return None; };
+    let ty = if rest.starts_with("sampler2D ") {
+        "sampler2D"
+    } else if rest.starts_with("sampler3D ") {
+        "sampler3D"
+    } else {
+        return None;
+    };
     let name = rest[ty.len()..].trim().to_string();
-    if name.is_empty() || name.contains(' ') { return None; }
-    Some(SamplerDecl { name, ty: ty.to_string() })
+    if name.is_empty() || name.contains(' ') {
+        return None;
+    }
+    Some(SamplerDecl {
+        name,
+        ty: ty.to_string(),
+    })
 }
 
 fn parse_scalar(line: &str) -> Option<ScalarDecl> {
@@ -218,7 +262,10 @@ fn parse_scalar(line: &str) -> Option<ScalarDecl> {
     if name.is_empty() || name.contains('[') || name.contains(' ') || name.contains(',') {
         return None;
     }
-    Some(ScalarDecl { name, ty: ty.to_string() })
+    Some(ScalarDecl {
+        name,
+        ty: ty.to_string(),
+    })
 }
 
 fn parse_io(line: &str, keyword: &str) -> Option<IoVar> {
@@ -227,23 +274,41 @@ fn parse_io(line: &str, keyword: &str) -> Option<IoVar> {
     let rest = l.strip_prefix(&format!("{keyword} "))?;
     // Must be type + name (two tokens)
     let mut parts = rest.splitn(2, ' ');
-    let ty   = parts.next()?.trim().to_string();
+    let ty = parts.next()?.trim().to_string();
     let name = parts.next()?.trim().to_string();
-    if name.is_empty() || name.contains(' ') || ty.is_empty() { return None; }
+    if name.is_empty() || name.contains(' ') || ty.is_empty() {
+        return None;
+    }
     Some(IoVar { name, ty })
 }
 
 // Returns true for lines that represent actual shader body / non-declaration content.
 fn is_body_line(line: &str) -> bool {
     let l = line.trim();
-    if l.is_empty() { return false; }
-    if l.starts_with("//") { return false; }
-    if l.starts_with("#version") { return false; }
-    if l.starts_with("#define") { return false; }
-    if l.starts_with("precision") { return false; }
-    if l.starts_with("uniform") { return false; }
-    if l.starts_with("in ") || l.starts_with("out ") { return false; }
-    if l.starts_with("layout") { return false; }
+    if l.is_empty() {
+        return false;
+    }
+    if l.starts_with("//") {
+        return false;
+    }
+    if l.starts_with("#version") {
+        return false;
+    }
+    if l.starts_with("#define") {
+        return false;
+    }
+    if l.starts_with("precision") {
+        return false;
+    }
+    if l.starts_with("uniform") {
+        return false;
+    }
+    if l.starts_with("in ") || l.starts_with("out ") {
+        return false;
+    }
+    if l.starts_with("layout") {
+        return false;
+    }
     true
 }
 
@@ -266,9 +331,11 @@ pub const MILKDROP_SAMPLERS: &[&str] = &[
     "sampler_blur2",
     "sampler_blur3",
     "sampler_noise_lq",
+    "sampler_noise_lq_lite",
     "sampler_noise_mq",
     "sampler_noise_hq",
     "sampler_noise_hq_lite",
+    "sampler_pw_noise_lq",
     "sampler_noisevol_lq",
     "sampler_noisevol_hq",
 ];
@@ -279,10 +346,14 @@ pub const MILKDROP_SAMPLERS: &[&str] = &[
 fn milk_fs_preamble(io_decls: &str) -> String {
     let mut tex_decls = String::new();
     for (i, name) in MILKDROP_SAMPLERS.iter().enumerate() {
-        let tex_bind  = (i * 2) as u32;
+        let tex_bind = (i * 2) as u32;
         let samp_bind = tex_bind + 1;
         // Use texture3D for volume noise samplers
-        let tex_ty = if name.contains("vol") { "texture3D" } else { "texture2D" };
+        let tex_ty = if name.contains("vol") {
+            "texture3D"
+        } else {
+            "texture2D"
+        };
         tex_decls.push_str(&format!(
             "layout(set = 0, binding = {tex_bind}) uniform {tex_ty} {name};\n"
         ));
@@ -332,6 +403,11 @@ vec2  safeRecip(vec2 b)  { return vec2(b.x != 0.0 ? 1.0/b.x : 0.0, b.y != 0.0 ? 
 vec3  safeRecip(vec3 b)  { return vec3(b.x != 0.0 ? 1.0/b.x : 0.0, b.y != 0.0 ? 1.0/b.y : 0.0, b.z != 0.0 ? 1.0/b.z : 0.0); }
 vec4  safeRecip(vec4 b)  { return vec4(b.x != 0.0 ? 1.0/b.x : 0.0, b.y != 0.0 ? 1.0/b.y : 0.0, b.z != 0.0 ? 1.0/b.z : 0.0, b.w != 0.0 ? 1.0/b.w : 0.0); }
 
+// A few raw MilkDrop shaders reference the converter-provided `rot_d1` matrix directly
+// for channel offsets. Provide a deterministic shader-space equivalent so those bodies
+// compile without having to special-case the preset text.
+#define rot_d1 mat3(cos(time*0.37), -sin(time*0.37), 0.0, sin(time*0.37), cos(time*0.37), 0.0, 0.0, 0.0, 1.0)
+
 // Component-wise logical ops for the Butterchurn converter's vector-bool `&&`/`||`
 // (naga rejects `LogicalAnd(vecN<bool>, _)`). preprocess::rewrite_vector_logical
 // emits calls to these in place of `bvecN(X) && bvecN(Y)` / `... || ...`.
@@ -343,7 +419,8 @@ bvec3 m_or3(bvec3 a, bvec3 b)  { return bvec3(a.x || b.x, a.y || b.y, a.z || b.z
 bvec4 m_or4(bvec4 a, bvec4 b)  { return bvec4(a.x || b.x, a.y || b.y, a.z || b.z, a.w || b.w); }
 "#;
 
-    format!(r#"#version 450
+    format!(
+        r#"#version 450
 {io_decls}
 {tex_decls}
 layout(set = 1, binding = {ubo_bind}) uniform PerFrame {{
@@ -446,11 +523,13 @@ const vec4 texsize_noise_lq      = vec4(256.0, 256.0, 1.0/256.0, 1.0/256.0);
 const vec4 texsize_noise_mq      = vec4(256.0, 256.0, 1.0/256.0, 1.0/256.0);
 const vec4 texsize_noise_hq      = vec4(256.0, 256.0, 1.0/256.0, 1.0/256.0);
 const vec4 texsize_noise_lq_lite = vec4(32.0, 32.0, 1.0/32.0, 1.0/32.0);
+const vec4 texsize_noise_hq_lite = texsize_noise_lq_lite;
 const vec4 texsize_noisevol_lq   = vec4(32.0, 32.0, 1.0/32.0, 1.0/32.0);
 const vec4 texsize_noisevol_hq   = vec4(32.0, 32.0, 1.0/32.0, 1.0/32.0);
 {helpers}
 // __MILK_BODY__
-"#)
+"#
+    )
 }
 
 /// Convert a raw HLSL .milk shader body to a complete naga-compatible GLSL 450
@@ -464,11 +543,21 @@ const vec4 texsize_noisevol_hq   = vec4(32.0, 32.0, 1.0/32.0, 1.0/32.0);
 /// Used by both the native pre-strip and the ungated pure-Rust fallback, so it is
 /// not feature-gated.
 const MILK_STANDARD_SAMPLERS: &[&str] = &[
-    "sampler_main", "sampler_fw_main", "sampler_pw_main", "sampler_fc_main", "sampler_pc_main",
-    "sampler_noise_lq", "sampler_noise_lq_lite", "sampler_noise_mq", "sampler_noise_hq",
-    "sampler_noisevol_lq", "sampler_noisevol_hq",
+    "sampler_main",
+    "sampler_fw_main",
+    "sampler_pw_main",
+    "sampler_fc_main",
+    "sampler_pc_main",
+    "sampler_noise_lq",
+    "sampler_noise_lq_lite",
+    "sampler_noise_mq",
+    "sampler_noise_hq",
+    "sampler_noisevol_lq",
+    "sampler_noisevol_hq",
     "sampler_pw_noise_lq",
-    "sampler_blur1", "sampler_blur2", "sampler_blur3",
+    "sampler_blur1",
+    "sampler_blur2",
+    "sampler_blur3",
 ];
 
 #[cfg(feature = "milk-native-converter")]
@@ -479,7 +568,9 @@ fn try_native_convert_hlsl(body: &str) -> Option<String> {
     // crash deep in the C++ library that we cannot recover from.  Skip the native path
     // for any body that declares a const array — it falls back to pure-Rust (<1% of corpus).
     if contains_const_array(body) {
-        log::debug!("native HLSL converter skipped (const array initialiser, falling back to pure-Rust)");
+        log::debug!(
+            "native HLSL converter skipped (const array initialiser, falling back to pure-Rust)"
+        );
         return None;
     }
     match particle_milkdrop_converter_sys::convert_milk_shader(body) {
@@ -519,7 +610,8 @@ fn extract_function_defs(before: &str) -> (String, String) {
     let mut rest = String::new();
     let mut i = 0;
     while i < lines.len() {
-        let t = lines[i].trim();
+        let line_no_comments = strip_comments(lines[i]);
+        let t = line_no_comments.trim();
         // A function signature line: has `(` and will be followed by (or contains) `{`
         // not preceded by `=`.
         let is_sig = t.contains('(')
@@ -539,12 +631,20 @@ fn extract_function_defs(before: &str) -> (String, String) {
             let mut depth = 0i32;
             let mut opened = false;
             while i < lines.len() {
-                for c in lines[i].chars() {
-                    if c == '{' { depth += 1; opened = true; }
-                    if c == '}' { depth -= 1; }
+                let count_line = strip_comments(lines[i]);
+                for c in count_line.chars() {
+                    if c == '{' {
+                        depth += 1;
+                        opened = true;
+                    }
+                    if c == '}' {
+                        depth -= 1;
+                    }
                 }
                 i += 1;
-                if opened && depth == 0 { break; }
+                if opened && depth == 0 {
+                    break;
+                }
             }
             for j in start..i {
                 func_defs.push_str(lines[j]);
@@ -565,14 +665,34 @@ fn before_has_function_defs(before: &str) -> bool {
     !func_defs.trim().is_empty()
 }
 
+fn comp_gamma_postlude(_body: &str) -> &'static str {
+    ""
+}
+
 /// Strip HLSL-only `sampler X;` lines from `src`, returning (cleaned, custom_names).
 /// Standard samplers are dropped silently; custom (user-texture) ones are collected
 /// so callers can alias their references to a standard sampler.
+fn normalize_milkdrop_sampler_variants(src: &str) -> String {
+    let mut out = src.to_string();
+    out = out.replace("sampler_pw_noise_lq_lite", "sampler_noise_lq_lite");
+    out = out.replace("sampler_pw_noise_mq", "sampler_noise_mq");
+    out = out.replace("sampler_pw_noise_hq", "sampler_noise_hq");
+    out = out.replace("sampler_pw_noisevol", "sampler_noisevol");
+    for mode in ["fw_", "fc_", "pc_"] {
+        out = out.replace(&format!("sampler_{mode}noise"), "sampler_noise");
+    }
+    for mode in ["fw_", "fc_", "pw_", "pc_"] {
+        out = out.replace(&format!("sampler_{mode}blur"), "sampler_blur");
+    }
+    out
+}
+
 #[cfg(feature = "milk-native-converter")]
 fn strip_hlsl_sampler_decls(src: &str) -> (String, Vec<String>) {
+    let normalized = normalize_milkdrop_sampler_variants(src);
     let mut out = String::with_capacity(src.len());
     let mut custom_samplers: Vec<String> = Vec::new();
-    for raw_line in src.lines() {
+    for raw_line in normalized.lines() {
         let line = raw_line.trim_start();
         let after_samp = line.strip_prefix("sampler ").unwrap_or("");
         if !after_samp.is_empty()
@@ -580,7 +700,11 @@ fn strip_hlsl_sampler_decls(src: &str) -> (String, Vec<String>) {
             && !after_samp.starts_with("3D")
             && !after_samp.starts_with("Cube")
         {
-            let name = after_samp.split([';', ' ', '\t']).next().unwrap_or("").trim();
+            let name = after_samp
+                .split([';', ' ', '\t'])
+                .next()
+                .unwrap_or("")
+                .trim();
             if !name.is_empty() && !MILK_STANDARD_SAMPLERS.contains(&name) {
                 custom_samplers.push(name.to_string());
             }
@@ -600,10 +724,12 @@ fn strip_hlsl_sampler_decls(src: &str) -> (String, Vec<String>) {
 ///   - Single-line `sampler X;` SM3 style
 ///   - `sampler2D X;` / `uniform sampler2D X;` inside function body (not file-scope)
 ///
-/// The returned `custom_sampler_names` should be aliased to `sampler_main` by
+/// The returned `custom_sampler_names` should be aliased to the shared custom
+/// sampler fallback by
 /// the caller (via replace_word) before passing to `hlsl_to_glsl_body`.
 fn strip_and_alias_hlsl_samplers(src: &str) -> (String, Vec<String>) {
-    let lines: Vec<&str> = src.lines().collect();
+    let normalized = normalize_milkdrop_sampler_variants(src);
+    let lines: Vec<&str> = normalized.lines().collect();
     let mut out = String::with_capacity(src.len());
     let mut custom: Vec<String> = Vec::new();
     let mut i = 0;
@@ -611,59 +737,104 @@ fn strip_and_alias_hlsl_samplers(src: &str) -> (String, Vec<String>) {
         let raw = lines[i];
         let t = raw.trim_start();
         // Multi-line block: `sampler X = sampler_state {`
-        if t.starts_with("sampler ") && !t.starts_with("sampler2D")
-            && !t.starts_with("sampler3D") && !t.starts_with("samplerCube")
+        if t.starts_with("sampler ")
+            && !t.starts_with("sampler2D")
+            && !t.starts_with("sampler3D")
+            && !t.starts_with("samplerCube")
             && t.contains("sampler_state")
         {
-            let name = t.strip_prefix("sampler ").unwrap_or("")
-                .split(['=', ' ', '\t']).next().unwrap_or("").trim().to_string();
-            if !name.is_empty() { custom.push(name); }
+            let name = t
+                .strip_prefix("sampler ")
+                .unwrap_or("")
+                .split(['=', ' ', '\t'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !name.is_empty() && !MILK_STANDARD_SAMPLERS.contains(&name.as_str()) {
+                custom.push(name);
+            }
             // Skip until closing `};`
             while i < lines.len() {
                 let cl = lines[i].trim();
                 i += 1;
-                if cl == "};" || (cl.ends_with("};") && !cl.contains('=')) { break; }
+                if cl == "};" || (cl.ends_with("};") && !cl.contains('=')) {
+                    break;
+                }
             }
             continue;
         }
         // Single-line: `sampler X;` (no = sampler_state)
-        if t.starts_with("sampler ") && !t.starts_with("sampler2D")
-            && !t.starts_with("sampler3D") && !t.starts_with("samplerCube")
-            && t.contains(';') && !t.contains('=')
+        if t.starts_with("sampler ")
+            && !t.starts_with("sampler2D")
+            && !t.starts_with("sampler3D")
+            && !t.starts_with("samplerCube")
+            && t.contains(';')
+            && !t.contains('=')
         {
             let after = t.strip_prefix("sampler ").unwrap_or("");
-            let name = after.split([';', ' ', '\t']).next().unwrap_or("").trim().to_string();
-            if !name.is_empty() { custom.push(name); }
-            i += 1;
-            continue;
-        }
-        // `uniform sampler2D X;` or `sampler2D X;` — sampler uniforms inside body
-        // (samplers must be file-scope uniforms in GLSL, not body-local declarations)
-        let nouni = t.trim_start_matches("uniform").trim_start();
-        if (nouni.starts_with("sampler2D ") || nouni.starts_with("sampler3D ")
-            || nouni.starts_with("samplerCube "))
-            && nouni.contains(';') && !nouni.contains('(')
-        {
-            // Extract the name so we can alias its usages
-            let after_ty = if let Some(s) = nouni.strip_prefix("sampler2D ").or_else(|| nouni.strip_prefix("sampler3D ")).or_else(|| nouni.strip_prefix("samplerCube ")) { s } else { "" };
-            let name = after_ty.split([';', ' ', '\t', '=']).next().unwrap_or("").trim().to_string();
+            let name = after
+                .split([';', ' ', '\t'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !name.is_empty() && !MILK_STANDARD_SAMPLERS.contains(&name.as_str()) {
                 custom.push(name);
             }
             i += 1;
             continue;
         }
-        // `#define MACRO sampler_name` — expand the macro to sampler_main alias.
+        // `uniform sampler2D X;` or `sampler2D X;` — sampler uniforms inside body
+        // (samplers must be file-scope uniforms in GLSL, not body-local declarations)
+        let nouni = t.trim_start_matches("uniform").trim_start();
+        if (nouni.starts_with("sampler2D ")
+            || nouni.starts_with("sampler3D ")
+            || nouni.starts_with("samplerCube "))
+            && nouni.contains(';')
+            && !nouni.contains('(')
+        {
+            // Extract the name so we can alias its usages
+            let after_ty = if let Some(s) = nouni
+                .strip_prefix("sampler2D ")
+                .or_else(|| nouni.strip_prefix("sampler3D "))
+                .or_else(|| nouni.strip_prefix("samplerCube "))
+            {
+                s
+            } else {
+                ""
+            };
+            let name = after_ty
+                .split([';', ' ', '\t', '='])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !name.is_empty() && !MILK_STANDARD_SAMPLERS.contains(&name.as_str()) {
+                custom.push(name);
+            }
+            i += 1;
+            continue;
+        }
+        // `#define MACRO sampler_name` — expand the macro to the shared custom
+        // sampler fallback.
         // Handles patterns like `#define MYSAMP sampler_devboxb` where the author
         // aliases an undeclared custom sampler to a macro name.
         if t.starts_with("#define ") {
             let rest = t.strip_prefix("#define ").unwrap_or("").trim();
             let mut parts = rest.splitn(2, [' ', '\t']);
             let macro_name = parts.next().unwrap_or("").trim();
-            let macro_value = parts.next().unwrap_or("").trim().split_whitespace().next().unwrap_or("");
+            let macro_value = parts
+                .next()
+                .unwrap_or("")
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
             // If the value looks like a sampler (starts with "sampler") and is NOT a standard
             // sampler, record both the macro name and the value for aliasing.
-            if !macro_name.is_empty() && macro_value.starts_with("sampler")
+            if !macro_name.is_empty()
+                && macro_value.starts_with("sampler")
                 && !MILK_STANDARD_SAMPLERS.contains(&macro_value)
                 && !MILK_STANDARD_SAMPLERS.contains(&macro_name)
             {
@@ -721,7 +892,7 @@ enum GTy {
 fn gty_width(t: GTy) -> u8 {
     match t {
         GTy::F | GTy::B => 1,
-        GTy::V(n) | GTy::BV(n) => n,
+        GTy::V(n) | GTy::BV(n) => n.min(4),
         GTy::Unknown => 0,
     }
 }
@@ -731,10 +902,23 @@ type TypeTable = HashMap<String, GTy>;
 /// Seed the symbol table with names the FS preamble always provides.
 fn seed_known_types(t: &mut TypeTable) {
     let v4 = [
-        "texsize", "aspect", "slow_roam_cos", "roam_cos", "slow_roam_sin", "roam_sin",
-        "rand_frame", "rand_preset", "vColor", "vDecay",
-        "texsize_noise_lq", "texsize_noise_mq", "texsize_noise_hq", "texsize_noise_lq_lite",
-        "texsize_noisevol_lq", "texsize_noisevol_hq",
+        "texsize",
+        "aspect",
+        "slow_roam_cos",
+        "roam_cos",
+        "slow_roam_sin",
+        "roam_sin",
+        "rand_frame",
+        "rand_preset",
+        "vColor",
+        "vDecay",
+        "texsize_noise_lq",
+        "texsize_noise_mq",
+        "texsize_noise_hq",
+        "texsize_noise_lq_lite",
+        "texsize_noise_hq_lite",
+        "texsize_noisevol_lq",
+        "texsize_noisevol_hq",
     ];
     for n in v4 {
         t.insert(n.to_string(), GTy::V(4));
@@ -749,11 +933,45 @@ fn seed_known_types(t: &mut TypeTable) {
         t.insert(format!("q{i}"), GTy::F);
     }
     for n in [
-        "time", "fps", "frame", "progress", "bass", "mid", "treb", "vol", "bass_att",
-        "mid_att", "treb_att", "vol_att", "fShader", "gammaAdj", "echo_zoom", "echo_alpha",
-        "echo_orientation", "blur1_min", "blur1_max", "blur2_min", "blur2_max", "blur3_min",
-        "blur3_max", "scale1", "scale2", "scale3", "bias1", "bias2", "bias3", "brighten",
-        "darken", "solarize", "invert", "rad", "ang", "PI", "M_PI", "M_PI_2", "M_INV_PI",
+        "time",
+        "fps",
+        "frame",
+        "progress",
+        "bass",
+        "mid",
+        "treb",
+        "vol",
+        "bass_att",
+        "mid_att",
+        "treb_att",
+        "vol_att",
+        "fShader",
+        "gammaAdj",
+        "echo_zoom",
+        "echo_alpha",
+        "echo_orientation",
+        "blur1_min",
+        "blur1_max",
+        "blur2_min",
+        "blur2_max",
+        "blur3_min",
+        "blur3_max",
+        "scale1",
+        "scale2",
+        "scale3",
+        "bias1",
+        "bias2",
+        "bias3",
+        "brighten",
+        "darken",
+        "solarize",
+        "invert",
+        "rad",
+        "ang",
+        "PI",
+        "M_PI",
+        "M_PI_2",
+        "M_INV_PI",
         "M_INV_PI_2",
     ] {
         t.insert(n.to_string(), GTy::F);
@@ -822,7 +1040,8 @@ fn collect_decl_types(src: &str, t: &mut TypeTable) {
                             if let Some(g) = keyword_gty(pty) {
                                 ins_ty(
                                     t,
-                                    pn.trim_matches(|c: char| !c.is_alphanumeric() && c != '_').to_string(),
+                                    pn.trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                                        .to_string(),
                                     g,
                                 );
                             }
@@ -850,6 +1069,51 @@ fn collect_decl_types(src: &str, t: &mut TypeTable) {
                         }
                     }
                 }
+            }
+            collect_decl_type_segments(raw, t);
+        }
+    }
+
+    fn collect_decl_type_segments(line: &str, table: &mut TypeTable) {
+        let b = line.as_bytes();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for i in 0..b.len() {
+            match b[i] {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b';' | b'{' | b'}' if depth == 0 => {
+                    collect_decl_type_seg(&line[start..i], table);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        collect_decl_type_seg(&line[start..], table);
+    }
+
+    fn collect_decl_type_seg(seg: &str, table: &mut TypeTable) {
+        let core = seg.trim();
+        let core = core.rsplit('{').next().unwrap_or(core).trim();
+        let mut it = core.splitn(2, char::is_whitespace);
+        let (Some(kw), Some(rest)) = (it.next(), it.next()) else {
+            return;
+        };
+        let Some(g) = keyword_gty(kw) else {
+            return;
+        };
+        if rest.trim_start().starts_with('(') {
+            return;
+        }
+        let names = rest.split('=').next().unwrap_or(rest);
+        for item in split_top_level_commas(names) {
+            let ident: String = item
+                .trim()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() {
+                ins_ty(table, ident, g);
             }
         }
     }
@@ -896,7 +1160,11 @@ fn strip_enclosing_parens(s: &str) -> &str {
             b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return if i == b.len() - 1 { strip_enclosing_parens(&s[1..b.len() - 1]) } else { s };
+                    return if i == b.len() - 1 {
+                        strip_enclosing_parens(&s[1..b.len() - 1])
+                    } else {
+                        s
+                    };
                 }
             }
             _ => {}
@@ -920,7 +1188,8 @@ const PREC: &[&[&str]] = &[
 fn split_binop(s: &str) -> Option<(&str, &'static str, &str)> {
     let b = s.as_bytes();
     let n = b.len();
-    let is_operand_end = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b')' || c == b']' || c == b'.';
+    let is_operand_end =
+        |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b')' || c == b']' || c == b'.';
     for group in PREC {
         let mut depth = 0i32;
         let mut i = 0;
@@ -934,7 +1203,10 @@ fn split_binop(s: &str) -> Option<(&str, &'static str, &str)> {
                 for op in *group {
                     let ob = op.as_bytes();
                     if i + ob.len() <= n && &b[i..i + ob.len()] == ob {
-                        let prev = (1..=i).rev().map(|k| b[k - 1]).find(|c| !c.is_ascii_whitespace());
+                        let prev = (1..=i)
+                            .rev()
+                            .map(|k| b[k - 1])
+                            .find(|c| !c.is_ascii_whitespace());
                         // +/- is binary only after an operand (else unary sign)
                         if (*op == "+" || *op == "-") && prev.map_or(true, |c| !is_operand_end(c)) {
                             continue;
@@ -1020,7 +1292,10 @@ fn infer_ty(expr: &str, t: &TypeTable) -> GTy {
             let name = &e2[..open];
             if name.chars().all(|c| c.is_alphanumeric() || c == '_') && !name.is_empty() {
                 let args = &e2[open + 1..e2.len() - 1];
-                let arg0 = split_top_level_commas(args).into_iter().next().unwrap_or_default();
+                let arg0 = split_top_level_commas(args)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
                 let arg0ty = infer_ty(arg0.trim(), t);
                 if let Some(g) = builtin_ret(name, arg0ty) {
                     return g;
@@ -1036,10 +1311,16 @@ fn infer_ty(expr: &str, t: &TypeTable) -> GTy {
     if let Some(dot) = e2.rfind('.') {
         let after = &e2[dot + 1..];
         if !after.is_empty()
-            && after.chars().all(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a'))
+            && after
+                .chars()
+                .all(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a'))
         {
             let base = infer_ty(&e2[..dot], t);
-            let w = after.len() as u8;
+            let w = after.chars().count();
+            if w > 4 {
+                return GTy::Unknown;
+            }
+            let w = w as u8;
             return match base {
                 GTy::V(_) | GTy::F => {
                     if w > 1 {
@@ -1099,10 +1380,14 @@ fn collect_fn_sigs(src: &str) -> HashMap<String, Vec<GTy>> {
     for line in src.lines() {
         let line = line.trim();
         let Some(open) = line.find('(') else { continue };
-        let Some(close_rel) = line[open..].find(')') else { continue };
+        let Some(close_rel) = line[open..].find(')') else {
+            continue;
+        };
         let head = line[..open].trim();
         let mut hp = head.split_whitespace();
-        let (Some(rty), Some(name)) = (hp.next(), hp.next()) else { continue };
+        let (Some(rty), Some(name)) = (hp.next(), hp.next()) else {
+            continue;
+        };
         if hp.next().is_some() || keyword_gty(rty).is_none() {
             continue; // not a `<type> <name>(` signature
         }
@@ -1160,26 +1445,188 @@ pub fn fix_glsl_vector_types(glsl: &str) -> String {
     };
     let s0 = fix_array_brace_init(body);
     let s0b = join_logical_statements(&s0);
-    let s1 = fix_vector_relops(&s0b, &table);
+    let s0c = drop_duplicate_bare_decls_same_scope(&s0b);
+    let s1 = fix_vector_relops(&s0c, &table);
     let s2 = fix_call_arg_promotion(&s1, &table, &sigs);
     let s2b = fix_pow_arg_width(&s2, &table);
     let s2c = fix_mix_calls(&s2b, &table);
     let s2d = fix_op_width_mismatches(&s2c, &table);
     let s3 = fix_assignment_width_mismatches(&s2d, &table);
     let s3b = fix_return_width_mismatches(&s3, &table);
-    let s4 = fix_for_constructor_cond(&s3b);
+    let s3c = fix_dot_calls(&s3b, &table);
+    let s3d = fix_typed_scalar_swizzles(&s3c, &table);
+    let s4 = fix_for_constructor_cond(&s3d);
     format!("{prefix}{s4}")
 }
 
-/// Truncate a `return <expr>;` whose expr is STRICTLY WIDER than the enclosing function's
-/// declared return width (HLSL truncate-on-return; the GetDist/PutDist helper families).
+fn drop_duplicate_bare_decls_same_scope(src: &str) -> String {
+    use std::collections::HashSet;
+
+    let mut out = String::with_capacity(src.len());
+    let mut seen: HashSet<(i32, String, String)> = HashSet::new();
+    let mut depth = 0i32;
+    for line in src.lines() {
+        let trimmed = line.trim();
+        let duplicate = parse_glsl_decl_line(trimmed).is_some_and(|(ty, names, bare)| {
+            if bare
+                && names
+                    .iter()
+                    .all(|name| seen.contains(&(depth, ty.clone(), name.clone())))
+            {
+                true
+            } else {
+                for name in names {
+                    seen.insert((depth, ty.clone(), name));
+                }
+                false
+            }
+        });
+        if !duplicate {
+            out.push_str(line);
+            out.push('\n');
+        }
+        depth += line.bytes().fold(0, |acc, byte| match byte {
+            b'{' => acc + 1,
+            b'}' => acc - 1,
+            _ => acc,
+        });
+    }
+    out
+}
+
+fn parse_glsl_decl_line(line: &str) -> Option<(String, Vec<String>, bool)> {
+    let body = line.strip_suffix(';')?.trim();
+    if body.contains('(') || body.starts_with("layout") || body.starts_with("return") {
+        return None;
+    }
+    let mut parts = body.splitn(2, char::is_whitespace);
+    let ty = parts.next()?.trim();
+    keyword_gty(ty)?;
+    let rest = parts.next()?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let bare = !rest.contains('=');
+    let names_part = rest.split('=').next().unwrap_or(rest);
+    let mut names = Vec::new();
+    for item in names_part.split(',') {
+        let name: String = item
+            .trim()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some((ty.to_string(), names, bare))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalarizes_vector_terms_in_float_return() {
+        let mut table: TypeTable = HashMap::new();
+        seed_known_types(&mut table);
+        table.insert("tmp".to_string(), GTy::F);
+        let src = "float GetDist(vec2 uvi) {vec2 tmp; tmp = vec2(0.1, 0.2);\n  return 1-(tmp + 1.0/255*(tmp)+ ds*.7);}\n";
+
+        let fixed = fix_return_width_mismatches(src, &table);
+
+        assert!(fixed.contains("return 1-((tmp).x"), "{fixed}");
+        assert!(fixed.contains("1.0/255*((tmp)).x"), "{fixed}");
+    }
+
+    #[test]
+    fn scalarizes_vector_terms_in_float_return_full_pipeline() {
+        let glsl = "// __MILK_BODY__\nfloat GetDist(vec2 uvi) {vec2 tmp; tmp = vec2(0.1, 0.2);\n  return 1-(tmp + 1.0/255*(tmp)+ ds*.7);}\n";
+
+        let fixed = fix_glsl_vector_types(glsl);
+
+        assert!(fixed.contains("return 1-((tmp).x"), "{fixed}");
+        assert!(fixed.contains("1.0/255*((tmp)).x"), "{fixed}");
+    }
+
+    #[test]
+    fn scalarizes_real_getdist_shape() {
+        let glsl = "// __MILK_BODY__\nvec2 fstep2(vec2 xy) {\n  return 1.0/res*round(res*xy);\n}\nfloat GetDist(vec2 uvi) {vec2 tmp; tmp = texture(sampler2D(sampler_pc_main, sampler_pc_main_samp),(uvi).xy).gb; \n  return 1-(tmp + 1.0/255*(tmp)+ ds*.7);}\nvec2 PutDist(float x) {float fg, fb; fg = modf((1-x)*255.0,fb);\n  return(vec2(fg,fb/255.0));}\nfloat MinDist(vec2 uvi) {\n   float tmp; vec4 nb;\n   tmp = GetDist(uvi);\n   return tmp;\n}\n";
+
+        let fixed = fix_glsl_vector_types(glsl);
+
+        assert!(fixed.contains("return 1-((tmp).x"), "{fixed}");
+        assert!(fixed.contains("1.0/255*((tmp)).x"), "{fixed}");
+    }
+
+    #[test]
+    fn hlsl_converter_strips_inline_helper_comments() {
+        let hlsl = "float MinDistB(float2 uvi) {float tmp; float4 nb; //##nicht ideal\n  tmp = GetDist(uvi);\n  return tmp;}\n";
+
+        let converted = hlsl_to_glsl_body_ex(hlsl, false);
+
+        assert!(!converted.contains("//##"), "{converted}");
+        assert!(converted.contains("tmp = GetDist(uvi);"), "{converted}");
+        assert!(converted.contains("return tmp;"), "{converted}");
+    }
+
+    #[test]
+    fn truncates_vector_rhs_for_swizzled_scalar_lvalue() {
+        let mut table: TypeTable = HashMap::new();
+        seed_known_types(&mut table);
+        table.insert("dz".to_string(), GTy::V(2));
+        let src = "void main() {\n  dz.x = lum(GetPixel(uv-hor)) - lum(GetPixel(uv+hor));\n}\n";
+
+        let fixed = fix_assignment_width_mismatches(src, &table);
+
+        assert!(
+            fixed.contains("dz.x = (lum(GetPixel(uv-hor)) - lum(GetPixel(uv+hor))).x;"),
+            "{fixed}"
+        );
+    }
+
+    #[test]
+    fn overwide_swizzle_relop_is_left_unknown_not_panicking() {
+        let mut table: TypeTable = HashMap::new();
+        seed_known_types(&mut table);
+        table.insert("v".to_string(), GTy::V(4));
+        let src = "void main() {\n  float m = v.xyzwx < 0.5;\n}\n";
+
+        assert!(matches!(infer_ty("v.xyzwx", &table), GTy::Unknown));
+        assert_eq!(fix_vector_relops(src, &table), src);
+    }
+
+    #[test]
+    fn extracts_multiline_helper_with_inline_comment() {
+        let before = "float GetDistB(float2 uvi)  {return GetDist(uvi); } // 1-GetBlur1(uvi).b;}\nfloat MinDistB (float2 uvi) {float tmp; float4 nb; //##nicht ideal\n  tmp = GetDist(uvi);\n  tmp = min(tmp,GetDistB2(uvi)*.7) ;\n  return tmp;}\nfloat after = 1;\n";
+
+        let (funcs, rest) = extract_function_defs(before);
+
+        assert!(
+            funcs.contains("tmp = GetDist(uvi);"),
+            "funcs={funcs}\nrest={rest}"
+        );
+        assert!(funcs.contains("return tmp;}"), "funcs={funcs}\nrest={rest}");
+        assert!(
+            rest.contains("float after = 1;"),
+            "funcs={funcs}\nrest={rest}"
+        );
+    }
+}
+
+/// Repair a `return <expr>;` whose expr differs from the enclosing function's declared
+/// return type in ways HLSL accepts but GLSL/naga rejects: vector truncation,
+/// scalar-vector broadcasts, and bool/float coercions (`bool f(){return x*y;}`,
+/// `float f(){return x<y;}`).
 /// A forward pass tracks the active function's declared return type and a merged table
 /// (global ∪ params ∪ local decls) — the global table collapses colliding local names
 /// (`tmp` is vec2 in one fn, float in another) to Unknown, so per-function locals are
-/// needed for the inference to fire. SAFE by construction: only F/V declared returns and
-/// F/V exprs; only strict truncation (m>w) to the DECLARED width, so an already-correct
-/// return becomes an identity `(expr).swz` at worst and a missed local types Unknown =>
-/// skip. bool/bvec functions are excluded by the F/V guard.
+/// needed for the inference to fire. Conservative: only acts when both sides are
+/// confidently typed; Unknown skips.
 fn fix_return_width_mismatches(body: &str, global: &TypeTable) -> String {
     let mut out = String::with_capacity(body.len() + 32);
     let mut cur_ret: Option<GTy> = None;
@@ -1202,7 +1649,7 @@ fn fix_return_width_mismatches(body: &str, global: &TypeTable) -> String {
             record_local_decls(trimmed, &mut merged);
         }
         let fixed = match cur_ret {
-            Some(ret @ (GTy::F | GTy::V(_))) => fix_return_line(line, &merged, ret),
+            Some(ret) => fix_return_line(line, &merged, ret),
             _ => line.to_string(),
         };
         out.push_str(&fixed);
@@ -1247,8 +1694,10 @@ fn parse_fn_header(s: &str) -> Option<(GTy, Vec<(String, GTy)>)> {
             let mut pi = p.split_whitespace();
             if let (Some(pkw), Some(pname)) = (pi.next(), pi.next()) {
                 if let Some(g) = keyword_gty(pkw) {
-                    let nm: String =
-                        pname.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    let nm: String = pname
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
                     if !nm.is_empty() {
                         params.push((nm, g));
                     }
@@ -1282,6 +1731,7 @@ fn record_local_decls(line: &str, table: &mut TypeTable) {
 
 fn record_decl_seg(seg: &str, table: &mut TypeTable) {
     let core = seg.trim();
+    let core = core.rsplit('{').next().unwrap_or(core).trim();
     let mut it = core.splitn(2, char::is_whitespace);
     let (Some(kw), Some(rest)) = (it.next(), it.next()) else {
         return;
@@ -1291,8 +1741,11 @@ fn record_decl_seg(seg: &str, table: &mut TypeTable) {
     };
     let names = rest.split('=').next().unwrap_or(rest);
     for nm in names.split(',') {
-        let ident: String =
-            nm.trim().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let ident: String = nm
+            .trim()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
         if !ident.is_empty() {
             table.insert(ident, g);
         }
@@ -1307,30 +1760,188 @@ fn fix_return_line(line: &str, merged: &TypeTable, ret: GTy) -> String {
         Some(c) => (&line[..c], &line[c..]),
         None => (line, ""),
     };
-    let lead_len = code.len() - code.trim_start().len();
-    let lead = &code[..lead_len];
-    let stmt = &code[lead_len..]; // `return <expr>; <tail>`
-    if !is_return_keyword(stmt) {
+    let mut out = String::with_capacity(line.len() + 16);
+    let b = code.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut saw_semi = false;
+    for i in 0..b.len() {
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b';' if depth == 0 => {
+                out.push_str(&fix_return_segment(&code[start..i], merged, ret));
+                out.push(';');
+                start = i + 1;
+                saw_semi = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_semi {
         return line.to_string();
     }
-    let after = &stmt["return".len()..];
-    // statement-terminating ';' at paren depth 0
-    let Some(semi) = find_top_level_char(after, b';') else {
-        return line.to_string();
-    };
-    let expr = after[..semi].trim();
-    let tail = &after[semi + 1..]; // closing `}`, trailing ws, etc. — preserved verbatim
+    out.push_str(&code[start..]);
+    out.push_str(comment);
+    out
+}
+
+fn fix_return_segment(seg: &str, merged: &TypeTable, ret: GTy) -> String {
+    let trimmed = seg.trim();
+    if trimmed.is_empty() {
+        return seg.to_string();
+    }
+    let lead = &seg[..seg.len() - seg.trim_start().len()];
+    let trail = &seg[seg.trim_end().len()..];
+    let body = trimmed;
+    if let Some(prefix_len) = repairable_statement_prefix_len(body) {
+        let prefix = &body[..prefix_len];
+        let rest = &body[prefix_len..];
+        let fixed = fix_return_segment(rest, merged, ret);
+        if fixed != rest {
+            return format!("{lead}{prefix}{fixed}{trail}");
+        }
+    }
+    if !is_return_keyword(body) {
+        return seg.to_string();
+    }
+    let expr = body["return".len()..].trim();
     if expr.is_empty() {
-        return line.to_string();
+        return seg.to_string();
     }
-    let rt = infer_ty(expr, merged);
+    let scalarized = if ret == GTy::F {
+        scalarize_vectors_for_float_expr(expr, merged)
+    } else {
+        None
+    };
+    let expr_for_infer = scalarized.as_deref().unwrap_or(expr);
+    let rt = infer_ty(expr_for_infer, merged);
     let w = gty_width(ret);
     let m = gty_width(rt);
-    if !matches!(rt, GTy::F | GTy::V(_)) || w == 0 || m == 0 || m <= w {
-        return line.to_string();
+    let fixed_expr = match (ret, rt) {
+        (GTy::B, GTy::F) => Some(format!("({expr_for_infer}) != 0.0")),
+        (GTy::F, GTy::B) => Some(format!("float({expr_for_infer})")),
+        (GTy::F, GTy::V(_)) | (GTy::F, GTy::BV(_)) => Some(format!("({expr_for_infer}).x")),
+        (GTy::V(w), GTy::F) if w > 1 => Some(format!("vec{w}({expr_for_infer})")),
+        (GTy::V(w), GTy::V(m)) if m > w && w > 0 => {
+            let sw = &"xyzw"[..w as usize];
+            Some(format!("({expr_for_infer}).{sw}"))
+        }
+        _ => {
+            if w != 0 && m != 0 && m > w && matches!(rt, GTy::V(_)) {
+                let sw = &"xyzw"[..w as usize];
+                Some(format!("({expr_for_infer}).{sw}"))
+            } else {
+                scalarized
+            }
+        }
+    };
+    match fixed_expr {
+        Some(expr) => format!("{lead}return {expr}{trail}"),
+        None => seg.to_string(),
     }
-    let sw = &"xyzw"[..w as usize];
-    format!("{lead}return ({expr}).{sw};{tail}{comment}")
+}
+
+/// HLSL permits a vector expression to flow into a scalar context and takes the first
+/// component. GLSL/naga rejects mixed scalar/vector arithmetic even if the enclosing
+/// function returns `float`. Repair only inside float return expressions by scalarizing
+/// vector operands that participate in arithmetic, preserving normal vector returns.
+fn scalarize_vectors_for_float_expr(e: &str, t: &TypeTable) -> Option<String> {
+    if let Some((l, op, r)) = split_binop_last(e) {
+        let lnew = scalarize_vectors_for_float_expr(l, t);
+        let rnew = scalarize_vectors_for_float_expr(r, t);
+        let mut ltext = lnew.clone().unwrap_or_else(|| l.to_string());
+        let mut rtext = rnew.clone().unwrap_or_else(|| r.to_string());
+        let mut acted = lnew.is_some() || rnew.is_some();
+        if matches!(op, "+" | "-" | "*" | "/" | "%") {
+            if matches!(infer_ty(&ltext, t), GTy::V(_) | GTy::BV(_)) {
+                ltext = format!("({}).x", ltext.trim());
+                acted = true;
+            }
+            if matches!(infer_ty(&rtext, t), GTy::V(_) | GTy::BV(_)) {
+                rtext = format!("({}).x", rtext.trim());
+                acted = true;
+            }
+        }
+        if acted {
+            if op == "%" {
+                return Some(format!("mod({ltext}, {rtext})"));
+            }
+            return Some(format!("{ltext}{op}{rtext}"));
+        }
+        return None;
+    }
+
+    let trimmed = e.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lead = &e[..e.len() - e.trim_start().len()];
+    let trail = &e[e.trim_end().len()..];
+    if matches!(trimmed.as_bytes()[0], b'-' | b'+' | b'!') {
+        let sign = &trimmed[..1];
+        let rest = &trimmed[1..];
+        if let Some(rn) = scalarize_vectors_for_float_expr(rest, t) {
+            return Some(format!("{lead}{sign}{rn}{trail}"));
+        }
+        return None;
+    }
+    if trimmed.starts_with('(') {
+        if let Some(close) = matching_close(trimmed, 0) {
+            if close == trimmed.len() - 1 {
+                let inner = &trimmed[1..close];
+                if let Some(inr) = scalarize_vectors_for_float_expr(inner, t) {
+                    return Some(format!("{lead}({inr}){trail}"));
+                }
+                return None;
+            }
+        }
+    }
+    if let Some(dot) = trailing_member_dot(trimmed) {
+        let base = &trimmed[..dot];
+        let member = &trimmed[dot..];
+        if let Some(bn) = scalarize_vectors_for_float_expr(base, t) {
+            return Some(format!("{lead}{bn}{member}{trail}"));
+        }
+        return None;
+    }
+    if let Some((open, close)) = whole_call_span(trimmed) {
+        let name = &trimmed[..open];
+        let args = &trimmed[open + 1..close];
+        let parts = split_top_level_commas(args);
+        let mut changed = false;
+        let mut newparts: Vec<String> = Vec::with_capacity(parts.len());
+        for p in &parts {
+            match scalarize_vectors_for_float_expr(p, t) {
+                Some(np) => {
+                    changed = true;
+                    newparts.push(np);
+                }
+                None => newparts.push(p.clone()),
+            }
+        }
+        if changed {
+            return Some(format!("{lead}{name}({}){trail}", newparts.join(",")));
+        }
+        return None;
+    }
+    if let Some(q) = find_top_level_char(trimmed, b'?') {
+        if let Some(colon_rel) = find_top_level_char(&trimmed[q + 1..], b':') {
+            let cond = &trimmed[..q];
+            let a = &trimmed[q + 1..q + 1 + colon_rel];
+            let b = &trimmed[q + 1 + colon_rel + 1..];
+            let cn = scalarize_vectors_for_float_expr(cond, t);
+            let an = scalarize_vectors_for_float_expr(a, t);
+            let bn = scalarize_vectors_for_float_expr(b, t);
+            if cn.is_some() || an.is_some() || bn.is_some() {
+                let cs = cn.unwrap_or_else(|| cond.to_string());
+                let as_ = an.unwrap_or_else(|| a.to_string());
+                let bs = bn.unwrap_or_else(|| b.to_string());
+                return Some(format!("{lead}{cs}?{as_}:{bs}{trail}"));
+            }
+        }
+    }
+    None
 }
 
 /// naga's GLSL frontend mis-parses a `for`-loop whose CONDITION begins with a scalar/
@@ -1509,9 +2120,17 @@ fn fix_mix_calls(src: &str, t: &TypeTable) -> String {
             if w >= 2 {
                 let sw = &"xyzw"[..w as usize];
                 if wa > w {
-                    na = if ta == GTy::F { format!("vec{w}({a})") } else { format!("({a}).{sw}") };
+                    na = if ta == GTy::F {
+                        format!("vec{w}({a})")
+                    } else {
+                        format!("({a}).{sw}")
+                    };
                 } else if wb > w {
-                    nb = if tb == GTy::F { format!("vec{w}({b})") } else { format!("({b}).{sw}") };
+                    nb = if tb == GTy::F {
+                        format!("vec{w}({b})")
+                    } else {
+                        format!("({b}).{sw}")
+                    };
                 }
                 changed = true;
             } else if w == 1 {
@@ -1537,6 +2156,183 @@ fn fix_mix_calls(src: &str, t: &TypeTable) -> String {
             None
         }
     })
+}
+
+/// HLSL accepts `dot(float, float)` as scalar multiplication and truncates mismatched
+/// vector widths (`dot(float4, float3)`). GLSL/naga require a matching vector overload.
+fn fix_dot_calls(src: &str, t: &TypeTable) -> String {
+    rewrite_calls_named_expr(src, "dot", |args| {
+        if args.len() != 2 {
+            return None;
+        }
+        let a = args[0].trim();
+        let b = args[1].trim();
+        let ta = infer_ty(a, t);
+        let tb = infer_ty(b, t);
+        if ta == GTy::F && tb == GTy::F {
+            return Some(format!("(({a}) * ({b}))"));
+        }
+        if let (GTy::V(wa), GTy::V(wb)) = (ta, tb) {
+            if wa >= 2 && wb >= 2 && wa != wb {
+                let w = wa.min(wb) as usize;
+                let sw = &"xyzw"[..w];
+                let na = if wa > wb {
+                    format!("({a}).{sw}")
+                } else {
+                    a.to_string()
+                };
+                let nb = if wb > wa {
+                    format!("({b}).{sw}")
+                } else {
+                    b.to_string()
+                };
+                return Some(format!("dot({na}, {nb})"));
+            }
+        }
+        None
+    })
+}
+
+/// HLSL allows scalar swizzles (`q1.x`, `s.xx`); GLSL/naga do not. Convert confident
+/// scalar identifier swizzles to either the bare scalar or a broadcast constructor.
+fn fix_typed_scalar_swizzles(src: &str, t: &TypeTable) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < src.len() {
+        let c = b[i];
+        if (c.is_ascii_alphabetic() || c == b'_')
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let start = i;
+            i += 1;
+            while i < src.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let ident = &src[start..i];
+            if i < src.len() && b[i] == b'.' && t.get(ident).copied() == Some(GTy::F) {
+                let sw_start = i + 1;
+                let mut sw_end = sw_start;
+                while sw_end < src.len()
+                    && matches!(
+                        b[sw_end],
+                        b'x' | b'y' | b'z' | b'w' | b'r' | b'g' | b'b' | b'a'
+                    )
+                {
+                    sw_end += 1;
+                }
+                if sw_end > sw_start {
+                    let width = sw_end - sw_start;
+                    if width == 1 {
+                        out.push_str(ident);
+                    } else {
+                        out.push_str(&format!("vec{width}({ident})"));
+                    }
+                    i = sw_end;
+                    continue;
+                }
+            }
+            out.push_str(ident);
+            continue;
+        }
+        if c == b'(' {
+            if let Some(close) = matching_close(src, i) {
+                let after = close + 1;
+                if after < src.len() && b[after] == b'.' && infer_ty(&src[i..=close], t) == GTy::F {
+                    let sw_start = after + 1;
+                    let mut sw_end = sw_start;
+                    while sw_end < src.len()
+                        && matches!(
+                            b[sw_end],
+                            b'x' | b'y' | b'z' | b'w' | b'r' | b'g' | b'b' | b'a'
+                        )
+                    {
+                        sw_end += 1;
+                    }
+                    if sw_end > sw_start {
+                        let width = sw_end - sw_start;
+                        let expr = &src[i..=close];
+                        if width == 1 {
+                            out.push_str(expr);
+                        } else {
+                            out.push_str(&format!("vec{width}({expr})"));
+                        }
+                        i = sw_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Variant of `rewrite_calls_named` for fixes that need to replace the whole call
+/// expression rather than just its argument list.
+fn rewrite_calls_named_expr(
+    src: &str,
+    name: &str,
+    f: impl Fn(&[String]) -> Option<String> + Copy,
+) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let n = b.len();
+    let mut out = String::with_capacity(n + 64);
+    let mut i = 0;
+    while i < n {
+        if (b[i].is_ascii_alphabetic() || b[i] == '_')
+            && (i == 0 || !(b[i - 1].is_alphanumeric() || b[i - 1] == '_'))
+        {
+            let mut j = i;
+            while j < n && (b[j].is_ascii_alphanumeric() || b[j] == '_') {
+                j += 1;
+            }
+            let ident: String = b[i..j].iter().collect();
+            if j < n && b[j] == '(' {
+                let mut depth = 0i32;
+                let mut k = j;
+                while k < n {
+                    match b[k] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if k < n {
+                    let inner: String = b[j + 1..k].iter().collect();
+                    let inner_fixed = rewrite_calls_named_expr(&inner, name, f);
+                    if ident == name {
+                        let args = split_top_level_commas(&inner_fixed);
+                        if let Some(replacement) = f(&args) {
+                            out.push_str(&replacement);
+                            i = k + 1;
+                            continue;
+                        }
+                    }
+                    out.push_str(&ident);
+                    out.push('(');
+                    out.push_str(&inner_fixed);
+                    out.push(')');
+                    i = k + 1;
+                    continue;
+                }
+            }
+            out.push_str(&ident);
+            i = j;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Walk `src`, find every call to a function literally named `name` (identifier
@@ -1674,8 +2470,12 @@ fn join_logical_statements(body: &str) -> String {
         let d = paren_bracket_depth(&buf);
         let t = buf.trim_start();
         let last = buf.trim_end().bytes().last().unwrap_or(b' ');
-        let is_ctrl = t.starts_with("for") || t.starts_with("if") || t.starts_with("while")
-            || t.starts_with("else") || t.starts_with('}') || t.starts_with('{')
+        let is_ctrl = t.starts_with("for")
+            || t.starts_with("if")
+            || t.starts_with("while")
+            || t.starts_with("else")
+            || t.starts_with('}')
+            || t.starts_with('{')
             || t.starts_with('#');
         if has_comment {
             flush(&mut out, &mut buf); // never join across a line comment
@@ -1729,7 +2529,11 @@ fn try_array_brace_init(body: &str, i: usize) -> Option<(usize, String)> {
     }
     let w = (b[i + 3] - b'0') as usize;
     let mut p = i + 4;
-    let ws = |p: &mut usize| while *p < n && b[*p].is_ascii_whitespace() { *p += 1 };
+    let ws = |p: &mut usize| {
+        while *p < n && b[*p].is_ascii_whitespace() {
+            *p += 1
+        }
+    };
     // require whitespace after the type (so `vec4 s` not `vec4(` / `vec4x`)
     if p >= n || !b[p].is_ascii_whitespace() {
         return None;
@@ -1815,7 +2619,10 @@ fn try_array_brace_init(body: &str, i: usize) -> Option<(usize, String)> {
         .chunks(w)
         .map(|c| format!("vec{w}({})", c.join(", ")))
         .collect();
-    let repl = format!("vec{w} {ident}[{count}] = vec{w}[{count}]({})", ctors.join(", "));
+    let repl = format!(
+        "vec{w} {ident}[{count}] = vec{w}[{count}]({})",
+        ctors.join(", ")
+    );
     Some((q + 1, repl))
 }
 
@@ -1829,22 +2636,56 @@ fn fix_op_width_mismatches(src: &str, t: &TypeTable) -> String {
 }
 
 fn fix_op_width_line(line: &str, t: &TypeTable) -> String {
-    // Trim BOTH ends to isolate the statement: the converter often emits a trailing
-    // space after the `;`, which would otherwise defeat strip_suffix(';'). Reattach the
-    // original leading indent and trailing whitespace verbatim.
-    let trimmed = line.trim();
-    let lead = &line[..line.len() - line.trim_start().len()];
-    let trail = &line[line.trim_end().len()..];
-    let Some(body) = trimmed.strip_suffix(';') else {
-        return line.to_string();
+    let (code, comment) = match line.find("//") {
+        Some(c) => (&line[..c], &line[c..]),
+        None => (line, ""),
     };
-    if body.contains(';') || body.contains("//") {
+    let mut out = String::with_capacity(line.len() + 16);
+    let b = code.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut saw_semi = false;
+    for i in 0..b.len() {
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b';' if depth == 0 => {
+                out.push_str(&fix_op_width_segment(&code[start..i], t));
+                out.push(';');
+                start = i + 1;
+                saw_semi = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_semi {
         return line.to_string();
+    }
+    out.push_str(&code[start..]);
+    out.push_str(comment);
+    out
+}
+
+fn fix_op_width_segment(seg: &str, t: &TypeTable) -> String {
+    let trimmed = seg.trim();
+    if trimmed.is_empty() {
+        return seg.to_string();
+    }
+    let lead = &seg[..seg.len() - seg.trim_start().len()];
+    let trail = &seg[seg.trim_end().len()..];
+    let body = trimmed;
+    if let Some(prefix_len) = repairable_statement_prefix_len(body) {
+        let prefix = &body[..prefix_len];
+        let rest = &body[prefix_len..];
+        let fixed = fix_op_width_segment(rest, t);
+        if fixed != rest {
+            return format!("{lead}{prefix}{fixed}{trail}");
+        }
     }
     let rebuilt = if let Some(eq) = find_plain_eq(body) {
         let lhs = &body[..=eq];
         let rhs = &body[eq + 1..];
-        rewrite_expr_width(rhs, t).map(|new_rhs| format!("{lhs}{new_rhs};"))
+        rewrite_expr_width(rhs, t).map(|new_rhs| format!("{lhs}{new_rhs}"))
     } else if let Some(op) = find_compound_assign(body) {
         // Compound assignment `lhs op= rhs` (op in + - * /): rewrite op-width ONLY inside
         // the RHS. This repairs `ret1 -= (roam_sin*roam_cos.wzy).xyz;` (vec4*vec3 inside),
@@ -1853,18 +2694,18 @@ fn fix_op_width_line(line: &str, t: &TypeTable) -> String {
         // (`(a*=b).xyz` → naga `InvalidToken: Assign`). `lhs` keeps the whole `op=` token.
         let lhs = &body[..op + 2];
         let rhs = &body[op + 2..];
-        rewrite_expr_width(rhs, t).map(|new_rhs| format!("{lhs}{new_rhs};"))
+        rewrite_expr_width(rhs, t).map(|new_rhs| format!("{lhs}{new_rhs}"))
     } else if is_return_keyword(body) {
         // `return <expr>;` — rewrite op-width mismatches inside the returned expression.
         // `expr` keeps its leading whitespace / `(`, which rewrite_expr_width preserves.
         let expr = &body["return".len()..];
-        rewrite_expr_width(expr, t).map(|ne| format!("return{ne};"))
+        rewrite_expr_width(expr, t).map(|ne| format!("return{ne}"))
     } else {
-        rewrite_expr_width(body, t).map(|new_body| format!("{new_body};"))
+        rewrite_expr_width(body, t)
     };
     match rebuilt {
         Some(stmt) => format!("{lead}{stmt}{trail}"),
-        None => line.to_string(),
+        None => seg.to_string(),
     }
 }
 
@@ -1889,6 +2730,31 @@ fn rewrite_expr_width(e: &str, t: &TypeTable) -> Option<String> {
         let mut ltext = lnew.clone().unwrap_or_else(|| l.to_string());
         let mut rtext = rnew.clone().unwrap_or_else(|| r.to_string());
         let mut acted = false;
+        if op == "%" {
+            let lt = infer_ty(&ltext, t);
+            let rt = infer_ty(&rtext, t);
+            let lw = gty_width(lt);
+            let rw = gty_width(rt);
+            if lw > 0
+                && rw > 0
+                && matches!(lt, GTy::F | GTy::V(_))
+                && matches!(rt, GTy::F | GTy::V(_))
+            {
+                if lw >= 2 && rw >= 2 && lw != rw {
+                    let w = lw.min(rw) as usize;
+                    let sw = &"xyzw"[..w];
+                    if lw > rw {
+                        ltext = format!("({}).{sw}", ltext.trim());
+                    } else {
+                        rtext = format!("({}).{sw}", rtext.trim());
+                    }
+                } else if lw == 1 && rw >= 2 {
+                    rtext = rtext.trim().to_string();
+                    ltext = format!("vec{rw}({})", ltext.trim());
+                }
+                return Some(format!("mod({ltext}, {rtext})"));
+            }
+        }
         if matches!(op, "+" | "-" | "*" | "/") {
             if let (GTy::V(a), GTy::V(b)) = (infer_ty(&ltext, t), infer_ty(&rtext, t)) {
                 if a >= 2 && b >= 2 && a != b {
@@ -2011,8 +2877,10 @@ fn split_binop_last(s: &str) -> Option<(&str, &'static str, &str)> {
                 for op in *group {
                     let ob = op.as_bytes();
                     if i + ob.len() <= n && &b[i..i + ob.len()] == ob {
-                        let prev =
-                            (1..=i).rev().map(|k| b[k - 1]).find(|c| !c.is_ascii_whitespace());
+                        let prev = (1..=i)
+                            .rev()
+                            .map(|k| b[k - 1])
+                            .find(|c| !c.is_ascii_whitespace());
                         if (*op == "+" || *op == "-") && prev.map_or(true, |c| !is_operand_end(c)) {
                             continue;
                         }
@@ -2070,7 +2938,12 @@ fn trailing_member_dot(s: &str) -> Option<usize> {
         return None;
     }
     let mut k = n;
-    while k > 0 && matches!(b[k - 1], b'x' | b'y' | b'z' | b'w' | b'r' | b'g' | b'b' | b'a') {
+    while k > 0
+        && matches!(
+            b[k - 1],
+            b'x' | b'y' | b'z' | b'w' | b'r' | b'g' | b'b' | b'a'
+        )
+    {
         k -= 1;
     }
     if k == n || k == 0 || b[k - 1] != b'.' {
@@ -2119,11 +2992,40 @@ fn whole_call_span(s: &str) -> Option<(usize, usize)> {
 /// (`float3 c = 0.0`); naga rejects the mismatch ("type … doesn't match the type
 /// stored"). Conservative: only fires when BOTH widths are confidently known and the
 /// LHS is a declaration (`<type> name = …`) or a plain identifier in the table.
-fn fix_assignment_width_mismatches(src: &str, t: &TypeTable) -> String {
+fn fix_assignment_width_mismatches(src: &str, global: &TypeTable) -> String {
     let mut out = String::with_capacity(src.len());
+    let mut in_fn = false;
+    let mut fn_level = 0i32;
+    let mut depth = 0i32;
+    let mut merged: TypeTable = global.clone();
     for line in src.lines() {
-        out.push_str(&fix_assign_line(line, t));
+        let trimmed = line.trim();
+        if !in_fn {
+            if let Some((_ret, params)) = parse_fn_header(trimmed) {
+                in_fn = true;
+                fn_level = depth;
+                merged = global.clone();
+                for (nm, g) in params {
+                    merged.insert(nm, g);
+                }
+            }
+        }
+        if in_fn {
+            record_local_decls(trimmed, &mut merged);
+        }
+        let active = if in_fn { &merged } else { global };
+        out.push_str(&fix_assign_line(line, active));
         out.push('\n');
+        for c in line.bytes() {
+            if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
+                depth -= 1;
+                if in_fn && depth <= fn_level {
+                    in_fn = false;
+                }
+            }
+        }
     }
     out
 }
@@ -2136,16 +3038,47 @@ fn fix_assign_line(line: &str, t: &TypeTable) -> String {
         Some(c) => (&line[..c], &line[c..]),
         None => (line, ""),
     };
-    let trimmed = code.trim();
-    let lead = &code[..code.len() - code.trim_start().len()];
-    let trail = &code[code.trim_end().len()..];
-    let Some(body) = trimmed.strip_suffix(';') else {
+    let mut out = String::with_capacity(line.len() + 16);
+    let b = code.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut saw_semi = false;
+    for i in 0..b.len() {
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b';' if depth == 0 => {
+                out.push_str(&fix_assign_segment(&code[start..i], t));
+                out.push(';');
+                start = i + 1;
+                saw_semi = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_semi {
         return line.to_string();
-    };
-    // Still skip genuine multi-statement lines: an internal `;` means several statements,
-    // and grabbing across them to wrap an RHS would splice a `;` into the wrap.
-    if body.contains(';') {
-        return line.to_string();
+    }
+    out.push_str(&code[start..]);
+    out.push_str(comment);
+    out
+}
+
+fn fix_assign_segment(seg: &str, t: &TypeTable) -> String {
+    let trimmed = seg.trim();
+    let lead = &seg[..seg.len() - seg.trim_start().len()];
+    let trail = &seg[seg.trim_end().len()..];
+    if trimmed.is_empty() {
+        return seg.to_string();
+    }
+    let body = trimmed;
+    if let Some(prefix_len) = repairable_statement_prefix_len(body) {
+        let prefix = &body[..prefix_len];
+        let rest = &body[prefix_len..];
+        let fixed = fix_assign_segment(rest, t);
+        if fixed != rest {
+            return format!("{lead}{prefix}{fixed}{trail}");
+        }
     }
     let Some(eq) = find_plain_eq(body) else {
         // No plain `=`: try a compound assignment `<lhs> op= <rhs>` (e.g. `vec3 += vec4`,
@@ -2161,16 +3094,16 @@ fn fix_assign_line(line: &str, t: &TypeTable) -> String {
                 if lw >= 1 && gty_width(rt) > lw && matches!(rt, GTy::V(_)) {
                     let sw = &"xyzw"[..lw as usize];
                     let optok = &body[op..op + 2];
-                    return format!("{lead}{lhs} {optok} ({rhs}).{sw};{trail}{comment}");
+                    return format!("{lead}{lhs} {optok} ({rhs}).{sw}{trail}");
                 }
             }
         }
-        return line.to_string();
+        return seg.to_string();
     };
     let lhs = body[..eq].trim();
     let rhs = body[eq + 1..].trim();
     if lhs.is_empty() || rhs.is_empty() {
-        return line.to_string();
+        return seg.to_string();
     }
     // LHS width: a `<type> name` declaration, or a plain identifier in the table.
     let words: Vec<&str> = lhs.split_whitespace().collect();
@@ -2179,15 +3112,17 @@ fn fix_assign_line(line: &str, t: &TypeTable) -> String {
     } else if lhs.chars().all(|c| c.is_alphanumeric() || c == '_') {
         t.get(lhs).map(|&g| gty_width(g))
     } else {
-        None
+        let inferred = infer_ty(lhs, t);
+        let w = gty_width(inferred);
+        (w >= 1).then_some(w)
     };
     let Some(lw) = lw.filter(|&w| w >= 1) else {
-        return line.to_string();
+        return seg.to_string();
     };
     let rt = infer_ty(rhs, t);
     let rw = gty_width(rt);
     if rw == 0 || rw == lw {
-        return line.to_string(); // unknown or already matching
+        return seg.to_string(); // unknown or already matching
     }
     let new_rhs = if rt == GTy::F && lw > 1 {
         format!("vec{lw}({rhs})") // scalar → broadcast
@@ -2195,9 +3130,40 @@ fn fix_assign_line(line: &str, t: &TypeTable) -> String {
         let sw = &"xyzw"[..lw as usize];
         format!("({rhs}).{sw}") // wider vector → truncate
     } else {
-        return line.to_string(); // narrower vector (vec2→vec3): can't safely widen
+        return seg.to_string(); // narrower vector (vec2→vec3): can't safely widen
     };
-    format!("{lead}{lhs} = {new_rhs};{trail}{comment}")
+    format!("{lead}{lhs} = {new_rhs}{trail}")
+}
+
+/// Some converter output keeps control/block prefixes on the same physical segment,
+/// e.g. `if(cond)ret += vec4;` or `else {ret = vec4;}`. The assignment/op fixers need
+/// to see the actual statement start (`ret ...`), so peel those prefixes first.
+fn repairable_statement_prefix_len(body: &str) -> Option<usize> {
+    if let Some(pos) = body.rfind('{') {
+        let idx = pos + 1;
+        if idx < body.len() && !body[idx..].trim().is_empty() {
+            return Some(idx);
+        }
+    }
+    let trimmed = body.trim_start();
+    let leading = body.len() - trimmed.len();
+    if trimmed.starts_with("if") {
+        let after_if = 2usize;
+        let rest = &trimmed[after_if..];
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '(')
+        {
+            let open_rel = rest.find('(')? + after_if;
+            let close = matching_close(trimmed, open_rel)?;
+            let idx = leading + close + 1;
+            if idx < body.len() && !body[idx..].trim().is_empty() {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 /// First top-level compound-assignment operator `+= -= *= /=`; returns the index of the
@@ -2207,8 +3173,8 @@ fn find_compound_assign(s: &str) -> Option<usize> {
     let mut depth = 0i32;
     for i in 1..b.len() {
         match b[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
             b'=' if depth == 0
                 && matches!(b[i - 1], b'+' | b'-' | b'*' | b'/')
                 && b.get(i + 1) != Some(&b'=') =>
@@ -2227,13 +3193,16 @@ fn find_plain_eq(s: &str) -> Option<usize> {
     let mut depth = 0i32;
     for i in 0..b.len() {
         match b[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
             b'=' if depth == 0 => {
                 let prev = if i > 0 { b[i - 1] } else { b' ' };
                 let next = if i + 1 < b.len() { b[i + 1] } else { b' ' };
                 if next != b'='
-                    && !matches!(prev, b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%')
+                    && !matches!(
+                        prev,
+                        b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%'
+                    )
                 {
                     return Some(i);
                 }
@@ -2358,7 +3327,16 @@ fn param_widths(
     // These builtins all accept the all-vector form, so over-requesting is safe.
     if matches!(
         name,
-        "mix" | "pow" | "max" | "min" | "clamp" | "smoothstep" | "step" | "mod" | "atan" | "reflect"
+        "mix"
+            | "pow"
+            | "max"
+            | "min"
+            | "clamp"
+            | "smoothstep"
+            | "step"
+            | "mod"
+            | "atan"
+            | "reflect"
     ) {
         // Target the MINIMUM known-vector width (HLSL truncates wider operands to the
         // narrowest), ignoring Unknown args. Scalars still broadcast up to this width
@@ -2393,9 +3371,7 @@ fn fix_vector_relops(src: &str, t: &TypeTable) -> String {
         // find a top-level relational operator inside the current "primary group":
         // we scan for `<`, `>`, `<=`, `>=` not part of `<<`,`->`,`=<` etc.
         let c = b[i];
-        if (c == '<' || c == '>')
-            && !(i + 1 < n && b[i + 1] == '<')
-            && !(i > 0 && b[i - 1] == '=')
+        if (c == '<' || c == '>') && !(i + 1 < n && b[i + 1] == '<') && !(i > 0 && b[i - 1] == '=')
         {
             let two = i + 1 < n && b[i + 1] == '=';
             let op: String = if two { format!("{c}=") } else { c.to_string() };
@@ -2428,17 +3404,26 @@ fn fix_vector_relops(src: &str, t: &TypeTable) -> String {
                     // mirror rewrite_expr_width: truncate the wider operand to `w`.
                     let sw = &"xyzw"[..w as usize];
                     let lexpr = if lv {
-                        if gty_width(lt) > w { format!("({}).{sw}", left.trim()) } else { left.trim().to_string() }
+                        if gty_width(lt) > w {
+                            format!("({}).{sw}", left.trim())
+                        } else {
+                            left.trim().to_string()
+                        }
                     } else {
                         format!("vec{w}({})", left.trim())
                     };
                     let rexpr = if rv {
-                        if gty_width(rt) > w { format!("({}).{sw}", right.trim()) } else { right.trim().to_string() }
+                        if gty_width(rt) > w {
+                            format!("({}).{sw}", right.trim())
+                        } else {
+                            right.trim().to_string()
+                        }
                     } else {
                         format!("vec{w}({})", right.trim())
                     };
                     // drop whatever we had buffered for the left operand, re-emit wrapped
-                    let keep = out.len() - (i - ls);
+                    let keep_chars = out.chars().count().saturating_sub(i - ls);
+                    let keep = byte_index_after_chars(&out, keep_chars);
                     out.truncate(keep);
                     out.push_str(&format!("vec{w}({fname}({lexpr}, {rexpr}))"));
                     i = re;
@@ -2450,6 +3435,16 @@ fn fix_vector_relops(src: &str, t: &TypeTable) -> String {
         i += 1;
     }
     out
+}
+
+fn byte_index_after_chars(s: &str, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    match s.char_indices().nth(count) {
+        Some((idx, _)) => idx,
+        None => s.len(),
+    }
 }
 
 /// Extent of the operand to the LEFT of a relational operator at `op`: a balanced
@@ -2485,7 +3480,9 @@ fn relop_left(b: &[char], op: usize) -> Option<usize> {
                 k -= 1;
             }
         } else if c.is_alphanumeric() || c == '_' || c == '.' {
-            while k >= 0 && (b[k as usize].is_alphanumeric() || b[k as usize] == '_' || b[k as usize] == '.') {
+            while k >= 0
+                && (b[k as usize].is_alphanumeric() || b[k as usize] == '_' || b[k as usize] == '.')
+            {
                 k -= 1;
             }
         } else {
@@ -2555,7 +3552,23 @@ pub fn hlsl_milk_body_to_naga(body: &str) -> String {
     let (before, inner) = split_shader_body_wrapper(body);
     #[cfg(feature = "milk-native-converter")]
     {
-        {
+        if !before.is_empty() && before_has_function_defs(&before) {
+            let (func_defs, non_func_rest) = extract_function_defs(&before);
+            let body_src = if non_func_rest.trim().is_empty() {
+                inner.clone()
+            } else {
+                format!("{}\n{}", non_func_rest.trim(), inner)
+            };
+            let union = format!("{func_defs}\n{body_src}");
+            let (_, customs) = strip_and_alias_hlsl_samplers(&union);
+            let file_globals = hlsl_pre_native_fixups(&alias_with_customs(&func_defs, &customs));
+            let (deduped_body, _) = dedup_hlsl_declarations(&hlsl_pre_native_fixups(
+                &alias_with_customs(&body_src, &customs),
+            ));
+            if let Some(glsl_body) = try_native_convert_hlsl_ex(&file_globals, &deduped_body) {
+                return glsl_milk_body_to_naga(&glsl_body);
+            }
+        } else {
             // Combine before + inner, strip any HLSL sampler decls that would cause
             // "opaque variable must be declared uniform" failures in glsl-optimizer,
             // then dedup and try the native converter.
@@ -2566,12 +3579,7 @@ pub fn hlsl_milk_body_to_naga(body: &str) -> String {
             };
             let (pre_stripped, custom_samplers_c) = strip_and_alias_hlsl_samplers(&combined);
             let mut pre_stripped = hlsl_pre_native_fixups(&pre_stripped);
-            for name in &custom_samplers_c {
-                pre_stripped = replace_word(&pre_stripped, name, "sampler_main");
-                if let Some(base) = name.strip_prefix("sampler_") {
-                    pre_stripped = replace_word(&pre_stripped, &format!("texsize_{base}"), "texsize");
-                }
-            }
+            pre_stripped = alias_custom_sampler_refs(pre_stripped, &custom_samplers_c);
             let (deduped, _) = dedup_hlsl_declarations(&pre_stripped);
             if let Some(glsl_body) = try_native_convert_hlsl(&deduped) {
                 return glsl_milk_body_to_naga(&glsl_body);
@@ -2583,16 +3591,16 @@ pub fn hlsl_milk_body_to_naga(body: &str) -> String {
     if before_has_function_defs(&before) {
         return hlsl_comp_fallback_hoisted(&before, &inner);
     }
-    let combined = if before.is_empty() { inner } else { format!("{before}\n{inner}") };
+    let combined = if before.is_empty() {
+        inner
+    } else {
+        format!("{before}\n{inner}")
+    };
     let (stripped, custom_samplers) = strip_and_alias_hlsl_samplers(&combined);
     let mut stripped = stripped;
-    for name in &custom_samplers {
-        stripped = replace_word(&stripped, name, "sampler_main");
-        if let Some(base) = name.strip_prefix("sampler_") {
-            stripped = replace_word(&stripped, &format!("texsize_{base}"), "texsize");
-        }
-    }
+    stripped = alias_custom_sampler_refs(stripped, &custom_samplers);
     let converted_body = hlsl_to_glsl_body(&stripped);
+    let gamma_postlude = comp_gamma_postlude(&converted_body);
 
     let io_decls = "\
 layout(location = 0) in  vec2 vUv;
@@ -2600,7 +3608,8 @@ layout(location = 1) in  vec4 vColor;
 layout(location = 0) out vec4 fragColor;";
     let preamble = milk_fs_preamble(io_decls);
 
-    format!(r#"{preamble}
+    format!(
+        r#"{preamble}
 void main() {{
     vec3 ret = vec3(0.0);
     vec2 uv = vUv;
@@ -2638,9 +3647,11 @@ void main() {{
 
 {converted_body}
 
+{gamma_postlude}
     fragColor = vec4(ret, 1.0);
 }}
-"#)
+"#
+    )
 }
 
 /// Convert a raw HLSL .milk WARP shader body to a complete naga-compatible GLSL 450
@@ -2683,8 +3694,9 @@ pub fn hlsl_milk_warp_body_to_naga(body: &str) -> String {
                 format!("{before}\n{inner}")
             };
             let (_, customs) = strip_and_alias_hlsl_samplers(&stripped);
-            let (deduped, _) =
-                dedup_hlsl_declarations(&hlsl_pre_native_fixups(&alias_with_customs(&stripped, &customs)));
+            let (deduped, _) = dedup_hlsl_declarations(&hlsl_pre_native_fixups(
+                &alias_with_customs(&stripped, &customs),
+            ));
             try_native_convert_hlsl(&deduped)
         };
         if let Some(glsl_body) = native_result {
@@ -2694,15 +3706,14 @@ pub fn hlsl_milk_warp_body_to_naga(body: &str) -> String {
     if before_has_function_defs(&before) {
         return hlsl_warp_fallback_hoisted(&before, &inner);
     }
-    let combined = if before.is_empty() { inner } else { format!("{before}\n{inner}") };
+    let combined = if before.is_empty() {
+        inner
+    } else {
+        format!("{before}\n{inner}")
+    };
     let (stripped, custom_samplers) = strip_and_alias_hlsl_samplers(&combined);
     let mut stripped = stripped;
-    for name in &custom_samplers {
-        stripped = replace_word(&stripped, name, "sampler_main");
-        if let Some(base) = name.strip_prefix("sampler_") {
-            stripped = replace_word(&stripped, &format!("texsize_{base}"), "texsize");
-        }
-    }
+    stripped = alias_custom_sampler_refs(stripped, &custom_samplers);
     let converted_body = hlsl_to_glsl_body(&stripped);
 
     // Declaration order MUST be vUv(0), vWarpUv(1), vDecay(2) for naga locations.
@@ -2713,7 +3724,8 @@ layout(location = 2) in  vec4 vDecay;
 layout(location = 0) out vec4 fragColor;";
     let preamble = milk_fs_preamble(io_decls);
 
-    format!(r#"{preamble}
+    format!(
+        r#"{preamble}
 void main() {{
     vec3 ret = vec3(0.0);
     // uv = warped sample coord from the mesh (DirectX-UV, v=0 top); NO y-flip.
@@ -2733,7 +3745,8 @@ void main() {{
     // slow-growing feedback (the missing tendrils). vDecay stays for the default mesh.
     fragColor = vec4(ret, 1.0);
 }}
-"#)
+"#
+    )
 }
 
 /// Pure-Rust COMP fallback for `.milk` bodies whose `before` block defines helper
@@ -2755,6 +3768,7 @@ fn hlsl_comp_fallback_hoisted(before: &str, inner: &str) -> String {
     let conv_globals = hlsl_to_glsl_body_ex(&alias_with_customs(&glob_src, &customs), false);
     let (conv_decls, conv_inits) = split_hlsl_globals(&conv_globals);
     let conv_inner = hlsl_to_glsl_body(&alias_with_customs(inner, &customs));
+    let gamma_postlude = comp_gamma_postlude(&conv_inner);
 
     let io_decls = "\
 layout(location = 0) in  vec2 vUv;
@@ -2805,6 +3819,7 @@ void main() {{
 {conv_inits}
 {conv_inner}
 
+{gamma_postlude}
     fragColor = vec4(ret, 1.0);
 }}
 "#
@@ -2920,9 +3935,14 @@ fn brace_extract(src: &str) -> String {
         match bytes[i] {
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
                 // Skip to end of line.
-                while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
             }
-            b'{' => { depth += 1; i += 1; }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
@@ -2930,7 +3950,9 @@ fn brace_extract(src: &str) -> String {
                 }
                 i += 1;
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     src.to_string() // no matching close found — return everything
@@ -2952,11 +3974,8 @@ fn dedup_hlsl_declarations(body: &str) -> (String, String) {
     use std::collections::HashSet;
 
     const TYPES: &[&str] = &[
-        "float4","float3","float2","float",
-        "int4","int3","int2","int",
-        "bool4","bool3","bool2","bool",
-        "half4","half3","half2","half",
-        "uint4","uint3","uint2","uint",
+        "float4", "float3", "float2", "float", "int4", "int3", "int2", "int", "bool4", "bool3",
+        "bool2", "bool", "half4", "half3", "half2", "half", "uint4", "uint3", "uint2", "uint",
         "double",
     ];
 
@@ -2966,7 +3985,10 @@ fn dedup_hlsl_declarations(body: &str) -> (String, String) {
     let mut declared: HashSet<String> = HashSet::new();
     for raw_line in body.lines() {
         let line = raw_line.trim_start();
-        let line = line.strip_prefix("static ").map(str::trim_start).unwrap_or(line);
+        let line = line
+            .strip_prefix("static ")
+            .map(str::trim_start)
+            .unwrap_or(line);
         for ty in TYPES {
             let after_ty = match line.strip_prefix(ty) {
                 Some(rest) if rest.starts_with(|c: char| c.is_whitespace()) => rest.trim_start(),
@@ -3020,7 +4042,10 @@ fn dedup_hlsl_declarations(body: &str) -> (String, String) {
             }
         }
 
-        let after_static = line.strip_prefix("static ").map(str::trim_start).unwrap_or(line);
+        let after_static = line
+            .strip_prefix("static ")
+            .map(str::trim_start)
+            .unwrap_or(line);
         let mut rewritten = false;
         for ty in TYPES {
             let after_ty = match after_static.strip_prefix(ty) {
@@ -3036,7 +4061,8 @@ fn dedup_hlsl_declarations(body: &str) -> (String, String) {
             if declared.contains(name) {
                 if seen.contains(name) && has_init {
                     // Redeclaration with init — strip the type prefix (turn into assignment).
-                    let indent: String = raw_line.chars().take_while(|c| c.is_whitespace()).collect();
+                    let indent: String =
+                        raw_line.chars().take_while(|c| c.is_whitespace()).collect();
                     out.push_str(&indent);
                     out.push_str(name);
                     out.push_str(rest);
@@ -3065,19 +4091,12 @@ fn dedup_hlsl_declarations(body: &str) -> (String, String) {
         }
     }
 
-    // Alias custom sampler references in the body: replace each custom sampler name
-    // with `sampler_main` so hlsl2glslfork can resolve the `tex2D(X, …)` call using a
-    // declared sampler.  This gives a visually degraded result (wrong texture) for
-    // presets that use user-loaded textures, but at least the shader compiles.
+    // Alias custom sampler references in the body so hlsl2glslfork can resolve the
+    // `tex2D(X, …)` call using a declared sampler. This gives a visually degraded
+    // result (noise fallback instead of the user texture) for presets that use
+    // user-loaded textures, but avoids sampling empty feedback forever.
     // Mirroring the pure-Rust GLSL path's `strip_user_texture_uniforms` logic.
-    let mut body_out = out;
-    for name in &custom_samplers {
-        body_out = replace_word(&body_out, name, "sampler_main");
-        // Also alias any `texsize_<base>` companion uniform.
-        if let Some(base) = name.strip_prefix("sampler_") {
-            body_out = replace_word(&body_out, &format!("texsize_{base}"), "texsize");
-        }
-    }
+    let body_out = alias_custom_sampler_refs(out, &custom_samplers);
 
     (body_out, String::new())
 }
@@ -3161,8 +4180,8 @@ fn fix_indexed_component_access(src: &str) -> String {
                 };
                 if let Some(idx) = idx {
                     let after = j + 2;
-                    let next_ok = after >= b.len()
-                        || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+                    let next_ok =
+                        after >= b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
                     if next_ok {
                         out.push(']');
                         out.push_str(&src[i + 1..j]); // preserve any whitespace before `.`
@@ -3194,10 +4213,7 @@ fn rewrite_glsl_texture_calls(body: &str) -> String {
     // `main`, while noise/noisevol/blur each have a single base sampler. So
     // `sampler_pw_noise_lq` etc. would be UnknownVariable — strip the mode infix for
     // those textures (the wrap/filter mode is a no-op for our read-only lookups).
-    for mode in ["fw_", "fc_", "pw_", "pc_"] {
-        normalized = normalized.replace(&format!("sampler_{mode}noise"), "sampler_noise");
-        normalized = normalized.replace(&format!("sampler_{mode}blur"), "sampler_blur");
-    }
+    normalized = normalize_milkdrop_sampler_variants(&normalized);
     // Butterchurn-exported bodies write `texture (sampler_main, …)` with a space
     // between `texture` and `(` (and similarly for other GLSL builtins). Normalize
     // those spaced calls to `name(` form so rewrite_texture_calls' `texture(name,`
@@ -3514,9 +4530,14 @@ fn rewrite_vector_logical(src: &str) -> String {
             Some((l_start, op_at, r_end, nv, opch)) => {
                 let l: String = s[l_start..op_at].iter().collect();
                 let r: String = s[op_at + 2..r_end].iter().collect();
-                let fname = if opch == '&' { format!("m_and{nv}") } else { format!("m_or{nv}") };
-                let repl: Vec<char> =
-                    format!("{fname}({}, {})", l.trim(), r.trim()).chars().collect();
+                let fname = if opch == '&' {
+                    format!("m_and{nv}")
+                } else {
+                    format!("m_or{nv}")
+                };
+                let repl: Vec<char> = format!("{fname}({}, {})", l.trim(), r.trim())
+                    .chars()
+                    .collect();
                 let mut out: Vec<char> = Vec::with_capacity(n);
                 out.extend_from_slice(&s[..l_start]);
                 out.extend_from_slice(&repl);
@@ -3542,25 +4563,42 @@ fn guard_divides(src: &str) -> String {
     let mut i = 0;
     while i < n {
         let c = b[i];
-        if c == b'/' && i + 1 < n && b[i + 1] == b'/' { // line comment
-            while i < n && b[i] != b'\n' { out.push(b[i] as char); i += 1; }
-            continue;
-        }
-        if c == b'/' && i + 1 < n && b[i + 1] == b'*' { // block comment
-            out.push_str("/*"); i += 2;
-            while i < n {
-                if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' { out.push_str("*/"); i += 2; break; }
-                out.push(b[i] as char); i += 1;
+        if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            // line comment
+            while i < n && b[i] != b'\n' {
+                out.push(b[i] as char);
+                i += 1;
             }
             continue;
         }
-        if c == b'/' && !(i + 1 < n && b[i + 1] == b'=') { // division (not /=)
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            // block comment
+            out.push_str("/*");
+            i += 2;
+            while i < n {
+                if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                    out.push_str("*/");
+                    i += 2;
+                    break;
+                }
+                out.push(b[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && !(i + 1 < n && b[i + 1] == b'=') {
+            // division (not /=)
             let mut j = i + 1;
-            while j < n && b[j].is_ascii_whitespace() { j += 1; }
-            let denom_start = j;
-            while j < n && matches!(b[j], b'-' | b'+' | b'!' | b'~') { // leading unary ops
+            while j < n && b[j].is_ascii_whitespace() {
                 j += 1;
-                while j < n && b[j].is_ascii_whitespace() { j += 1; }
+            }
+            let denom_start = j;
+            while j < n && matches!(b[j], b'-' | b'+' | b'!' | b'~') {
+                // leading unary ops
+                j += 1;
+                while j < n && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
             }
             let (end, is_literal) = parse_primary_fwd(b, j);
             if end > j && !is_literal {
@@ -3583,7 +4621,9 @@ fn guard_divides(src: &str) -> String {
 /// Parse one GLSL "primary" at `j` (after leading unary ops). Returns (end, is_numeric_literal).
 fn parse_primary_fwd(b: &[u8], mut j: usize) -> (usize, bool) {
     let n = b.len();
-    if j >= n { return (j, false); }
+    if j >= n {
+        return (j, false);
+    }
     let c = b[j];
     if c == b'(' {
         j = consume_balanced(b, j, b'(', b')');
@@ -3593,14 +4633,25 @@ fn parse_primary_fwd(b: &[u8], mut j: usize) -> (usize, bool) {
         while j < n {
             let d = b[j];
             let prev_e = j > 0 && (b[j - 1] == b'e' || b[j - 1] == b'E');
-            if d.is_ascii_digit() || matches!(d, b'.' | b'e' | b'E' | b'f' | b'F' | b'u' | b'U' | b'l' | b'L')
-                || ((d == b'+' || d == b'-') && prev_e) { j += 1; } else { break; }
+            if d.is_ascii_digit()
+                || matches!(
+                    d,
+                    b'.' | b'e' | b'E' | b'f' | b'F' | b'u' | b'U' | b'l' | b'L'
+                )
+                || ((d == b'+' || d == b'-') && prev_e)
+            {
+                j += 1;
+            } else {
+                break;
+            }
         }
         return (j, true);
     }
     if c.is_ascii_alphabetic() || c == b'_' {
         let id_start = j;
-        while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') { j += 1; }
+        while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
         let ident = std::str::from_utf8(&b[id_start..j]).unwrap_or("");
         // Is the identifier immediately a call `(`? A GLSL vector/matrix *constructor*
         // call (`vec2(0.0,-1.0)`, `mat3(...)`) with all-constant args is const-foldable
@@ -3609,7 +4660,9 @@ fn parse_primary_fwd(b: &[u8], mut j: usize) -> (usize, bool) {
         // zero component → naga "Function 'main' is invalid". Reporting it as a literal
         // leaves the original `/ctor(…)` division (uniform/const numerators don't fold).
         let mut k = j;
-        while k < n && b[k].is_ascii_whitespace() { k += 1; }
+        while k < n && b[k].is_ascii_whitespace() {
+            k += 1;
+        }
         let is_ctor_call = k < n && b[k] == b'(' && is_glsl_constructor(ident);
         return (consume_suffixes_fwd(b, j), is_ctor_call);
     }
@@ -3621,14 +4674,30 @@ fn parse_primary_fwd(b: &[u8], mut j: usize) -> (usize, bool) {
 fn is_glsl_constructor(name: &str) -> bool {
     matches!(
         name,
-        "vec2" | "vec3" | "vec4"
-            | "ivec2" | "ivec3" | "ivec4"
-            | "uvec2" | "uvec3" | "uvec4"
-            | "bvec2" | "bvec3" | "bvec4"
-            | "mat2" | "mat3" | "mat4"
-            | "mat2x2" | "mat2x3" | "mat2x4"
-            | "mat3x2" | "mat3x3" | "mat3x4"
-            | "mat4x2" | "mat4x3" | "mat4x4"
+        "vec2"
+            | "vec3"
+            | "vec4"
+            | "ivec2"
+            | "ivec3"
+            | "ivec4"
+            | "uvec2"
+            | "uvec3"
+            | "uvec4"
+            | "bvec2"
+            | "bvec3"
+            | "bvec4"
+            | "mat2"
+            | "mat3"
+            | "mat4"
+            | "mat2x2"
+            | "mat2x3"
+            | "mat2x4"
+            | "mat3x2"
+            | "mat3x3"
+            | "mat3x4"
+            | "mat4x2"
+            | "mat4x3"
+            | "mat4x4"
     )
 }
 
@@ -3637,8 +4706,16 @@ fn consume_balanced(b: &[u8], mut j: usize, open: u8, close: u8) -> usize {
     let mut depth = 0i32;
     while j < n {
         let c = b[j];
-        if c == open { depth += 1; }
-        else if c == close { depth -= 1; j += 1; if depth == 0 { return j; } continue; }
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            j += 1;
+            if depth == 0 {
+                return j;
+            }
+            continue;
+        }
         j += 1;
     }
     j
@@ -3649,14 +4726,20 @@ fn consume_suffixes_fwd(b: &[u8], mut j: usize) -> usize {
     let n = b.len();
     loop {
         let mut k = j;
-        while k < n && b[k].is_ascii_whitespace() { k += 1; }
-        if k >= n { break; }
+        while k < n && b[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= n {
+            break;
+        }
         match b[k] {
             b'(' => j = consume_balanced(b, k, b'(', b')'),
             b'[' => j = consume_balanced(b, k, b'[', b']'),
             b'.' if k + 1 < n && (b[k + 1].is_ascii_alphabetic() || b[k + 1] == b'_') => {
                 j = k + 1;
-                while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') { j += 1; }
+                while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
             }
             _ => break,
         }
@@ -3666,8 +4749,10 @@ fn consume_suffixes_fwd(b: &[u8], mut j: usize) -> usize {
 
 pub fn glsl_milk_body_to_naga(body: &str) -> String {
     let inner = strip_shader_body_wrapper(body);
-    let (hoisted_fns, converted_body) =
-        hoist_function_defs(&guard_divides(&rewrite_vector_logical(&rewrite_glsl_texture_calls(&inner))));
+    let (hoisted_fns, converted_body) = hoist_function_defs(&guard_divides(
+        &rewrite_vector_logical(&rewrite_glsl_texture_calls(&inner)),
+    ));
+    let gamma_postlude = comp_gamma_postlude(&converted_body);
 
     let io_decls = "\
 layout(location = 0) in  vec2 vUv;
@@ -3675,7 +4760,8 @@ layout(location = 1) in  vec4 vColor;
 layout(location = 0) out vec4 fragColor;";
     let preamble = milk_fs_preamble(io_decls);
 
-    format!(r#"{preamble}
+    format!(
+        r#"{preamble}
 // Per-pixel values promoted to file-scope globals so hoisted helper functions
 // (the Butterchurn converter's `main_shader_sentinel` + helpers) can reference
 // them. `main()` ASSIGNS (not declares) them before the body runs — backward
@@ -3719,9 +4805,11 @@ void main() {{
 
 {converted_body}
 
+{gamma_postlude}
     fragColor = vec4(ret, 1.0);
 }}
-"#)
+"#
+    )
 }
 
 /// Convert a Butterchurn converted-JSON GLSL WARP shader body to a complete
@@ -3731,8 +4819,9 @@ void main() {{
 /// fragColor = vec4(ret, 1.0) with NO vDecay multiply). Body is already GLSL.
 pub fn glsl_milk_warp_body_to_naga(body: &str) -> String {
     let inner = strip_shader_body_wrapper(body);
-    let (hoisted_fns, converted_body) =
-        hoist_function_defs(&guard_divides(&rewrite_vector_logical(&rewrite_glsl_texture_calls(&inner))));
+    let (hoisted_fns, converted_body) = hoist_function_defs(&guard_divides(
+        &rewrite_vector_logical(&rewrite_glsl_texture_calls(&inner)),
+    ));
 
     let io_decls = "\
 layout(location = 0) in  vec2 vUv;
@@ -3741,7 +4830,8 @@ layout(location = 2) in  vec4 vDecay;
 layout(location = 0) out vec4 fragColor;";
     let preamble = milk_fs_preamble(io_decls);
 
-    format!(r#"{preamble}
+    format!(
+        r#"{preamble}
 // Per-pixel values promoted to file-scope globals so hoisted helper functions
 // (the Butterchurn converter's `main_shader_sentinel` + helpers) can reference
 // them. `main()` ASSIGNS (not declares) them before the body runs.
@@ -3763,7 +4853,8 @@ void main() {{
     // Custom warp self-decays — NO extra vDecay multiply (matches the HLSL custom-warp path).
     fragColor = vec4(ret, 1.0);
 }}
-"#)
+"#
+    )
 }
 
 /// Strip HLSL sampler declarations that have no GLSL equivalent.
@@ -3794,8 +4885,10 @@ fn strip_hlsl_sampler_blocks(src: &str) -> String {
             continue;
         }
         // Single-line `sampler X;` (bare HLSL SM3 sampler declare)
-        if t.starts_with("sampler ") && !t.starts_with("sampler2D")
-            && !t.starts_with("sampler3D") && !t.starts_with("samplerCube")
+        if t.starts_with("sampler ")
+            && !t.starts_with("sampler2D")
+            && !t.starts_with("sampler3D")
+            && !t.starts_with("samplerCube")
             && (t.contains(';') || t.ends_with(';'))
         {
             i += 1;
@@ -3804,7 +4897,8 @@ fn strip_hlsl_sampler_blocks(src: &str) -> String {
         // `sampler2D X;` or `uniform sampler2D X;` inside a function body
         // (GLSL doesn't allow sampler declarations inside functions)
         let stripped = t.trim_start_matches("uniform").trim_start();
-        if (stripped.starts_with("sampler2D ") || stripped.starts_with("sampler3D ")
+        if (stripped.starts_with("sampler2D ")
+            || stripped.starts_with("sampler3D ")
             || stripped.starts_with("samplerCube "))
             && stripped.contains(';')
         {
@@ -3834,6 +4928,8 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
     // (lerp→mix, mul, tex2D→texture, pow/max int coercion) matches. GLSL treats
     // `f (x)` and `f(x)` identically, so this changes nothing semantically.
     let mut s = collapse_call_spaces(src);
+    s = normalize_milkdrop_sampler_variants(&s);
+    s = strip_comments(&s);
 
     // HLSL bool-as-number: cast a comparison used in arithmetic to float (naga rejects
     // `bool * float`). Same transform applied to the native pre-pass.
@@ -3844,15 +4940,15 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
     s = replace_word(&s, "static", "");
 
     // HLSL vector/matrix types → GLSL (float1 is the HLSL scalar)
-    s = replace_word(&s, "float1",   "float");
-    s = replace_word(&s, "float2",   "vec2");
-    s = replace_word(&s, "float3",   "vec3");
-    s = replace_word(&s, "float4",   "vec4");
+    s = replace_word(&s, "float1", "float");
+    s = replace_word(&s, "float2", "vec2");
+    s = replace_word(&s, "float3", "vec3");
+    s = replace_word(&s, "float4", "vec4");
     // DX11 double-precision types (hlsl2glslfork rejects these; treat as float)
-    s = replace_word(&s, "double2",  "vec2");
-    s = replace_word(&s, "double3",  "vec3");
-    s = replace_word(&s, "double4",  "vec4");
-    s = replace_word(&s, "double",   "float");
+    s = replace_word(&s, "double2", "vec2");
+    s = replace_word(&s, "double3", "vec3");
+    s = replace_word(&s, "double4", "vec4");
+    s = replace_word(&s, "double", "float");
     s = replace_word(&s, "float2x2", "mat2");
     s = replace_word(&s, "float3x3", "mat3");
     s = replace_word(&s, "float4x4", "mat4");
@@ -3868,24 +4964,24 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
     // mat2(<single-arg>) → mat2((e).x,(e).y,(e).z,(e).w). Multi-arg forms
     // (mat2(a,b,c,d) / mat2(v0,v1)) have a top-level comma and are left alone.
     s = expand_mat2_from_vec(&s);
-    s = replace_word(&s, "int2",     "ivec2");
-    s = replace_word(&s, "int3",     "ivec3");
-    s = replace_word(&s, "int4",     "ivec4");
-    s = replace_word(&s, "bool2",    "bvec2");
-    s = replace_word(&s, "bool3",    "bvec3");
-    s = replace_word(&s, "bool4",    "bvec4");
+    s = replace_word(&s, "int2", "ivec2");
+    s = replace_word(&s, "int3", "ivec3");
+    s = replace_word(&s, "int4", "ivec4");
+    s = replace_word(&s, "bool2", "bvec2");
+    s = replace_word(&s, "bool3", "bvec3");
+    s = replace_word(&s, "bool4", "bvec4");
     // HLSL half-precision types → float (longest-first so `half` doesn't eat `half2`).
-    s = replace_word(&s, "half2",    "vec2");
-    s = replace_word(&s, "half3",    "vec3");
-    s = replace_word(&s, "half4",    "vec4");
-    s = replace_word(&s, "half",     "float");
+    s = replace_word(&s, "half2", "vec2");
+    s = replace_word(&s, "half3", "vec3");
+    s = replace_word(&s, "half4", "vec4");
+    s = replace_word(&s, "half", "float");
 
     // HLSL math functions → GLSL
-    s = s.replace("lerp(",   "mix(");
-    s = s.replace("frac(",   "fract(");
-    s = s.replace("atan2(",  "atan(");
-    s = s.replace("ddx(",    "dFdx(");
-    s = s.replace("ddy(",    "dFdy(");
+    s = s.replace("lerp(", "mix(");
+    s = s.replace("frac(", "fract(");
+    s = s.replace("atan2(", "atan(");
+    s = s.replace("ddx(", "dFdx(");
+    s = s.replace("ddy(", "dFdy(");
     // mul(mat, vec) → mat * vec — risky if nested, but covers the common case
     s = replace_mul(&s);
 
@@ -3896,7 +4992,16 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
     // float (`1` → `1.0`).
     s = coerce_builtin_int_args(
         &s,
-        &["pow", "max", "min", "mix", "clamp", "smoothstep", "step", "mod"],
+        &[
+            "pow",
+            "max",
+            "min",
+            "mix",
+            "clamp",
+            "smoothstep",
+            "step",
+            "mod",
+        ],
     );
 
     // HLSL scalar swizzles (`f.xxx` replicates a float to vec3) are illegal in GLSL
@@ -3934,7 +5039,8 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
 /// following tokens), forcing these presets onto the weaker pure-Rust fallback.
 /// Rewriting `double*` → `float*` up front lets them go through the native path.
 fn hlsl_pre_native_fixups(src: &str) -> String {
-    let mut s = src.to_string();
+    let mut s = normalize_milkdrop_sampler_variants(src);
+    s = strip_comments(&s);
     s = replace_word(&s, "double2", "float2");
     s = replace_word(&s, "double3", "float3");
     s = replace_word(&s, "double4", "float4");
@@ -4009,8 +5115,12 @@ fn wrap_bool_arith(src: &str) -> String {
                 if has_top_level_comparison(&inner) {
                     let prev = (0..i).rev().map(|j| b[j]).find(|c| !c.is_whitespace());
                     let next = (k + 1..n).map(|j| b[j]).find(|c| !c.is_whitespace());
-                    let arith = |c: Option<char>| matches!(c, Some('*') | Some('/') | Some('+') | Some('-'));
-                    let boolean = |c: Option<char>| matches!(c, Some('&') | Some('|') | Some('?') | Some(':'));
+                    let arith = |c: Option<char>| {
+                        matches!(c, Some('*') | Some('/') | Some('+') | Some('-'))
+                    };
+                    let boolean = |c: Option<char>| {
+                        matches!(c, Some('&') | Some('|') | Some('?') | Some(':'))
+                    };
                     // The contiguous word immediately before `(` (no whitespace): if it is
                     // a function name, this `(…)` is its ARGUMENT list (not a groupable
                     // comparison) — leave it. `if`/`while`/`for` is a boolean condition —
@@ -4021,7 +5131,10 @@ fn wrap_bool_arith(src: &str) -> String {
                     }
                     let word: String = b[ws..i].iter().collect();
                     let is_call = !word.is_empty()
-                        && !matches!(word.as_str(), "return" | "if" | "while" | "for" | "else" | "do");
+                        && !matches!(
+                            word.as_str(),
+                            "return" | "if" | "while" | "for" | "else" | "do"
+                        );
                     let is_cond = matches!(word.as_str(), "if" | "while" | "for");
                     if !is_call
                         && !is_cond
@@ -4030,7 +5143,11 @@ fn wrap_bool_arith(src: &str) -> String {
                         && !boolean(next)
                     {
                         // avoid gluing `float(` onto a preceding keyword (`return`)
-                        if out.chars().last().map_or(false, |c| c.is_alphanumeric() || c == '_') {
+                        if out
+                            .chars()
+                            .last()
+                            .map_or(false, |c| c.is_alphanumeric() || c == '_')
+                        {
                             out.push(' ');
                         }
                         out.push_str("float(");
@@ -4104,14 +5221,41 @@ fn strip_comments(src: &str) -> String {
 fn is_hlsl_value_type(t: &str) -> bool {
     matches!(
         t,
-        "float" | "float2" | "float3" | "float4"
-            | "float2x2" | "float3x3" | "float4x4"
-            | "float2x3" | "float2x4" | "float3x2" | "float3x4" | "float4x2" | "float4x3"
-            | "int" | "int2" | "int3" | "int4"
-            | "bool" | "bool2" | "bool3" | "bool4"
-            | "half" | "half2" | "half3" | "half4"
-            | "double" | "double2" | "double3" | "double4"
-            | "vec2" | "vec3" | "vec4" | "mat2" | "mat3" | "mat4"
+        "float"
+            | "float2"
+            | "float3"
+            | "float4"
+            | "float2x2"
+            | "float3x3"
+            | "float4x4"
+            | "float2x3"
+            | "float2x4"
+            | "float3x2"
+            | "float3x4"
+            | "float4x2"
+            | "float4x3"
+            | "int"
+            | "int2"
+            | "int3"
+            | "int4"
+            | "bool"
+            | "bool2"
+            | "bool3"
+            | "bool4"
+            | "half"
+            | "half2"
+            | "half3"
+            | "half4"
+            | "double"
+            | "double2"
+            | "double3"
+            | "double4"
+            | "vec2"
+            | "vec3"
+            | "vec4"
+            | "mat2"
+            | "mat3"
+            | "mat4"
     )
 }
 
@@ -4246,14 +5390,17 @@ fn process_global_stmt(stmt: &str, decls: &mut String, inits: &mut String) {
 /// `before` block but used in `inner` is aliased consistently across fragments).
 fn alias_with_customs(fragment: &str, customs: &[String]) -> String {
     let (stripped, _) = strip_and_alias_hlsl_samplers(fragment);
-    let mut o = stripped;
+    alias_custom_sampler_refs(stripped, customs)
+}
+
+fn alias_custom_sampler_refs(mut src: String, customs: &[String]) -> String {
     for name in customs {
-        o = replace_word(&o, name, "sampler_main");
+        src = replace_word(&src, name, "sampler_noise_lq");
         if let Some(base) = name.strip_prefix("sampler_") {
-            o = replace_word(&o, &format!("texsize_{base}"), "texsize");
+            src = replace_word(&src, &format!("texsize_{base}"), "texsize_noise_lq");
         }
     }
-    o
+    src
 }
 
 /// Coerce whole-integer-literal arguments of the given builtin calls to float.
@@ -4275,7 +5422,9 @@ fn coerce_builtin_int_args(src: &str, fns: &[&str]) -> String {
             let before_ok = i == 0 || !(b[i - 1].is_alphanumeric() || b[i - 1] == '_');
             if before_ok {
                 let mut j = i;
-                while j < n && (b[j].is_ascii_alphanumeric() || b[j] == '_') { j += 1; }
+                while j < n && (b[j].is_ascii_alphanumeric() || b[j] == '_') {
+                    j += 1;
+                }
                 let ident: String = b[i..j].iter().collect();
                 if fns.contains(&ident.as_str()) && j < n && b[j] == '(' {
                     // emit the name and the open paren, then process the arg list
@@ -4302,9 +5451,18 @@ fn coerce_builtin_int_args(src: &str, fns: &[&str]) -> String {
                 let core = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
                 if !core.is_empty() && core.chars().all(|c| c.is_ascii_digit()) {
                     // pure integer literal → float, preserving original surrounding ws
-                    let lead: String = processed.chars().take_while(|c| c.is_whitespace()).collect();
-                    let trail: String =
-                        processed.chars().rev().take_while(|c| c.is_whitespace()).collect::<String>().chars().rev().collect();
+                    let lead: String = processed
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .collect();
+                    let trail: String = processed
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_whitespace())
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
                     out.push_str(&format!("{lead}{trimmed}.0{trail}"));
                 } else {
                     out.push_str(&processed);
@@ -4348,7 +5506,10 @@ fn fix_scalar_swizzles(src: &str) -> String {
     for line in src.lines() {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("float ") {
-            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
             if !name.is_empty() {
                 let after = rest[name.len()..].trim_start();
                 if after.starts_with('=') || after.starts_with(';') {
@@ -4368,7 +5529,9 @@ fn fix_scalar_swizzles(src: &str) -> String {
         if b[i].is_ascii_alphabetic() || b[i] == '_' {
             let start = i;
             let mut j = i;
-            while j < n && (b[j].is_ascii_alphanumeric() || b[j] == '_') { j += 1; }
+            while j < n && (b[j].is_ascii_alphanumeric() || b[j] == '_') {
+                j += 1;
+            }
             let ident: String = b[start..j].iter().collect();
             if scalars.contains(&ident) && j < n && b[j] == '.' {
                 let sw_start = j + 1;
@@ -4417,10 +5580,15 @@ fn truncate_texture_decls(src: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for line in src.lines() {
         let t = line.trim_start();
-        let swiz = if t.starts_with("vec3 ") { Some(".xyz") }
-            else if t.starts_with("vec2 ") { Some(".xy") }
-            else if t.starts_with("float ") { Some(".x") }
-            else { None };
+        let swiz = if t.starts_with("vec3 ") {
+            Some(".xyz")
+        } else if t.starts_with("vec2 ") {
+            Some(".xy")
+        } else if t.starts_with("float ") {
+            Some(".x")
+        } else {
+            None
+        };
         if let Some(sw) = swiz {
             // require RHS to be exactly `texture(...)` ending in `);`
             if let Some(eq) = t.find('=') {
@@ -4448,15 +5616,25 @@ fn truncate_texture_decls(src: &str) -> String {
 /// type: `vec3 lay1 = ...roam_cos;` → `vec3 lay1 = (...roam_cos).xyz;`.
 fn truncate_vec4_builtin_decls(src: &str) -> String {
     const VEC4_BUILTINS: [&str; 6] = [
-        "roam_cos", "roam_sin", "slow_roam_cos", "slow_roam_sin", "rand_frame", "rand_preset",
+        "roam_cos",
+        "roam_sin",
+        "slow_roam_cos",
+        "slow_roam_sin",
+        "rand_frame",
+        "rand_preset",
     ];
     let mut out: Vec<String> = Vec::new();
     for line in src.lines() {
         let t = line.trim_start();
-        let sw = if t.starts_with("vec3 ") { Some(".xyz") }
-            else if t.starts_with("vec2 ") { Some(".xy") }
-            else if t.starts_with("float ") { Some(".x") }
-            else { None };
+        let sw = if t.starts_with("vec3 ") {
+            Some(".xyz")
+        } else if t.starts_with("vec2 ") {
+            Some(".xy")
+        } else if t.starts_with("float ") {
+            Some(".x")
+        } else {
+            None
+        };
         if let Some(sw) = sw {
             if let Some(eq) = t.find('=') {
                 let rhs_full = t[eq + 1..].trim();
@@ -4482,12 +5660,20 @@ fn truncate_vec4_builtin_decls(src: &str) -> String {
 /// True if `s` is a single balanced `name(...)` call (close paren only at the end).
 fn is_single_call(s: &str) -> bool {
     let b = s.as_bytes();
-    let open = match s.find('(') { Some(i) => i, None => return false };
+    let open = match s.find('(') {
+        Some(i) => i,
+        None => return false,
+    };
     let mut depth = 0i32;
     for (k, &c) in b.iter().enumerate().skip(open) {
         match c {
             b'(' => depth += 1,
-            b')' => { depth -= 1; if depth == 0 { return k == b.len() - 1; } }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return k == b.len() - 1;
+                }
+            }
             _ => {}
         }
     }
@@ -4512,7 +5698,9 @@ fn drop_unused_decls(src: &str) -> String {
 /// If `t` is `<type> <ident> = ...` (a scalar/vector local decl, not `==`),
 /// return the declared identifier.
 fn decl_ident(t: &str) -> Option<String> {
-    for ty in ["float ", "vec2 ", "vec3 ", "vec4 ", "int ", "mat2 ", "mat3 ", "mat4 ", "bool "] {
+    for ty in [
+        "float ", "vec2 ", "vec3 ", "vec4 ", "int ", "mat2 ", "mat3 ", "mat4 ", "bool ",
+    ] {
         if let Some(rest) = t.strip_prefix(ty) {
             let rest = rest.trim_start();
             let ident: String = rest
@@ -4571,7 +5759,12 @@ fn expand_mat2_from_vec(src: &str) -> String {
             while j < bytes.len() {
                 match bytes[j] {
                     b'(' => depth += 1,
-                    b')' => { depth -= 1; if depth == 0 { break; } }
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
                     b',' if depth == 1 => top_comma = true,
                     _ => {}
                 }
@@ -4579,10 +5772,7 @@ fn expand_mat2_from_vec(src: &str) -> String {
             }
             if j < bytes.len() && !top_comma {
                 let inner = src[open + 1..j].trim();
-                out.push_str(&format!(
-                    "mat2(({0}).x, ({0}).y, ({0}).z, ({0}).w)",
-                    inner
-                ));
+                out.push_str(&format!("mat2(({0}).x, ({0}).y, ({0}).z, ({0}).w)", inner));
                 i = j + 1;
                 continue;
             }
@@ -4603,8 +5793,9 @@ fn replace_word(src: &str, from: &str, to: &str) -> String {
         if let Some(idx) = src[pos..].find(from) {
             let abs = pos + idx;
             // Check that the character before and after are not word characters
-            let before_ok = abs == 0 || !src.as_bytes()[abs - 1].is_ascii_alphanumeric()
-                && src.as_bytes()[abs - 1] != b'_';
+            let before_ok = abs == 0
+                || !src.as_bytes()[abs - 1].is_ascii_alphanumeric()
+                    && src.as_bytes()[abs - 1] != b'_';
             let after = abs + from.len();
             let after_ok = after >= src.len()
                 || (!src.as_bytes()[after].is_ascii_alphanumeric()
@@ -4633,20 +5824,28 @@ fn rewrite_tex2d_calls(src: &str) -> String {
     names.sort_by_key(|s| std::cmp::Reverse(s.len()));
 
     for name in &names {
-        for call in &[format!("tex2D({name},"), format!("tex2d({name},"),
-                      format!("tex2D( {name},"), format!("tex2d( {name},"),
-                      format!("tex2D({name} ,"), format!("tex2d({name} ,")]
-        {
+        for call in &[
+            format!("tex2D({name},"),
+            format!("tex2d({name},"),
+            format!("tex2D( {name},"),
+            format!("tex2d( {name},"),
+            format!("tex2D({name} ,"),
+            format!("tex2d({name} ,"),
+        ] {
             if result.contains(call.as_str()) {
                 let replacement = format!("texture(sampler2D({name}, {name}_samp),");
                 result = result.replace(call.as_str(), &replacement);
             }
         }
         // tex3D → sampler3D (3D noise-volume textures: sampler_noisevol_*)
-        for call in &[format!("tex3D({name},"), format!("tex3d({name},"),
-                      format!("tex3D( {name},"), format!("tex3d( {name},"),
-                      format!("tex3D({name} ,"), format!("tex3d({name} ,")]
-        {
+        for call in &[
+            format!("tex3D({name},"),
+            format!("tex3d({name},"),
+            format!("tex3D( {name},"),
+            format!("tex3d( {name},"),
+            format!("tex3D({name} ,"),
+            format!("tex3d({name} ,"),
+        ] {
             if result.contains(call.as_str()) {
                 let replacement = format!("texture(sampler3D({name}, {name}_samp),");
                 result = result.replace(call.as_str(), &replacement);
@@ -4678,7 +5877,11 @@ fn replace_mul(src: &str) -> String {
         result.push_str(&rest[..idx]);
         let after = &rest[idx + 4..]; // skip "mul("
         if let Some((a, b, end)) = split_two_args(after) {
-            result.push_str(&format!("(({a}) * ({b}))"));
+            if let Some((c0, c1)) = mat2x3_columns(a.trim()) {
+                result.push_str(&format!("vec2(dot(({c0}), ({b})), dot(({c1}), ({b})))"));
+            } else {
+                result.push_str(&format!("(({a}) * ({b}))"));
+            }
             rest = &after[end..];
         } else {
             result.push_str("mul(");
@@ -4687,6 +5890,17 @@ fn replace_mul(src: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+fn mat2x3_columns(expr: &str) -> Option<(String, String)> {
+    let expr = expr.trim();
+    let inner = expr.strip_prefix("mat2x3(")?.strip_suffix(')')?;
+    let (a, b, end) = split_two_args(&(inner.to_string() + ")"))?;
+    if end == inner.len() + 1 {
+        Some((a, b))
+    } else {
+        None
+    }
 }
 
 /// Split the content inside a two-argument function call `a, b)`.

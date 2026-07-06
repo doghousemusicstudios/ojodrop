@@ -14,6 +14,15 @@ const TIME_MEDIAN_FRAMES: usize = 15;
 const FREQ_MEDIAN_RADIUS: usize = 5;
 const MASK_POWER: f32 = 2.0;
 
+#[inline]
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HpssFeatures {
     pub perc_rms: f32,
@@ -93,16 +102,17 @@ impl HpssSeparator {
         let mut harm_energy = 0.0f32;
 
         for bin in 0..self.n_bins {
-            let harmonic_ref = self.time_median(bin);
-            let percussive_ref = self.frequency_median(mag, bin);
+            let harmonic_ref = finite_or_zero(self.time_median(bin)).max(0.0);
+            let percussive_ref = finite_or_zero(self.frequency_median(mag, bin)).max(0.0);
             let h = harmonic_ref.powf(MASK_POWER);
             let p = percussive_ref.powf(MASK_POWER);
-            let denom = h + p + 1e-12;
-            let harm_mask = h / denom;
-            let perc_mask = p / denom;
+            let denom = finite_or_zero(h + p).max(0.0) + 1e-12;
+            let harm_mask = finite_or_zero(h / denom).clamp(0.0, 1.0);
+            let perc_mask = finite_or_zero(p / denom).clamp(0.0, 1.0);
 
-            let hm = mag[bin] * harm_mask;
-            let pm = mag[bin] * perc_mask;
+            let m = finite_or_zero(mag[bin]).max(0.0);
+            let hm = m * harm_mask;
+            let pm = m * perc_mask;
             self.harmonic_mag[bin] = hm;
             self.percussive_mag[bin] = pm;
             harm_energy += hm * hm;
@@ -186,7 +196,12 @@ impl HpssSeparator {
 
     fn push_history(&mut self, mag: &[f32]) {
         let offset = self.history_write * self.n_bins;
-        self.history[offset..offset + self.n_bins].copy_from_slice(mag);
+        for (dst, &src) in self.history[offset..offset + self.n_bins]
+            .iter_mut()
+            .zip(mag.iter())
+        {
+            *dst = finite_or_zero(src).max(0.0);
+        }
         self.history_write = (self.history_write + 1) % TIME_MEDIAN_FRAMES;
         self.history_filled = (self.history_filled + 1).min(TIME_MEDIAN_FRAMES);
     }
@@ -207,7 +222,12 @@ impl HpssSeparator {
         let lo = bin.saturating_sub(FREQ_MEDIAN_RADIUS);
         let hi = (bin + FREQ_MEDIAN_RADIUS + 1).min(mag.len());
         let count = hi - lo;
-        self.freq_scratch[..count].copy_from_slice(&mag[lo..hi]);
+        for (dst, &src) in self.freq_scratch[..count]
+            .iter_mut()
+            .zip(mag[lo..hi].iter())
+        {
+            *dst = finite_or_zero(src).max(0.0);
+        }
         median(&mut self.freq_scratch[..count])
     }
 }

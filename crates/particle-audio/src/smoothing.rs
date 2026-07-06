@@ -13,6 +13,15 @@
 //!   decay — that turns twitchy energy/onset signals into impulses that "pop"
 //!   then fall (the single biggest factor in visuals feeling on-beat, spec §4).
 
+#[inline]
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 /// First-order one-pole low-pass filter. `coeff` in `0..1`: higher = smoother
 /// (more inertia). `y[n] = y[n-1] + (1-coeff) * (x[n] - y[n-1])`.
 #[derive(Clone, Copy, Debug)]
@@ -32,7 +41,14 @@ impl OnePole {
 
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
+        let x = finite_or_zero(x);
+        if !self.state.is_finite() {
+            self.state = 0.0;
+        }
         self.state += (1.0 - self.coeff) * (x - self.state);
+        if !self.state.is_finite() {
+            self.state = 0.0;
+        }
         self.state
     }
 
@@ -70,6 +86,10 @@ impl Agc {
     /// Normalize `x` to `0..1` against the running peak, updating the peak.
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
+        let x = finite_or_zero(x).max(0.0);
+        if !self.peak.is_finite() {
+            self.peak = self.floor;
+        }
         // Decay the peak toward the floor, then let a new maximum push it up.
         self.peak = (self.peak * self.decay).max(self.floor);
         if x > self.peak {
@@ -102,6 +122,7 @@ impl SilenceGate {
     /// Feed a level (e.g. linear RMS). Returns the gate state (true = silent).
     #[inline]
     pub fn update(&mut self, level: f32) -> bool {
+        let level = finite_or_zero(level);
         if self.silent {
             if level > self.exit {
                 self.silent = false;
@@ -135,6 +156,10 @@ impl AsymEnv {
 
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
+        let x = finite_or_zero(x);
+        if !self.state.is_finite() {
+            self.state = 0.0;
+        }
         let coeff = if x > self.state {
             self.attack
         } else {
@@ -142,6 +167,9 @@ impl AsymEnv {
         };
         // coeff is the per-frame retention of the OLD value; (1-coeff) lets the new in.
         self.state += (1.0 - coeff) * (x - self.state);
+        if !self.state.is_finite() {
+            self.state = 0.0;
+        }
         self.state
     }
 }
@@ -194,6 +222,13 @@ impl ReactiveLevel {
         const BASE_FPS: f32 = 30.0;
         let fps = (1.0 / hop_dt.max(1e-4)).clamp(15.0, 144.0);
         let adjust = |rate: f32| rate.powf(BASE_FPS / fps);
+        let imm = finite_or_zero(imm).max(0.0);
+        if !self.avg.is_finite() {
+            self.avg = 1.0;
+        }
+        if !self.long_avg.is_finite() {
+            self.long_avg = 1.0;
+        }
 
         // Short rolling average: rises fast (0.2 retention), falls slower (0.5).
         let rate = adjust(if imm > self.avg { 0.2 } else { 0.5 });
@@ -208,7 +243,10 @@ impl ReactiveLevel {
         if self.long_avg < 0.001 {
             (1.0, 1.0)
         } else {
-            (imm / self.long_avg, self.avg / self.long_avg)
+            (
+                finite_or_zero(imm / self.long_avg),
+                finite_or_zero(self.avg / self.long_avg),
+            )
         }
     }
 }
@@ -234,6 +272,21 @@ mod tests {
             lp.process(1.0);
         }
         assert!((lp.value() - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn one_pole_and_asym_env_recover_from_nan() {
+        let mut lp = OnePole::new(0.5);
+        assert_eq!(lp.process(f32::NAN), 0.0);
+        lp.state = f32::NAN;
+        assert!(lp.process(1.0).is_finite());
+        assert!(lp.process(1.0).is_finite());
+
+        let mut env = AsymEnv::new(8.0, 250.0, 256.0 / 48_000.0);
+        assert_eq!(env.process(f32::NAN), 0.0);
+        env.state = f32::NAN;
+        assert!(env.process(1.0).is_finite());
+        assert!(env.process(0.0).is_finite());
     }
 
     #[test]

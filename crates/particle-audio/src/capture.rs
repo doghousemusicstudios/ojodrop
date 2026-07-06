@@ -30,6 +30,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig};
 use rtrb::Producer;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::{AudioError, CaptureFrame};
 
@@ -127,7 +129,11 @@ pub struct Capture {
 /// Start capturing into `producer`, selecting the source per `cfg` (spec §2).
 ///
 /// On success returns a [`Capture`] whose `stream` is already `play()`-ing.
-pub fn start(producer: Producer<CaptureFrame>, cfg: CaptureConfig) -> Result<Capture, AudioError> {
+pub fn start(
+    producer: Producer<CaptureFrame>,
+    cfg: CaptureConfig,
+    running: Arc<AtomicBool>,
+) -> Result<Capture, AudioError> {
     let host = cpal::default_host();
 
     if cfg.prefer_loopback {
@@ -138,7 +144,13 @@ pub fn start(producer: Producer<CaptureFrame>, cfg: CaptureConfig) -> Result<Cap
             // fails, surface the error rather than silently dropping to the mic —
             // the operator chose loopback and should know it broke. (`producer` is
             // moved into the stream on success or consumed on a build failure.)
-            return open_input_device(&device, name, CaptureSource::VirtualDevice, producer);
+            return open_input_device(
+                &device,
+                name,
+                CaptureSource::VirtualDevice,
+                producer,
+                running,
+            );
         }
         log::debug!(
             "particle-audio: no virtual loopback device found \
@@ -154,11 +166,11 @@ pub fn start(producer: Producer<CaptureFrame>, cfg: CaptureConfig) -> Result<Cap
         };
 
         // --- Fallback rung 3: default input device (mic / line-in) ---
-        return open_default_input(&host, producer);
+        return open_default_input(&host, producer, running);
     }
 
     // prefer_loopback unset: original behavior, default input device only.
-    open_default_input(&host, producer)
+    open_default_input(&host, producer, running)
 }
 
 /// Attempt the platform-native system-loopback path.
@@ -261,13 +273,14 @@ fn device_name(device: &cpal::Device) -> Option<String> {
 fn open_default_input(
     host: &cpal::Host,
     producer: Producer<CaptureFrame>,
+    running: Arc<AtomicBool>,
 ) -> Result<Capture, AudioError> {
     let device = host
         .default_input_device()
         .ok_or(AudioError::NoInputDevice)?;
     let name = device_name(&device).unwrap_or_else(|| "<unknown input device>".to_string());
 
-    open_input_device(&device, name, CaptureSource::Microphone, producer)
+    open_input_device(&device, name, CaptureSource::Microphone, producer, running)
 }
 
 /// Build + start a cpal input stream on `device`, tagging it with `source`.
@@ -281,6 +294,7 @@ fn open_input_device(
     device_name: String,
     source: CaptureSource,
     producer: Producer<CaptureFrame>,
+    running: Arc<AtomicBool>,
 ) -> Result<Capture, AudioError> {
     // Read the *actual* device config (spec §2): many loopback/virtual devices run
     // at 44.1k/96k and have 2+ channels — never assume 48k stereo.
@@ -299,7 +313,7 @@ fn open_input_device(
         source.label()
     );
 
-    let stream = build_stream(device, &config, sample_format, channels, producer)?;
+    let stream = build_stream(device, &config, sample_format, channels, producer, running)?;
     stream
         .play()
         .map_err(|e| AudioError::Stream(e.to_string()))?;
@@ -322,10 +336,11 @@ fn build_stream(
     sample_format: SampleFormat,
     channels: u16,
     producer: Producer<CaptureFrame>,
+    running: Arc<AtomicBool>,
 ) -> Result<Stream, AudioError> {
     macro_rules! build {
         ($t:ty) => {
-            build_typed::<$t>(device, config, channels, producer)
+            build_typed::<$t>(device, config, channels, producer, running)
         };
     }
     match sample_format {
@@ -347,6 +362,7 @@ fn build_typed<T>(
     config: &StreamConfig,
     channels: u16,
     mut producer: Producer<CaptureFrame>,
+    running: Arc<AtomicBool>,
 ) -> Result<Stream, AudioError>
 where
     T: Sample + cpal::SizedSample + Send + 'static,
@@ -366,7 +382,14 @@ where
             let mut left = 0.0f32;
             let mut right = 0.0f32;
             for (i, &s) in frame.iter().enumerate() {
-                let sample = f32::from_sample(s);
+                let sample = {
+                    let value = f32::from_sample(s);
+                    if value.is_finite() {
+                        value
+                    } else {
+                        0.0
+                    }
+                };
                 if i == 0 {
                     left = sample;
                 } else if i == 1 {
@@ -382,8 +405,9 @@ where
         }
     };
 
-    let err_cb = |err: cpal::Error| {
+    let err_cb = move |err: cpal::Error| {
         log::error!("particle-audio: capture stream error: {err}");
+        running.store(false, Ordering::Relaxed);
     };
 
     device

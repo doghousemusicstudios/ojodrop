@@ -65,7 +65,11 @@ fn matches_butterchurn_js_reference_for_fixture_frame() {
     // vol / vol_att are the band means.
     let want_vol = (want_bass + want_mid + want_treb) / 3.0;
     let want_vol_att = (want_bass_att + want_mid_att + want_treb_att) / 3.0;
-    assert!(rel(out.vol, want_vol) < 2e-3, "vol {} != {want_vol}", out.vol);
+    assert!(
+        rel(out.vol, want_vol) < 2e-3,
+        "vol {} != {want_vol}",
+        out.vol
+    );
     assert!(
         rel(out.vol_att, want_vol_att) < 2e-3,
         "vol_att {} != {want_vol_att}",

@@ -33,7 +33,7 @@ float3 uv2 = mul(float3((uv-.5)*MinDistB(uv),MinDistB(uv))/myzoom,RotMat)+CamPos
 float focus = sat(abs(GetDistB2(uv)-dist_c)*1+.2);
 float struc2 = GetBlurX(uv,focus).r;
 ret = float3(struc2, focus, dist);"#;
-    
+
     println!("All-before _ex (comp shader):");
     match particle_milkdrop_converter_sys::convert_milk_shader_ex(before_raw, inner, true) {
         Ok(g) => println!("OK ({} chars):\n{}", g.len(), &g[..g.len().min(300)]),
