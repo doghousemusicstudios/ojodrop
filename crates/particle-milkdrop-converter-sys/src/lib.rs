@@ -1,4 +1,16 @@
-// Safe Rust wrapper around the milk_converter_shim C-ABI.
+//! Safe Rust wrapper around the `milk_converter_shim` C ABI.
+//!
+//! Untrusted shader text is never passed to the legacy C++ libraries in the
+//! calling process. Public conversion requests use a bounded, one-shot helper
+//! subprocess. Embedders must either package `particle-milkdrop-converter-helper`
+//! beside their executable, set [`HELPER_PATH_ENV`] to its exact path, or use
+//! [`register_current_executable_as_helper`] and service
+//! [`current_executable_helper_mode`] before normal application startup.
+//!
+//! Helper resolution is deterministic: an explicitly set [`HELPER_PATH_ENV`]
+//! is authoritative, then a registered self-host is used, then an adjacent
+//! dedicated helper is tried. An empty/invalid explicit path is an error rather
+//! than permission to fall through, and there is no in-process fallback.
 //
 // Primary entry points:
 //   convert_milk_shader(hlsl_body) -> Result<String, String>
@@ -9,10 +21,17 @@
 //   convert_milk_shader_raw(hlsl_body, optimize) -> Result<String, String>
 //     Returns the full GLSL ES 3.00 program string without post-processing.
 
-/// `true` when this build linked the native converter (hlsl2glslfork +
-/// glsl-optimizer). When `false`, the conversion entry points return `Err` and
-/// the host should fall back to the JSON-only path. Lets callers surface a
-/// clear "converter unavailable in this build" message instead of guessing.
+mod containment;
+
+pub use containment::{
+    current_executable_helper_mode, helper_available, register_current_executable_as_helper,
+    run_converter_helper_stdio, CONVERTER_TIMEOUT, CURRENT_EXE_HELPER_ARG, HELPER_PATH_ENV,
+    MAX_CONVERTER_INPUT_BYTES, MAX_CONVERTER_OUTPUT_BYTES,
+};
+
+/// `true` when this crate linked the native converter payload
+/// (hlsl2glslfork + glsl-optimizer). This only describes the helper payload;
+/// use [`helper_available`] to check whether a runnable helper is configured.
 pub const NATIVE_CONVERTER_AVAILABLE: bool = cfg!(milk_converter_native);
 
 #[cfg(milk_converter_native)]
@@ -50,7 +69,7 @@ pub fn convert_milk_shader(hlsl_body: &str) -> Result<String, String> {
 /// Convert to GLSL ES 3.00 without post-processing.  `optimize` controls
 /// whether glsl-optimizer is run on the hlsl2glsl output.
 pub fn convert_milk_shader_raw(hlsl_body: &str, optimize: bool) -> Result<String, String> {
-    call_c_convert(None, hlsl_body, optimize)
+    containment::convert(None, hlsl_body, optimize)
 }
 
 /// Like [`convert_milk_shader`] but accepts the pre-`shader_body` file-scope
@@ -63,15 +82,29 @@ pub fn convert_milk_shader_ex(
     body_inner: &str,
     optimize: bool,
 ) -> Result<String, String> {
-    let glsl_es300 = call_c_convert(Some(file_globals), body_inner, optimize)?;
+    let glsl_es300 = containment::convert(Some(file_globals), body_inner, optimize)?;
     Ok(process_native_glsl(&glsl_es300))
 }
 
-/// Stub used when the crate was built without the native converter (sources
-/// absent at build time). Keeps the crate linkable with no C++ dependency; the
-/// host falls back to JSON-only ingestion.
+/// Process exit code implied by one native-converter smoke result: `0` on
+/// success, `1` on failure.
+///
+/// The smoke example (`src/test_main.rs`) exits with this so a printed `FAIL`
+/// propagates a nonzero status. Without it, a broken native conversion still
+/// exited `0`, letting CI and release smoke gates go green while conversion was
+/// silently broken.
+pub fn smoke_result_exit_code(result: &Result<String, String>) -> i32 {
+    match result {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Stub used by the helper process when this crate was built without the native
+/// converter sources. This function is deliberately private: the host-facing
+/// API must never silently fall back to loading legacy C++ in process.
 #[cfg(not(milk_converter_native))]
-fn call_c_convert(
+fn call_c_convert_in_process(
     _file_globals: Option<&str>,
     _hlsl_body: &str,
     _optimize: bool,
@@ -85,7 +118,7 @@ fn call_c_convert(
 }
 
 #[cfg(milk_converter_native)]
-fn call_c_convert(
+fn call_c_convert_in_process(
     file_globals: Option<&str>,
     hlsl_body: &str,
     optimize: bool,
@@ -334,4 +367,25 @@ fn find_simple_assign(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke_failure_exits_nonzero_and_success_exits_zero() {
+        // Success must gate green (exit 0).
+        assert_eq!(
+            smoke_result_exit_code(&Ok("ret = float3(0);".to_string())),
+            0
+        );
+        // Any failure must gate red (nonzero, specifically 1) so a printed FAIL
+        // fails CI and release smoke gates instead of exiting 0.
+        assert_eq!(
+            smoke_result_exit_code(&Err("converter rejected shader".to_string())),
+            1
+        );
+        assert_ne!(smoke_result_exit_code(&Err(String::new())), 0);
+    }
 }

@@ -21,6 +21,8 @@ log.workspace = true
 naga = { version = "29.0.3", features = ["glsl-in", "wgsl-out"] }
 serde.workspace = true
 serde_json.workspace = true
+rayon = "1.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # App/binary-only deps — windowing, the pollster block-on used by the windowed
 # init path, env_logger, live mic capture, and headless PNG export. Optional so
 # the renderer can be consumed as a window-free library (see the `app` feature).
@@ -31,19 +33,25 @@ particle-audio = { workspace = true, optional = true }
 png = { version = "0.18", optional = true }
 particle-milkdrop-converter-sys = { path = "../particle-milkdrop-converter-sys", optional = true }
 
-# The native in-process .milk → GLSL converter is ON by default so the OjoDrop
-# app "just works" when a raw .milk is dropped, with no external tooling. The
-# sys-crate degrades to a no-op stub when the upstream C++ sources are absent at
-# build time (see particle-milkdrop-converter-sys/build.rs), so this never makes
-# the C++ toolchain a hard build requirement. For a lean / JSON-only build (e.g.
-# engine devs who don't want the converter), use `--no-default-features`.
+# The native .milk → GLSL converter is ON by default. OjoDrop self-hosts its
+# bounded one-shot helper mode, so raw .milk works without a separately
+# installed tool while legacy C++ never processes shader text in the long-lived
+# app process. The sys-crate degrades to a stub when upstream sources are absent
+# at build time. For a lean / JSON-only build, use `--no-default-features`.
 [features]
 default = ["milk-native-converter", "app"]
 milk-native-converter = ["dep:particle-milkdrop-converter-sys"]
 # The standalone OjoDrop application layer: a winit window, the pollster block-on
 # used to init it, env_logger, live mic audio (particle-audio), and headless PNG
 # export (png). Library consumers (particle-core, particle-demo) omit this.
-app = ["dep:winit", "dep:pollster", "dep:env_logger", "dep:particle-audio", "dep:png"]
+app = [
+    "dep:winit",
+    "dep:pollster",
+    "dep:env_logger",
+    "dep:particle-audio",
+    "particle-audio/capture",
+    "dep:png",
+]
 
 # macOS .app packaging via `cargo bundle --release` (`cargo install cargo-bundle`).
 # A hand-rolled equivalent that needs no extra tooling lives at
@@ -56,7 +64,7 @@ short_description = "Drop a MilkDrop preset, watch it play."
 long_description = """
 OjoDrop is a native Rust + wgpu MilkDrop / Butterchurn preset player. Drag a
 .milk or .json preset onto the window and it renders live, reacting to your mic.
-The .milk → GLSL converter is baked in.
+The .milk → GLSL converter runs in an isolated one-shot helper subprocess.
 """
 category = "public.app-category.entertainment"
 osx_minimum_system_version = "11.0"

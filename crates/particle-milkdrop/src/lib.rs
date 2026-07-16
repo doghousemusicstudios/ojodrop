@@ -18,7 +18,8 @@
 //!   GLSL bodies) to the same `MilkShaders`.
 //! - [`fallback_preset`] — a known-good passthrough preset, used as a graceful
 //!   fallback when an untrusted file fails to load or compile.
-//! - [`native_converter_available`] — whether this build can ingest raw `.milk`.
+//! - [`native_converter_available`] — whether this process has a runnable,
+//!   isolated helper for raw `.milk` ingestion.
 //!
 //! Lower-level modules ([`parse_milk`], [`load_json`], [`preprocess`],
 //! [`equations`], [`renderer`]) are public for advanced consumers but most callers
@@ -26,36 +27,59 @@
 
 pub mod equations;
 pub mod load_json;
+pub mod named_textures;
 pub mod parse_milk;
 pub mod preprocess;
 pub mod renderer;
 
 use std::path::Path;
 
+pub use named_textures::{
+    NamedSamplerBinding, NamedTextureArray, NamedTextureAtlas, NamedTextureConfig,
+    NamedTexturePlan, NamedTextureResolver, NamedTextureSource, ResolvedNamedTexture,
+    SamplerAddressMode, SamplerFilterMode, DEFAULT_NAMED_TEXTURE_LAYER_SIZE,
+    MAX_NAMED_TEXTURE_LAYERS, NAMED_TEXTURE_ATLAS_GRID, NAMED_TEXTURE_ATLAS_GUTTER,
+};
 pub use parse_milk::{parse, CustomWaveDef, MilkShaders, ShapeBaseVals, ShapeCode};
 pub use renderer::{
     compile_glsl, compile_milkdrop_shader_bodies, compile_milkdrop_shader_bodies_from_parts,
-    CompiledMilkdropShaderBodies, MilkdropRenderer,
+    CompiledMilkdropShaderBodies, DimensionError, MilkdropRenderer, MilkdropResizeDebouncer,
+    INTERACTIVE_RESIZE_DEBOUNCE,
 };
 
-/// Whether this build can ingest raw `.milk` presets — i.e. the native
-/// HLSL→GLSL converter (hlsl2glslfork + glsl-optimizer) was compiled and linked.
+/// Whether this process can ingest raw `.milk` presets through the isolated
+/// HLSL→GLSL helper (hlsl2glslfork + glsl-optimizer).
 ///
 /// When `false`, only pre-converted `.json` presets load; a dropped `.milk`
 /// should report that the converter is unavailable rather than rendering a blank.
-/// This is `true` only when the `milk-native-converter` feature is enabled **and**
-/// the C++ sources were present at build time (the sys-crate degrades to a stub
-/// otherwise — see `particle-milkdrop-converter-sys`).
+/// This runtime probe is `true` only when the `milk-native-converter` feature is
+/// enabled and a helper with the C++ payload can be launched successfully.
 pub fn native_converter_available() -> bool {
     #[cfg(feature = "milk-native-converter")]
     {
-        particle_milkdrop_converter_sys::NATIVE_CONVERTER_AVAILABLE
+        particle_milkdrop_converter_sys::helper_available()
     }
     #[cfg(not(feature = "milk-native-converter"))]
     {
         false
     }
 }
+
+/// Release invariant (P2-VIS-040): the `milk-native-converter` feature is what the
+/// package metadata (`Cargo.toml` `[package.metadata.bundle]`) and the crate docs
+/// advertise as raw `.milk` support. Enabling that feature MUST link the converter
+/// sys crate and keep its capability marker reachable — otherwise the crate would
+/// advertise raw `.milk` while silently shipping JSON-only behavior.
+///
+/// Referencing the sys crate's compile-time marker here makes the wiring a hard
+/// build requirement: drop the `particle-milkdrop-converter-sys` dependency (or its
+/// wiring) while leaving the advertised feature enabled and this fails to compile,
+/// instead of degrading to a silent JSON-only ship. The runtime half of the
+/// invariant (the advertised capability tracks the actual converter) is asserted by
+/// `converter_availability_invariant::converter_availability_matches_feature_wiring`.
+#[cfg(feature = "milk-native-converter")]
+const _MILK_NATIVE_CONVERTER_WIRED: bool =
+    particle_milkdrop_converter_sys::NATIVE_CONVERTER_AVAILABLE;
 
 /// Load a preset from a string, dispatching on `is_json`:
 /// `true` → the Butterchurn converted-JSON loader (GLSL shader bodies);
@@ -100,4 +124,41 @@ pub fn load_preset_path(path: &Path) -> Result<MilkShaders, String> {
 /// renders as a plain feedback passthrough rather than crashing.
 pub fn fallback_preset() -> MilkShaders {
     parse_milk::parse("")
+}
+
+#[cfg(test)]
+mod converter_availability_invariant {
+    //! P2-VIS-040: the advertised raw-`.milk` capability must match the actual
+    //! converter wiring. The crate must never silently ship JSON-only behavior while
+    //! its package metadata / docs promise raw `.milk` support via the
+    //! `milk-native-converter` feature.
+
+    #[test]
+    fn converter_availability_matches_feature_wiring() {
+        // Without the advertised feature (a lean / JSON-only build), the runtime
+        // probe MUST report the converter as unavailable, so a dropped `.milk` is
+        // refused rather than silently rendered blank while claiming support.
+        #[cfg(not(feature = "milk-native-converter"))]
+        {
+            assert!(
+                !crate::native_converter_available(),
+                "a JSON-only build (no milk-native-converter feature) must report \
+                 native_converter_available() == false"
+            );
+        }
+
+        // With the advertised feature on, the runtime capability MUST be delegated to
+        // the converter sys crate (not hardcoded/faked), so the metadata's raw-`.milk`
+        // promise tracks the real, linked converter and cannot silently drift to
+        // JSON-only.
+        #[cfg(feature = "milk-native-converter")]
+        {
+            assert_eq!(
+                crate::native_converter_available(),
+                particle_milkdrop_converter_sys::helper_available(),
+                "native_converter_available() must delegate to the converter sys \
+                 crate; the advertised raw-.milk feature is not actually wired"
+            );
+        }
+    }
 }

@@ -10,7 +10,14 @@
 // one line of shader code. We reassemble them in order and strip the outer
 // `shader_body { }` wrapper to get just the inner body code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// MilkDrop addresses exactly 4 custom waveforms and 4 custom shapes (slots
+/// 0..=3). Higher indices are not renderable, so an attacker-controlled sparse
+/// high slot index is ignored — matching MilkDrop/Butterchurn — rather than
+/// widening the parse. Bounding the slot count also bounds the indexed-key parse.
+const MAX_CUSTOM_WAVES: u32 = 4;
+const MAX_CUSTOM_SHAPES: u32 = 4;
 
 pub struct MilkShaders {
     pub warp: Option<String>,
@@ -29,6 +36,8 @@ pub struct MilkShaders {
     pub decay: f32,
     /// brightness exponent; default 2.0
     pub gamma_adj: f32,
+    /// Authored composite-shader hue weighting (`fShader`); default 0.0.
+    pub fshader: f32,
 
     // ── Video echo (in-comp-shader feedback look) ─────────────────────────────
     pub echo_zoom: f32,   // fVideoEchoZoom,        default 2.0
@@ -243,6 +252,7 @@ pub fn parse(content: &str) -> MilkShaders {
         per_pixel: extract_per_pixel(content),
         decay: parse_float(content, "fDecay", 0.98),
         gamma_adj: parse_float(content, "fGammaAdj", 2.0),
+        fshader: parse_float(content, "fShader", 0.0),
 
         echo_zoom: parse_float(content, "fVideoEchoZoom", 2.0),
         echo_alpha: parse_float(content, "fVideoEchoAlpha", 0.0),
@@ -340,13 +350,34 @@ fn parse_float(content: &str, key: &str, default: f32) -> f32 {
         let key_lc = key.to_ascii_lowercase();
         if let Some(rest) = lc.strip_prefix(&key_lc) {
             if let Some(val) = rest.strip_prefix('=') {
-                if let Ok(v) = val.trim().parse::<f32>() {
+                if let Some(v) = parse_finite_f32(val, key) {
                     return v;
                 }
             }
         }
     }
     default
+}
+
+/// Parse a numeric field value from raw `.milk` text, rejecting non-finite results.
+///
+/// Rust's `f32` parser accepts `inf`/`-inf`/`nan` and silently overflows an
+/// out-of-range exponent (`1e999`) to `±inf`. A raw `.milk` is untrusted input, and
+/// such a poisoned value must never flow downstream into the renderer's uniforms
+/// (an `inf`/`nan` in a transform or color scalar corrupts the whole frame). Returns
+/// `None` for unparseable OR non-finite input; the caller then keeps its default.
+/// A present-but-non-finite value is logged as a diagnostic; ordinary non-numeric
+/// text is skipped silently (the scan simply moves on).
+fn parse_finite_f32(raw: &str, key: &str) -> Option<f32> {
+    let s = raw.trim();
+    match s.parse::<f32>() {
+        Ok(v) if v.is_finite() => Some(v),
+        Ok(_) => {
+            log::warn!("ignoring non-finite value `{s}` for `{key}` in .milk preset");
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 fn extract_per_frame(content: &str) -> Option<String> {
@@ -419,6 +450,11 @@ fn collect_numbered_eel(content: &str, prefix: &str) -> Option<String> {
             continue;
         }
         let rest = &line[prefix.len()..];
+        // Custom wave/shape equations exist in both `per_frame1` and
+        // `per_frame_1` spellings across the corpus. Callers whose prefix
+        // already ends in `_` are unaffected; otherwise accept the optional
+        // separator before the numeric index.
+        let rest = rest.strip_prefix('_').unwrap_or(rest);
         // rest is like "3=code" (the trailing index then '=')
         let eq = match rest.find('=') {
             Some(e) => e,
@@ -463,6 +499,7 @@ fn collect_per_frame_no_init(content: &str, prefix: &str) -> Option<String> {
         if rest.starts_with("_init") {
             continue;
         }
+        let rest = rest.strip_prefix('_').unwrap_or(rest);
         let eq = match rest.find('=') {
             Some(e) => e,
             None => continue,
@@ -479,38 +516,58 @@ fn collect_per_frame_no_init(content: &str, prefix: &str) -> Option<String> {
     Some(lines.values().cloned().collect::<Vec<_>>().join("\n"))
 }
 
-/// Read a per-shape / per-wave scalar key like `shapecode_0_rad`. Case-insensitive
-/// on the field name. Returns None if absent.
-fn parse_key_opt(content: &str, key: &str) -> Option<f32> {
-    let key_lc = key.to_ascii_lowercase();
+/// Single pass over `content`: bucket every `<family><slot>_<field>=<value>`
+/// scalar line into `slot → (field → value)`. Case-insensitive on the whole key
+/// (MilkDrop writes mixed case). Slots at or beyond `max_slots` are dropped, so a
+/// sparse attacker-controlled high index costs nothing. First occurrence of a
+/// field wins (matching the previous first-match `parse_key_opt`). A slot is
+/// `Some` iff at least one `<family><slot>_…` line was present, reproducing the old
+/// presence gate. This replaces the previous O(slots × fields × lines) brute-force
+/// rescans (one full `content.lines()` scan per candidate key per slot) with a
+/// single O(lines) pass.
+fn collect_indexed_scalars(
+    content: &str,
+    family: &str,
+    max_slots: u32,
+) -> Vec<Option<HashMap<String, f32>>> {
+    let mut slots: Vec<Option<HashMap<String, f32>>> = (0..max_slots).map(|_| None).collect();
+    let family_lc = family.to_ascii_lowercase();
     for line in content.lines() {
         let lc = line.to_ascii_lowercase();
-        if let Some(rest) = lc.strip_prefix(&key_lc) {
-            if let Some(val) = rest.strip_prefix('=') {
-                if let Ok(v) = val.trim().parse::<f32>() {
-                    return Some(v);
-                }
-            }
+        let Some(rest) = lc.strip_prefix(&family_lc) else {
+            continue;
+        };
+        // rest is "<slot>_<field>=<value>"; split the slot on the FIRST '_' so a
+        // field that itself contains '_' (num_inst, tex_ang, border_r…) is intact.
+        let Some(us) = rest.find('_') else { continue };
+        let Ok(slot) = rest[..us].parse::<u32>() else {
+            continue;
+        };
+        if slot >= max_slots {
+            continue; // enforce the real MilkDrop slot limit
+        }
+        let map = slots[slot as usize].get_or_insert_with(HashMap::new);
+        let after = &rest[us + 1..];
+        let Some(eq) = after.find('=') else { continue };
+        let field = &after[..eq];
+        if let Some(v) = parse_finite_f32(&after[eq + 1..], field) {
+            map.entry(field.to_string()).or_insert(v); // first-match wins
         }
     }
-    None
+    slots
 }
 
 fn parse_shapes(content: &str) -> Vec<ShapeCode> {
+    let slots = collect_indexed_scalars(content, "shapecode_", MAX_CUSTOM_SHAPES);
     let mut out = Vec::new();
-    for i in 0..4u32 {
-        let pfx = format!("shapecode_{i}_");
-        // Was any shapecode_i_* key present at all?
-        let lc_pfx = pfx.to_ascii_lowercase();
-        let present = content
-            .lines()
-            .any(|l| l.to_ascii_lowercase().starts_with(&lc_pfx));
-        if !present {
-            continue;
-        }
+    for (i, fields) in slots.into_iter().enumerate() {
+        let Some(fields) = fields else { continue };
+        let i = i as u32;
 
         let mut base = ShapeBaseVals::default();
-        let g = |field: &str| parse_key_opt(content, &format!("{pfx}{field}"));
+        // Field names are lowercased in the slot map; lowercase the lookup to keep
+        // the previous case-insensitive matching.
+        let g = |field: &str| fields.get(&field.to_ascii_lowercase()).copied();
         if let Some(v) = g("enabled") {
             base.enabled = v as i32;
         }
@@ -602,22 +659,19 @@ fn parse_shapes(content: &str) -> Vec<ShapeCode> {
 }
 
 fn parse_waves(content: &str) -> Vec<CustomWaveDef> {
+    let slots = collect_indexed_scalars(content, "wavecode_", MAX_CUSTOM_WAVES);
     let mut out = Vec::new();
-    for n in 0..4u32 {
-        let pfx = format!("wavecode_{n}_");
-        let lc_pfx = pfx.to_ascii_lowercase();
-        let present = content
-            .lines()
-            .any(|l| l.to_ascii_lowercase().starts_with(&lc_pfx));
-        if !present {
-            continue;
-        }
+    for (n, fields) in slots.into_iter().enumerate() {
+        let Some(fields) = fields else { continue };
+        let n = n as u32;
 
         let mut w = CustomWaveDef {
             index: n,
             ..Default::default()
         };
-        let g = |field: &str| parse_key_opt(content, &format!("{pfx}{field}"));
+        // Field names are lowercased in the slot map; lowercase the lookup to keep
+        // the previous case-insensitive matching.
+        let g = |field: &str| fields.get(&field.to_ascii_lowercase()).copied();
         if let Some(v) = g("enabled") {
             w.enabled = v != 0.0;
         }
@@ -709,12 +763,20 @@ fn extract_section(content: &str, prefix: &str) -> Option<String> {
     // sees them at file scope. The old prefix/suffix strip silently no-oped the
     // prefix strips when globals were present but still chopped the trailing `}`,
     // leaving `shader_body` and `{` embedded with the closing brace gone.
-    match trimmed.find("shader_body") {
+    //
+    // Uses the shared comment-/string-/token-aware scanner (see preprocess) so a
+    // `shader_body` substring inside a comment, string, or larger identifier — or a
+    // brace inside a block comment — never confuses the wrapper extraction.
+    match crate::preprocess::find_shader_body_keyword(trimmed) {
         Some(pos) => {
             let before = trimmed[..pos].trim_end();
             let after_kw = trimmed[pos + "shader_body".len()..].trim_start();
-            let inner = match after_kw.strip_prefix('{') {
-                Some(body_src) => strip_to_matching_brace(body_src).trim().to_string(),
+            let inner = match crate::preprocess::find_code_byte(after_kw, b'{') {
+                Some(open) => {
+                    let body_src = &after_kw[open + 1..];
+                    let end = crate::preprocess::scan_to_matching_brace(body_src);
+                    body_src[..end].trim().to_string()
+                }
                 // No `{` after the token — nothing sane to strip; keep as-is.
                 None => after_kw.to_string(),
             };
@@ -730,33 +792,114 @@ fn extract_section(content: &str, prefix: &str) -> Option<String> {
     }
 }
 
-/// Return everything up to (but excluding) the `}` that closes depth 0, given a
-/// string that begins just AFTER an opening `{` (depth starts at 1). Skips `//`
-/// line comments. If no matching close is found, returns the whole input.
-fn strip_to_matching_brace(src: &str) -> &str {
-    let bytes = src.as_bytes();
-    let mut depth: i32 = 1;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &src[..i];
-                }
-                i += 1;
-            }
-            _ => i += 1,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── P2-VIS-013: bounded, single-pass indexed-key parsing ─────────────────
+
+    #[test]
+    fn wave_slot_index_beyond_limit_is_ignored() {
+        // Slot 0 is in range; slot 7 exceeds MAX_CUSTOM_WAVES (4) and must be
+        // dropped, so an attacker-controlled sparse high index never allocates a
+        // slot. The whole preset is bucketed in a single O(lines) pass.
+        let content = "\
+wavecode_0_enabled=1
+wavecode_0_sep=120
+wavecode_7_enabled=1
+wavecode_7_sep=99
+";
+        let waves = parse_waves(content);
+        assert_eq!(waves.len(), 1, "only the in-range slot parses");
+        assert_eq!(waves[0].index, 0);
+        assert!(waves[0].enabled);
     }
-    src
+
+    #[test]
+    fn shape_slot_index_beyond_limit_is_ignored() {
+        let content = "shapecode_0_enabled=1\nshapecode_9_enabled=1\n";
+        let shapes = parse_shapes(content);
+        assert_eq!(shapes.len(), 1);
+    }
+
+    #[test]
+    fn sparse_in_range_wave_slot_parses() {
+        // Only slot 2 present (0/1 absent) → exactly one wave at index 2.
+        let content = "wavecode_2_enabled=1\nwavecode_2_samples=64\n";
+        let waves = parse_waves(content);
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].index, 2);
+        assert_eq!(waves[0].samples, 64);
+    }
+
+    #[test]
+    fn field_name_with_underscore_survives_slot_split() {
+        // The slot is split on the FIRST '_'; a field that itself contains '_'
+        // (num_inst here) must stay intact.
+        let content = "shapecode_0_enabled=1\nshapecode_0_num_inst=5\n";
+        let shapes = parse_shapes(content);
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].base.num_inst, 5);
+    }
+
+    // ── P2-VIS-011: numeric custom-wave sep preserved through this crate ─────
+
+    #[test]
+    fn custom_wave_sep_120_survives_parse() {
+        // A numeric sep of 120 must NOT collapse to a boolean 1. The milkdrop
+        // crate's schema keeps `sep` as i32 and parse preserves it end-to-end
+        // through this crate's own path (.milk → MilkShaders → renderer runtime).
+        let content = "wavecode_0_enabled=1\nwavecode_0_sep=120\n";
+        let waves = parse_waves(content);
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].sep, 120, "numeric sep was coerced (expected 120)");
+
+        // …and through the public parse() entry point.
+        let shaders = parse(content);
+        assert_eq!(shaders.waves[0].sep, 120);
+    }
+
+    #[test]
+    fn fshader_parses_case_insensitively_and_defaults_to_zero() {
+        assert_eq!(parse("").fshader, 0.0);
+        assert!((parse("FsHaDeR=0.600\n").fshader - 0.6).abs() < 1.0e-6);
+    }
+
+    // ── P1-044: finite validation on raw .milk numeric ingress ───────────────
+
+    #[test]
+    fn non_finite_numeric_fields_are_rejected_to_default() {
+        // `1e999` overflows f32 to +inf; `nan` / `-inf` parse directly. None of
+        // these may reach the renderer's uniforms — each scalar key falls back to
+        // its field default instead of flowing downstream as a non-finite value.
+        let overflow = parse("zoom=1e999\n");
+        assert!(overflow.zoom.is_finite(), "1e999 must not survive as inf");
+        assert_eq!(
+            overflow.zoom, 1.0,
+            "overflow falls back to the zoom default"
+        );
+
+        let nan = parse("fDecay=nan\n");
+        assert!(nan.decay.is_finite());
+        assert_eq!(nan.decay, 0.98, "nan falls back to the fDecay default");
+
+        let neg_inf = parse("rot=-inf\n");
+        assert!(neg_inf.rot.is_finite());
+        assert_eq!(neg_inf.rot, 0.0, "-inf falls back to the rot default");
+
+        // Indexed-scalar ingress (shape/wave fields) rejects non-finite too: an
+        // inf shape field is dropped, leaving that field at its default.
+        let shape = parse("shapecode_0_enabled=1\nshapecode_0_x=1e999\n");
+        assert_eq!(shape.shapes.len(), 1);
+        assert!(
+            shape.shapes[0].base.x.is_finite(),
+            "inf shape field must be rejected"
+        );
+        assert_eq!(shape.shapes[0].base.x, 0.5, "rejected → shape x default");
+
+        // A finite value in the same fields still parses (no false positives).
+        let ok = parse("zoom=1.5\nshapecode_0_enabled=1\nshapecode_0_x=0.25\n");
+        assert_eq!(ok.zoom, 1.5);
+        assert_eq!(ok.shapes[0].base.x, 0.25);
+    }
 }

@@ -1,4 +1,10 @@
 fn main() {
+    if let Some(code) = particle_milkdrop_converter_sys::current_executable_helper_mode() {
+        std::process::exit(code);
+    }
+    particle_milkdrop_converter_sys::register_current_executable_as_helper()
+        .expect("register smoke-test executable as converter helper");
+
     // Test xtramartin (1) comp shader: ALL before as file_globals, real inner
     let before_raw = "#define sat saturate
 static const float2 pix = texsize.zw;
@@ -35,8 +41,15 @@ float struc2 = GetBlurX(uv,focus).r;
 ret = float3(struc2, focus, dist);"#;
 
     println!("All-before _ex (comp shader):");
-    match particle_milkdrop_converter_sys::convert_milk_shader_ex(before_raw, inner, true) {
+    let result = particle_milkdrop_converter_sys::convert_milk_shader_ex(before_raw, inner, true);
+    match &result {
         Ok(g) => println!("OK ({} chars):\n{}", g.len(), &g[..g.len().min(300)]),
         Err(e) => println!("FAIL: {}", e.lines().take(5).collect::<Vec<_>>().join("\n")),
     }
+
+    // A printed FAIL must exit nonzero so CI and release smoke gates truly gate
+    // (they went green on a broken conversion when this always returned/exited 0).
+    std::process::exit(particle_milkdrop_converter_sys::smoke_result_exit_code(
+        &result,
+    ));
 }
