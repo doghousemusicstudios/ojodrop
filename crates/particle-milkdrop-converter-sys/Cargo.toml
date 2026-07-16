@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 links = "milk_converter_shim"
 
+[[bin]]
+name = "particle-milkdrop-converter-helper"
+path = "src/helper_main.rs"
+
 [[example]]
 name = "smoke_test"
 path = "src/test_main.rs"

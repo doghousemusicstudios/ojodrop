@@ -31,10 +31,11 @@ static const char MILK_HLSL_PREFIX[] =
     "   uniform sampler2D sampler_noise_lq_lite;\n"
     "   uniform sampler2D sampler_noise_mq;\n"
     "   uniform sampler2D sampler_noise_hq;\n"
+    "   uniform sampler2D sampler_named_linear;\n"
     "   uniform sampler3D sampler_noisevol_lq;\n"
     "   uniform sampler3D sampler_noisevol_hq;\n"
     "\n"
-    "   uniform sampler2D sampler_pw_noise_lq;\n"
+    "   uniform sampler2D sampler_named_point;\n"
     "\n"
     "   uniform sampler2D sampler_blur1;\n"
     "   uniform sampler2D sampler_blur2;\n"
@@ -178,92 +179,159 @@ static const char ES300_PREAMBLE[] =
 
 static std::mutex s_hlsl_mutex;
 
+// Own the global hlsl2glsl lifetime and compiler handle so every exceptional
+// path releases both. The legacy library can fail initialization/construction
+// by returning zero/null; neither value is safe to pass to later APIs.
+class HlslCompilerSession {
+public:
+    HlslCompilerSession() : initialized_(false), parser_(nullptr)
+    {
+        if (!Hlsl2Glsl_Initialize())
+            throw std::runtime_error("Hlsl2Glsl_Initialize failed");
+        initialized_ = true;
+        parser_ = Hlsl2Glsl_ConstructCompiler(EShLangFragment);
+        if (!parser_) {
+            Hlsl2Glsl_Shutdown();
+            initialized_ = false;
+            throw std::runtime_error("Hlsl2Glsl_ConstructCompiler returned null");
+        }
+    }
+
+    ~HlslCompilerSession() noexcept
+    {
+        if (parser_)
+            Hlsl2Glsl_DestructCompiler(parser_);
+        if (initialized_)
+            Hlsl2Glsl_Shutdown();
+    }
+
+    HlslCompilerSession(const HlslCompilerSession&) = delete;
+    HlslCompilerSession& operator=(const HlslCompilerSession&) = delete;
+
+    ShHandle parser() const noexcept { return parser_; }
+
+private:
+    bool initialized_;
+    ShHandle parser_;
+};
+
+class GlslOptContext {
+public:
+    explicit GlslOptContext(glslopt_ctx* context) : context_(context) {}
+    ~GlslOptContext() noexcept
+    {
+        if (context_)
+            glslopt_cleanup(context_);
+    }
+    GlslOptContext(const GlslOptContext&) = delete;
+    GlslOptContext& operator=(const GlslOptContext&) = delete;
+    glslopt_ctx* get() const noexcept { return context_; }
+
+private:
+    glslopt_ctx* context_;
+};
+
+class GlslOptShader {
+public:
+    explicit GlslOptShader(glslopt_shader* shader) : shader_(shader) {}
+    ~GlslOptShader() noexcept
+    {
+        if (shader_)
+            glslopt_shader_delete(shader_);
+    }
+    GlslOptShader(const GlslOptShader&) = delete;
+    GlslOptShader& operator=(const GlslOptShader&) = delete;
+    glslopt_shader* get() const noexcept { return shader_; }
+
+private:
+    glslopt_shader* shader_;
+};
+
+static int copy_output(char** out_glsl, const char* text, int result_code) noexcept
+{
+    if (!out_glsl)
+        return 1;
+    *out_glsl = strdup(text ? text : "");
+    return *out_glsl ? result_code : 5;
+}
+
 // Run hlsl2glslfork on a full HLSL program string.
 // Returns the GLSL ES 300 body (with preamble prepended) or throws on failure.
 static std::string hlsl_to_glsl_es300(const std::string& hlsl_program)
 {
     std::lock_guard<std::mutex> guard(s_hlsl_mutex);
+    HlslCompilerSession session;
+    ShHandle parser = session.parser();
 
-    Hlsl2Glsl_Initialize();
-
-    ShHandle parser = Hlsl2Glsl_ConstructCompiler(EShLangFragment);
-    std::string result;
-
-    try {
-        int parse_ok = Hlsl2Glsl_Parse(parser, hlsl_program.c_str(),
-                                        ETargetGLSL_ES_300, nullptr,
-                                        ETranslateOpNone);
-        if (!parse_ok) {
-            const char* log = Hlsl2Glsl_GetInfoLog(parser);
-            throw std::runtime_error(std::string("HLSL parse error: ") + (log ? log : "(null)"));
-        }
-
-        static const EAttribSemantic kSem[] = { EAttrSemTangent };
-        static const char* kSemStr[] = { "TANGENT" };
-        Hlsl2Glsl_SetUserAttributeNames(parser, kSem, kSemStr, 1);
-
-        int translate_ok = Hlsl2Glsl_Translate(parser, "shader_body",
-                                                ETargetGLSL_ES_300,
-                                                ETranslateOpNone);
-        if (!translate_ok) {
-            const char* log = Hlsl2Glsl_GetInfoLog(parser);
-            throw std::runtime_error(std::string("HLSL translate error: ") + (log ? log : "(null)"));
-        }
-
-        std::string glsl = Hlsl2Glsl_GetShader(parser);
-
-        // Check for non-ASCII (same guard as original main.cpp).
-        for (char c : glsl) {
-            if (!isascii(c))
-                throw std::runtime_error("HLSL output contains non-ASCII character");
-        }
-
-        result = std::string(ES300_PREAMBLE) + glsl;
-    } catch (...) {
-        Hlsl2Glsl_DestructCompiler(parser);
-        Hlsl2Glsl_Shutdown();
-        throw;
+    int parse_ok = Hlsl2Glsl_Parse(parser, hlsl_program.c_str(),
+                                    ETargetGLSL_ES_300, nullptr,
+                                    ETranslateOpNone);
+    if (!parse_ok) {
+        const char* log = Hlsl2Glsl_GetInfoLog(parser);
+        throw std::runtime_error(std::string("HLSL parse error: ") + (log ? log : "(null)"));
     }
 
-    Hlsl2Glsl_DestructCompiler(parser);
-    Hlsl2Glsl_Shutdown();
-    return result;
+    static const EAttribSemantic kSem[] = { EAttrSemTangent };
+    static const char* kSemStr[] = { "TANGENT" };
+    Hlsl2Glsl_SetUserAttributeNames(parser, kSem, kSemStr, 1);
+
+    int translate_ok = Hlsl2Glsl_Translate(parser, "shader_body",
+                                            ETargetGLSL_ES_300,
+                                            ETranslateOpNone);
+    if (!translate_ok) {
+        const char* log = Hlsl2Glsl_GetInfoLog(parser);
+        throw std::runtime_error(std::string("HLSL translate error: ") + (log ? log : "(null)"));
+    }
+
+    const char* shader_text = Hlsl2Glsl_GetShader(parser);
+    if (!shader_text)
+        throw std::runtime_error("Hlsl2Glsl_GetShader returned null");
+    std::string glsl(shader_text);
+
+    // Check for non-ASCII (same guard as original main.cpp).
+    for (char c : glsl) {
+        if (!isascii(c))
+            throw std::runtime_error("HLSL output contains non-ASCII character");
+    }
+
+    return std::string(ES300_PREAMBLE) + glsl;
 }
 
-static int run_full_hlsl(const std::string& full_hlsl, int optimize, char** out_glsl)
+static int run_full_hlsl(const std::string& full_hlsl, int optimize,
+                         char** out_glsl) noexcept
 {
+    if (!out_glsl)
+        return 1;
+    *out_glsl = nullptr;
     try {
         std::string glsl_es300 = hlsl_to_glsl_es300(full_hlsl);
 
         if (optimize) {
-            glslopt_ctx* ctx = glslopt_initialize(kGlslTargetOpenGLES30);
-            glslopt_shader* shader = glslopt_optimize(
-                ctx, kGlslOptShaderFragment, glsl_es300.c_str(), 0);
+            GlslOptContext ctx(glslopt_initialize(kGlslTargetOpenGLES30));
+            if (!ctx.get())
+                throw std::runtime_error("glslopt_initialize returned null");
+            GlslOptShader shader(glslopt_optimize(
+                ctx.get(), kGlslOptShaderFragment, glsl_es300.c_str(), 0));
+            if (!shader.get())
+                throw std::runtime_error("glslopt_optimize returned null");
 
-            if (glslopt_get_status(shader)) {
-                const char* out = glslopt_get_output(shader);
-                *out_glsl = strdup(out ? out : "");
-                glslopt_shader_delete(shader);
-                glslopt_cleanup(ctx);
-                return 0;
+            if (glslopt_get_status(shader.get())) {
+                const char* out = glslopt_get_output(shader.get());
+                if (!out)
+                    throw std::runtime_error("glslopt_get_output returned null");
+                return copy_output(out_glsl, out, 0);
             } else {
-                const char* log = glslopt_get_log(shader);
+                const char* log = glslopt_get_log(shader.get());
                 std::string err = std::string("glslopt error: ") + (log ? log : "(null)");
-                *out_glsl = strdup(err.c_str());
-                glslopt_shader_delete(shader);
-                glslopt_cleanup(ctx);
-                return 2;
+                return copy_output(out_glsl, err.c_str(), 2);
             }
         } else {
-            *out_glsl = strdup(glsl_es300.c_str());
-            return 0;
+            return copy_output(out_glsl, glsl_es300.c_str(), 0);
         }
     } catch (const std::exception& e) {
-        *out_glsl = strdup(e.what());
-        return 3;
+        return copy_output(out_glsl, e.what(), 3);
     } catch (...) {
-        *out_glsl = strdup("unknown error in milk_convert_shader");
-        return 4;
+        return copy_output(out_glsl, "unknown error in milk_convert_shader", 4);
     }
 }
 
@@ -274,15 +342,26 @@ extern "C" {
 //
 // Returns 0 on success: *out_glsl is a malloc'd C string; free with milk_convert_free.
 // Returns nonzero on failure: *out_glsl is a malloc'd error string.
-int milk_convert_shader(const char* hlsl_body, int optimize, char** out_glsl)
+int milk_convert_shader(const char* hlsl_body, int optimize,
+                        char** out_glsl) noexcept
 {
-    if (!hlsl_body || !out_glsl) return 1;
-    std::string full_hlsl =
-        std::string(MILK_HLSL_PREFIX) +
-        std::string(MILK_HLSL_WRAPPER_BEGIN) +
-        std::string(hlsl_body) +
-        std::string(MILK_HLSL_WRAPPER_END);
-    return run_full_hlsl(full_hlsl, optimize, out_glsl);
+    if (!out_glsl)
+        return 1;
+    *out_glsl = nullptr;
+    if (!hlsl_body)
+        return copy_output(out_glsl, "hlsl_body is null", 1);
+    try {
+        std::string full_hlsl =
+            std::string(MILK_HLSL_PREFIX) +
+            std::string(MILK_HLSL_WRAPPER_BEGIN) +
+            std::string(hlsl_body) +
+            std::string(MILK_HLSL_WRAPPER_END);
+        return run_full_hlsl(full_hlsl, optimize, out_glsl);
+    } catch (const std::exception& e) {
+        return copy_output(out_glsl, e.what(), 3);
+    } catch (...) {
+        return copy_output(out_glsl, "unknown error in milk_convert_shader entrypoint", 4);
+    }
 }
 
 // Like milk_convert_shader but accepts pre-shader_body file-scope globals
@@ -292,19 +371,29 @@ int milk_convert_shader(const char* hlsl_body, int optimize, char** out_glsl)
 // layout and avoiding redeclaration errors when the body re-uses a name.
 // file_globals may be NULL or empty.
 int milk_convert_shader_ex(const char* file_globals, const char* hlsl_body,
-                            int optimize, char** out_glsl)
+                            int optimize, char** out_glsl) noexcept
 {
-    if (!hlsl_body || !out_glsl) return 1;
-    std::string full_hlsl =
-        std::string(MILK_HLSL_PREFIX) +
-        (file_globals ? std::string(file_globals) + "\n" : std::string()) +
-        std::string(MILK_HLSL_WRAPPER_BEGIN) +
-        std::string(hlsl_body) +
-        std::string(MILK_HLSL_WRAPPER_END);
-    return run_full_hlsl(full_hlsl, optimize, out_glsl);
+    if (!out_glsl)
+        return 1;
+    *out_glsl = nullptr;
+    if (!hlsl_body)
+        return copy_output(out_glsl, "hlsl_body is null", 1);
+    try {
+        std::string full_hlsl =
+            std::string(MILK_HLSL_PREFIX) +
+            (file_globals ? std::string(file_globals) + "\n" : std::string()) +
+            std::string(MILK_HLSL_WRAPPER_BEGIN) +
+            std::string(hlsl_body) +
+            std::string(MILK_HLSL_WRAPPER_END);
+        return run_full_hlsl(full_hlsl, optimize, out_glsl);
+    } catch (const std::exception& e) {
+        return copy_output(out_glsl, e.what(), 3);
+    } catch (...) {
+        return copy_output(out_glsl, "unknown error in milk_convert_shader_ex entrypoint", 4);
+    }
 }
 
-void milk_convert_free(char* p)
+void milk_convert_free(char* p) noexcept
 {
     free(p);
 }

@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use particle_audio::{AudioEngine, CaptureConfig};
 use winit::{
@@ -18,7 +19,9 @@ use winit::{
 
 // The engine lives in the library crate (single source of truth). This bin is a
 // thin CLI/window shell over it.
-use particle_milkdrop::{fallback_preset, load_preset_path, MilkShaders, MilkdropRenderer};
+use particle_milkdrop::{
+    fallback_preset, load_preset_path, MilkShaders, MilkdropRenderer, MilkdropResizeDebouncer,
+};
 
 /// Thin path-based wrapper over the library ingest ([`load_preset_path`]) used by
 /// the headless / anim CLI paths and the windowed app. `.json` → Butterchurn
@@ -491,6 +494,9 @@ struct GpuState {
     config: wgpu::SurfaceConfiguration,
     renderer: MilkdropRenderer,
     active_shaders: MilkShaders,
+    /// Coalesces window drag events before calling the renderer's in-place
+    /// resize path, so feedback/EEL state survives and target work stays bounded.
+    resize_debouncer: MilkdropResizeDebouncer,
     /// Live mic capture + DSP. None if no input device was available; the
     /// renderer then falls back to its synthetic audio. Must stay alive for
     /// capture to continue (cpal stops on drop).
@@ -606,6 +612,7 @@ impl GpuState {
             config,
             renderer,
             active_shaders: shaders,
+            resize_debouncer: MilkdropResizeDebouncer::default(),
             audio,
         }
     }
@@ -651,8 +658,8 @@ impl GpuState {
         let is_json = path.to_ascii_lowercase().ends_with(".json");
         if !is_json && !particle_milkdrop::native_converter_available() {
             log::warn!(
-                "{name}: this build has no native .milk converter linked; rendering may be \
-                 degraded. Drop a .json preset, or use a build with the converter."
+                "{name}: no native .milk converter helper is available; rendering may be \
+                 degraded. Drop a .json preset, or install/configure a converter helper."
             );
         }
         match load_preset(path) {
@@ -674,6 +681,8 @@ impl GpuState {
                 );
                 self.renderer = renderer;
                 self.active_shaders = shaders;
+                // The fresh renderer already uses the current surface size.
+                self.resize_debouncer.clear();
                 if compiled {
                     log::info!("loaded {name}");
                     format!("{APP_NAME} — {name}")
@@ -694,10 +703,17 @@ impl GpuState {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.renderer.resize(w, h);
+        self.resize_debouncer.request(w, h, Instant::now());
     }
 
     fn render(&mut self) {
+        if let Some((width, height)) = self.resize_debouncer.take_ready(Instant::now()) {
+            if let Err(error) = self.renderer.try_resize(width, height) {
+                log::warn!(
+                    "MilkDrop resize to {width}x{height} rejected; retaining live targets: {error}"
+                );
+            }
+        }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -827,7 +843,7 @@ Built on the work of:
 
 License: MIT (see LICENSE). Bundled converter components keep their own
 permissive licenses (BSD-3 / zlib / MIT) — see THIRD_PARTY_NOTICES.md.
-Native .milk converter in this build: {}",
+Native .milk converter available: {}",
         if particle_milkdrop::native_converter_available() {
             "yes"
         } else {
@@ -837,6 +853,19 @@ Native .milk converter in this build: {}",
 }
 
 fn main() {
+    // Service the isolated, one-shot converter mode before logging, argument
+    // parsing, windowing, audio, or any other application threads are started.
+    // Normal OjoDrop launches then register this same executable as their
+    // helper, keeping app packaging self-contained without loading untrusted
+    // shader text into the long-lived UI/audio process.
+    #[cfg(feature = "milk-native-converter")]
+    {
+        if let Some(code) = particle_milkdrop_converter_sys::current_executable_helper_mode() {
+            std::process::exit(code);
+        }
+        let _ = particle_milkdrop_converter_sys::register_current_executable_as_helper();
+    }
+
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -902,8 +931,8 @@ fn main() {
     }
     if !particle_milkdrop::native_converter_available() {
         println!(
-            "(note: native .milk converter not linked in this build — .json presets \
-             load fully; raw .milk may render degraded)"
+            "(note: native .milk converter helper unavailable — .json presets load fully; \
+             raw .milk may render degraded)"
         );
     }
     let event_loop = EventLoop::new().expect("event loop");
