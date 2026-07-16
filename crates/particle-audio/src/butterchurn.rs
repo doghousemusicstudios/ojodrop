@@ -258,6 +258,15 @@ impl ButterchurnLevels {
         (self.starts, self.stops)
     }
 
+    /// The most recently computed Butterchurn `freqArray` — `NUM_SAMPS` equalized
+    /// magnitude bins at `bucketHz = sampleRate / fftSize`. This is the exact
+    /// frequency array Butterchurn hands to `bSpectrum` custom waves (no window,
+    /// signed `-128..127` time-domain scaling, `equalize` curve applied), updated
+    /// by [`ButterchurnLevels::update_bytes`] / [`ButterchurnLevels::update_signed`].
+    pub fn freq_array(&self) -> &[f32] {
+        &self.freq_array
+    }
+
     /// Update from unsigned time-domain bytes (`getByteTimeDomainData`, `0..255`
     /// centered at 128), exactly as Butterchurn consumes Web Audio data.
     pub fn update_bytes(&mut self, time_byte_array: &[u8], fps: f32, frame: u64) -> AudioLevels {

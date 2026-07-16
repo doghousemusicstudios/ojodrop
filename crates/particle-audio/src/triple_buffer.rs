@@ -18,7 +18,7 @@
 //! atomically swaps its `back` index with the published `ready` index, so the two
 //! sides never touch the same slot concurrently.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -49,13 +49,15 @@ pub struct Writer<T> {
 
 /// Consumer half. Lives on the render/UI thread.
 ///
-/// `front` is an atomic so [`Reader::read`] can take `&self` (the public engine
-/// API exposes `latest(&self)`). The consumer is still logically single-threaded;
-/// the atomic is only for interior mutability, not cross-thread reader sharing.
+/// `front` is a [`Cell`] so [`Reader::read`] can take `&self` (the public engine
+/// API exposes `latest(&self)`) while the type remains deliberately `!Sync`.
+/// That enforces the protocol's single-consumer requirement at the Rust type
+/// level: a reader may be moved to another thread (`Send`), but shared references
+/// cannot be used to read it concurrently from multiple threads.
 pub struct Reader<T> {
     shared: Arc<Shared<T>>,
     /// Slot the consumer currently owns / last latched.
-    front: AtomicU8,
+    front: Cell<u8>,
 }
 
 /// Create a triple buffer initialized with `initial` in every slot.
@@ -76,7 +78,7 @@ pub fn triple_buffer<T: Copy>(initial: T) -> (Writer<T>, Reader<T>) {
         },
         Reader {
             shared,
-            front: AtomicU8::new(2),
+            front: Cell::new(2),
         },
     )
 }
@@ -105,12 +107,12 @@ impl<T: Copy> Reader<T> {
         // We do this by swapping our front index into `ready` (clearing dirty) and
         // taking the published index as our new front.
         let ready = self.shared.ready.load(Ordering::Acquire);
-        let mut front = self.front.load(Ordering::Relaxed);
+        let mut front = self.front.get();
         if ready & DIRTY_BIT != 0 {
             // Hand our current front slot back to the producer pool and adopt the
             // freshly published one.
             front = self.shared.ready.swap(front, Ordering::AcqRel) & INDEX_MASK;
-            self.front.store(front, Ordering::Relaxed);
+            self.front.set(front);
         }
         // SAFETY: `front` is owned exclusively by the consumer between swaps.
         unsafe { *self.shared.slots[front as usize].get() }
@@ -120,6 +122,33 @@ impl<T: Copy> Reader<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send<T: Send>() {}
+
+    // Compile-time negative assertion without adding a dev dependency. If `T`
+    // implements `Sync`, both trait implementations below match and `_` becomes
+    // ambiguous; for a `!Sync` type only the `()` implementation is available.
+    macro_rules! assert_not_sync {
+        ($ty:ty) => {
+            const _: fn() = || {
+                trait AmbiguousIfSync<A> {
+                    fn assert_not_sync() {}
+                }
+                struct SyncMarker<T: ?Sized>(std::marker::PhantomData<T>);
+                impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+                impl<T: ?Sized + Sync> AmbiguousIfSync<SyncMarker<dyn Sync>> for T {}
+
+                let _ = <$ty as AmbiguousIfSync<_>>::assert_not_sync;
+            };
+        };
+    }
+
+    assert_not_sync!(Reader<u32>);
+
+    #[test]
+    fn reader_is_send_but_not_sync() {
+        assert_send::<Reader<u32>>();
+    }
 
     #[test]
     fn initial_value_is_readable() {
@@ -147,5 +176,19 @@ mod tests {
             w.write(i);
         }
         assert_eq!(r.read(), 999);
+    }
+
+    #[test]
+    fn reader_can_move_to_one_consumer_thread() {
+        let (mut w, r) = triple_buffer(0u32);
+        let (read_now_tx, read_now_rx) = std::sync::mpsc::channel();
+        let consumer = std::thread::spawn(move || {
+            read_now_rx.recv().expect("producer start signal");
+            r.read()
+        });
+
+        w.write(42);
+        read_now_tx.send(()).expect("consumer start signal");
+        assert_eq!(consumer.join().expect("consumer thread"), 42);
     }
 }

@@ -14,6 +14,9 @@ use crate::smoothing::AsymEnv;
 pub struct OnsetDetector {
     /// Recent raw flux values for adaptive-median thresholding.
     history: Vec<f32>,
+    /// Preallocated scratch reused by [`OnsetDetector::median`] so the per-hop
+    /// median never allocates (P2-AUD-013). Length tracks the copied window.
+    median_scratch: Vec<f32>,
     capacity: usize,
     write: usize,
     filled: usize,
@@ -44,6 +47,7 @@ impl OnsetDetector {
         let cap = hist_len.max(1);
         Self {
             history: vec![0.0; cap],
+            median_scratch: Vec::with_capacity(cap),
             capacity: cap,
             write: 0,
             filled: 0,
@@ -87,15 +91,23 @@ impl OnsetDetector {
         (out.clamp(0.0, 1.0), fired)
     }
 
-    /// Median of the current history window (cheap: copy + select). History is
-    /// short (tens of frames) so this is negligible cost per hop.
-    fn median(&self) -> f32 {
+    /// Median of the current history window. Copies the written frames into a
+    /// reused scratch buffer (no per-hop allocation, P2-AUD-013) and takes the
+    /// center order statistic with a partial selection instead of a full sort.
+    /// The selected element is the sorted-order midpoint, so the value is
+    /// identical to the previous copy-and-sort implementation.
+    fn median(&mut self) -> f32 {
         if self.filled == 0 {
             return 0.0;
         }
-        let mut buf: Vec<f32> = self.history[..self.filled].to_vec();
-        buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        buf[buf.len() / 2]
+        self.median_scratch.clear();
+        self.median_scratch
+            .extend_from_slice(&self.history[..self.filled]);
+        let mid = self.median_scratch.len() / 2;
+        let (_, median, _) = self
+            .median_scratch
+            .select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        *median
     }
 }
 
@@ -146,6 +158,51 @@ mod tests {
             }
         }
         assert!(fires < 50, "steady signal fired too often: {fires}");
+    }
+
+    /// P2-AUD-013: the reused-scratch partial-selection median returns exactly the
+    /// same value as the previous allocate-and-full-sort implementation across a
+    /// range of odd/even fills, and reuses its scratch buffer (no per-hop
+    /// allocation — capacity never grows once warmed).
+    #[test]
+    fn median_matches_sort_reference_without_reallocating() {
+        // Reference: the old copy + full-sort + midpoint element.
+        fn sort_reference(history: &[f32]) -> f32 {
+            if history.is_empty() {
+                return 0.0;
+            }
+            let mut buf = history.to_vec();
+            buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            buf[buf.len() / 2]
+        }
+
+        let hop_dt = 256.0 / 48_000.0;
+        let mut d = OnsetDetector::new(37, 1.6, 1e-4, 60.0, 5.0, 200.0, hop_dt);
+        let warm_capacity = d.median_scratch.capacity();
+
+        // A pseudo-random-ish, non-monotonic flux stream so the median is a real
+        // order statistic, not a trivially-sorted input.
+        let mut acc = 0.123_f32;
+        for step in 0..400 {
+            acc = (acc * 7.0 + 0.31).fract();
+            let flux = acc * (1.0 + (step % 5) as f32);
+
+            // Capture the window the detector will median BEFORE it mutates it,
+            // then assert the detector's internal median equals the sort reference.
+            let expected = sort_reference(&d.history[..d.filled]);
+            let got = d.median();
+            assert_eq!(
+                got, expected,
+                "select-based median diverged from the sort reference at step {step}"
+            );
+
+            d.process(flux, 1.0);
+            assert_eq!(
+                d.median_scratch.capacity(),
+                warm_capacity,
+                "median scratch reallocated at step {step} — per-hop allocation regressed"
+            );
+        }
     }
 
     #[test]

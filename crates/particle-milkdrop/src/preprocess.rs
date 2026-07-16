@@ -14,154 +14,219 @@
 
 use std::collections::HashMap;
 
+/// Hard byte budget for a single shader source fed to [`butterchurn_to_naga`].
+/// Real Butterchurn comp/warp bodies are a few KiB; a 512 KiB ceiling sits far
+/// above any legitimate preset yet bounds the preprocessing work (and allocation)
+/// for an adversarial blob before any pass runs.
+const MAX_SHADER_BYTES: usize = 512 * 1024;
+
+/// Hard line budget. Bounds the single classification pass independently of byte
+/// count (a source of many short lines still costs per-line work). Real bodies are
+/// well under a few hundred lines.
+const MAX_SHADER_LINES: usize = 20_000;
+
+/// Typed rejection from the Butterchurn→naga shader preprocessor. The infallible
+/// [`butterchurn_to_naga`] maps it to an inert empty program; callers that need to
+/// distinguish a rejection use [`try_butterchurn_to_naga`]. Mirrors the
+/// `equations::ParseError` convention (an infallible entry point plus a fallible
+/// `try_` sibling).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreprocessError {
+    /// Source exceeded [`MAX_SHADER_BYTES`]; rejected before any pass ran.
+    SourceTooLarge { bytes: usize, limit: usize },
+    /// Source exceeded [`MAX_SHADER_LINES`]; rejected before any pass ran.
+    TooManyLines { lines: usize, limit: usize },
+}
+
+/// One source line, classified exactly once. The previous implementation parsed
+/// every line twice (a collection pass, then a rewrite pass); recording the
+/// classification lets the emit pass replay it, so each line is parsed once —
+/// single-pass symbol/reference accounting.
+enum ClassifiedLine {
+    /// `#version …` → replaced with `#version 450`.
+    Version,
+    /// `precision …` → dropped.
+    Precision,
+    /// `in <ty> <name>;` → emitted once with a `layout(location)` qualifier.
+    In { name: String, ty: String },
+    /// `out <ty> <name>;`
+    Out { name: String, ty: String },
+    /// `uniform sampler2D/3D <name>;` → emitted once as separate texture + sampler.
+    Sampler { name: String, ty: String },
+    /// `uniform <scalar/vector> <name>;` → folded into the UBO; original dropped.
+    Scalar,
+    /// Any other line, carried through verbatim (subject to the `float PI` fixup and
+    /// the pre-body UBO emission).
+    Other(String),
+}
+
+/// Convert butterchurn GLSL (`#version 300 es`) to naga-compatible GLSL 450.
+///
+/// Infallible entry point: an over-budget or pathological source yields an inert
+/// (empty) program rather than unbounded work. Callers that must distinguish a
+/// rejection use [`try_butterchurn_to_naga`].
 pub fn butterchurn_to_naga(src: &str) -> String {
-    let mut lines: Vec<String> = src.lines().map(String::from).collect();
+    try_butterchurn_to_naga(src).unwrap_or_default()
+}
 
-    // Pass 1: collect all uniform declarations
-    let mut samplers: Vec<SamplerDecl> = Vec::new();
+/// Fallible core of [`butterchurn_to_naga`]. Enforces source budgets up front, then
+/// converts the shader in a SINGLE classification pass (each line parsed once),
+/// returning a typed [`PreprocessError`] for over-budget input. The final texture
+/// rewrite is linear in the source length (see [`rewrite_texture_calls`]), so the
+/// whole conversion is bounded — no quadratic per-symbol rescans.
+pub fn try_butterchurn_to_naga(src: &str) -> Result<String, PreprocessError> {
+    // Budget 1: total bytes. Every downstream pass is linear in the source length,
+    // so capping it bounds the total work before any allocation/scan runs.
+    if src.len() > MAX_SHADER_BYTES {
+        return Err(PreprocessError::SourceTooLarge {
+            bytes: src.len(),
+            limit: MAX_SHADER_BYTES,
+        });
+    }
+
+    // Single classification pass: parse each line ONCE, recording both the decl
+    // tables (scalars for the UBO) and the binding/location maps, plus a per-line
+    // plan the emit pass replays without re-parsing.
+    let mut classified: Vec<ClassifiedLine> = Vec::new();
     let mut scalars: Vec<ScalarDecl> = Vec::new();
-    let mut in_vars: Vec<IoVar> = Vec::new();
-    let mut out_vars: Vec<IoVar> = Vec::new();
-
-    for line in &lines {
-        let t = line.trim();
-        if let Some(s) = parse_sampler(t) {
-            samplers.push(s);
-        } else if let Some(s) = parse_scalar(t) {
-            scalars.push(s);
-        } else if let Some(v) = parse_io(t, "in") {
-            in_vars.push(v);
-        } else if let Some(v) = parse_io(t, "out") {
-            out_vars.push(v);
-        }
-    }
-
-    // Pass 2: rewrite line-by-line
-    let mut sampler_binding = 0u32;
     let mut sampler_map: HashMap<String, u32> = HashMap::new(); // name → tex binding
-
-    // Assign bindings to samplers in order of appearance
-    for s in &samplers {
-        sampler_map.insert(s.name.clone(), sampler_binding);
-        sampler_binding += 2; // tex + sampler each consume a slot
-    }
-
-    let mut ubo_binding = sampler_binding; // UBO goes after all texture slots
-
-    let mut in_loc = 0u32;
-    let mut out_loc = 0u32;
-    // Build maps for in/out location assignment (order of appearance)
+    let mut sampler_binding = 0u32;
     let mut in_locs: HashMap<String, u32> = HashMap::new();
     let mut out_locs: HashMap<String, u32> = HashMap::new();
-    for v in &in_vars {
-        in_locs.entry(v.name.clone()).or_insert_with(|| {
-            let l = in_loc;
-            in_loc += 1;
-            l
-        });
-    }
-    for v in &out_vars {
-        out_locs.entry(v.name.clone()).or_insert_with(|| {
-            let l = out_loc;
-            out_loc += 1;
-            l
-        });
+    let mut in_loc = 0u32;
+    let mut out_loc = 0u32;
+    let mut line_count = 0usize;
+
+    for line in src.lines() {
+        // Budget 2: line count, checked as we scan so a many-line blob is rejected
+        // in bounded work (before the emit pass and the join allocate anything).
+        line_count += 1;
+        if line_count > MAX_SHADER_LINES {
+            return Err(PreprocessError::TooManyLines {
+                lines: line_count,
+                limit: MAX_SHADER_LINES,
+            });
+        }
+
+        let t = line.trim();
+        let classified_line = if t.starts_with("#version") {
+            ClassifiedLine::Version
+        } else if t.starts_with("precision ") {
+            ClassifiedLine::Precision
+        } else if let Some(v) = parse_io(t, "in") {
+            in_locs.entry(v.name.clone()).or_insert_with(|| {
+                let l = in_loc;
+                in_loc += 1;
+                l
+            });
+            ClassifiedLine::In {
+                name: v.name,
+                ty: v.ty,
+            }
+        } else if let Some(v) = parse_io(t, "out") {
+            out_locs.entry(v.name.clone()).or_insert_with(|| {
+                let l = out_loc;
+                out_loc += 1;
+                l
+            });
+            ClassifiedLine::Out {
+                name: v.name,
+                ty: v.ty,
+            }
+        } else if let Some(s) = parse_sampler(t) {
+            // Assign a binding pair (tex + sampler) at first occurrence, in order of
+            // appearance — the same slot layout the previous two-pass code produced.
+            sampler_map.entry(s.name.clone()).or_insert_with(|| {
+                let b = sampler_binding;
+                sampler_binding += 2;
+                b
+            });
+            ClassifiedLine::Sampler {
+                name: s.name,
+                ty: s.ty,
+            }
+        } else if let Some(s) = parse_scalar(t) {
+            scalars.push(s);
+            ClassifiedLine::Scalar
+        } else {
+            ClassifiedLine::Other(line.to_string())
+        };
+        classified.push(classified_line);
     }
 
+    let ubo_binding = sampler_binding; // UBO goes after all texture slots
+
+    // Emit pass: replay the classification (no re-parsing of source text).
     let mut result: Vec<String> = Vec::new();
     let mut ubo_emitted = false;
     let mut in_out_done: std::collections::HashSet<String> = Default::default();
     let mut sampler_done: std::collections::HashSet<String> = Default::default();
-    let mut skipping_scalar_uniforms = false;
 
-    for line in &lines {
-        let t = line.trim();
-
-        // --- version ---
-        if t.starts_with("#version") {
-            result.push("#version 450".to_string());
-            continue;
-        }
-
-        // --- precision declarations → strip ---
-        if t.starts_with("precision ") {
-            continue;
-        }
-
-        // --- in / out variables: add layout qualifier ---
-        if let Some(v) = parse_io(t, "in") {
-            if !in_out_done.contains(&format!("in:{}", v.name)) {
-                let loc = in_locs[&v.name];
-                result.push(format!("layout(location = {loc}) in {} {};", v.ty, v.name));
-                in_out_done.insert(format!("in:{}", v.name));
+    for c in &classified {
+        match c {
+            ClassifiedLine::Version => result.push("#version 450".to_string()),
+            // precision declarations → strip
+            ClassifiedLine::Precision => {}
+            // in / out variables: add layout qualifier (once per name)
+            ClassifiedLine::In { name, ty } => {
+                if in_out_done.insert(format!("in:{name}")) {
+                    let loc = in_locs[name];
+                    result.push(format!("layout(location = {loc}) in {ty} {name};"));
+                }
             }
-            continue;
-        }
-        if let Some(v) = parse_io(t, "out") {
-            if !in_out_done.contains(&format!("out:{}", v.name)) {
-                let loc = out_locs[&v.name];
-                result.push(format!("layout(location = {loc}) out {} {};", v.ty, v.name));
-                in_out_done.insert(format!("out:{}", v.name));
+            ClassifiedLine::Out { name, ty } => {
+                if in_out_done.insert(format!("out:{name}")) {
+                    let loc = out_locs[name];
+                    result.push(format!("layout(location = {loc}) out {ty} {name};"));
+                }
             }
-            continue;
-        }
-
-        // --- sampler uniforms → separate texture + sampler ---
-        if let Some(s) = parse_sampler(t) {
-            if !sampler_done.contains(&s.name) {
-                let b = sampler_map[&s.name];
-                let (tex_ty, samp_ty) = if s.ty == "sampler3D" {
-                    ("texture3D", "sampler")
+            // sampler uniforms → separate texture + sampler (once per name)
+            ClassifiedLine::Sampler { name, ty } => {
+                if sampler_done.insert(name.clone()) {
+                    let b = sampler_map[name];
+                    let (tex_ty, samp_ty) = if ty == "sampler3D" {
+                        ("texture3D", "sampler")
+                    } else {
+                        ("texture2D", "sampler")
+                    };
+                    result.push(format!(
+                        "layout(set = 0, binding = {b}) uniform {tex_ty} {name};"
+                    ));
+                    result.push(format!(
+                        "layout(set = 0, binding = {}) uniform {samp_ty} {name}_samp;",
+                        b + 1
+                    ));
+                }
+            }
+            // scalar uniforms are folded into the UBO — drop the individual decl
+            ClassifiedLine::Scalar => {}
+            ClassifiedLine::Other(orig) => {
+                let t = orig.trim();
+                // Emit the UBO just before the first real body line.
+                if !ubo_emitted && !scalars.is_empty() && is_body_line(t) {
+                    emit_ubo(&scalars, ubo_binding, &mut result);
+                    ubo_emitted = true;
+                }
+                // `float PI = ...` → `const float PI = ...` (naga rejects mutable
+                // globals without a storage qualifier).
+                let line_out = if t.starts_with("float PI") && t.contains('=') {
+                    orig.replacen("float PI", "const float PI", 1)
                 } else {
-                    ("texture2D", "sampler")
+                    orig.clone()
                 };
-                result.push(format!(
-                    "layout(set = 0, binding = {b}) uniform {tex_ty} {};",
-                    s.name
-                ));
-                result.push(format!(
-                    "layout(set = 0, binding = {}) uniform {samp_ty} {}_samp;",
-                    b + 1,
-                    s.name
-                ));
-                sampler_done.insert(s.name);
+                result.push(line_out);
             }
-            continue;
         }
-
-        // --- scalar uniforms → collect into UBO (emitted before first non-uniform line) ---
-        if let Some(_) = parse_scalar(t) {
-            // Will be emitted as UBO block; skip individual declarations
-            skipping_scalar_uniforms = true;
-            continue;
-        }
-
-        // Emit UBO before the first non-declaration line inside the file body
-        // (when we encounter something that isn't a uniform / #define / precision)
-        if !ubo_emitted && !scalars.is_empty() && is_body_line(t) {
-            emit_ubo(&scalars, ubo_binding, &mut result);
-            ubo_emitted = true;
-        }
-
-        // --- `float PI = ...` → `const float PI = ...` ---
-        // naga doesn't allow mutable global variables without storage qualifiers
-        let line_out = if t.starts_with("float PI") && t.contains('=') {
-            line.replacen("float PI", "const float PI", 1)
-        } else {
-            line.clone()
-        };
-
-        result.push(line_out);
     }
 
-    // Emit UBO if we never hit a body line (edge case)
+    // Emit UBO if we never hit a body line (edge case).
     if !ubo_emitted && !scalars.is_empty() {
         emit_ubo(&scalars, ubo_binding, &mut result);
     }
 
-    // Pass 3: rewrite texture() calls in the full string
+    // Final pass: rewrite texture() calls in the full string (single linear scan).
     let joined = result.join("\n");
-    rewrite_texture_calls(&joined, &sampler_map)
+    Ok(rewrite_texture_calls(&joined, &sampler_map))
 }
 
 // ---------------------------------------------------------------------------
@@ -189,26 +254,66 @@ fn emit_ubo(scalars: &[ScalarDecl], binding: u32, out: &mut Vec<String>) {
 // ---------------------------------------------------------------------------
 
 // Rewrites `texture(name, ...)` → `texture(sampler2D(name, name_samp), ...)`
-// and `texture(name, ..., ...)` for 3D samplers.
+// for every sampler named in `sampler_map`.
+//
+// A SINGLE linear scan (O(len)) replaces the previous per-name `String::replace`
+// loop, which was O(samplers × len) — quadratic when both the sampler count and the
+// body length grow with the (untrusted) source. Reading the full identifier after
+// each `texture(` also removes the need for the old longest-first name sort: a name
+// that is a prefix of another (`sampler_noise_lq` vs `sampler_noise_lq_lite`) can no
+// longer partially match, because the whole `[A-Za-z0-9_]+` token is compared.
+//
+// Output is byte-for-byte identical to the old rewriter for the two whitespace
+// variants it handled: `texture(name,` and `texture(name ,` (exactly one space).
 fn rewrite_texture_calls(src: &str, sampler_map: &HashMap<String, u32>) -> String {
-    let mut result = src.to_string();
-
-    // Sort sampler names longest-first to avoid partial matches
-    let mut names: Vec<&str> = sampler_map.keys().map(|s| s.as_str()).collect();
-    names.sort_by_key(|s| std::cmp::Reverse(s.len()));
-
-    for name in names {
-        let pattern = format!("texture({name},");
-        let replacement = format!("texture(sampler2D({name}, {name}_samp),");
-        result = result.replace(&pattern, &replacement);
-
-        // With space variant
-        let pattern2 = format!("texture({name} ,");
-        let replacement2 = format!("texture(sampler2D({name}, {name}_samp) ,");
-        result = result.replace(&pattern2, &replacement2);
+    const PREFIX: &[u8] = b"texture(";
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(src.len() + src.len() / 8);
+    let mut i = 0;
+    while i < n {
+        if i + PREFIX.len() <= n && &b[i..i + PREFIX.len()] == PREFIX {
+            // Read the identifier immediately after `texture(`.
+            let id_start = i + PREFIX.len();
+            let mut j = id_start;
+            while j < n && is_ident_byte(b[j]) {
+                j += 1;
+            }
+            // Only a `texture(name,` or `texture(name ,` call (name directly
+            // followed by a comma, or a single space then a comma) is a sampler
+            // read to rewrite — anything else is left untouched.
+            let sep_len = if j < n && b[j] == b',' {
+                Some(0)
+            } else if j + 1 < n && b[j] == b' ' && b[j + 1] == b',' {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(sep_len) = sep_len {
+                let name = &src[id_start..j];
+                if !name.is_empty() && sampler_map.contains_key(name) {
+                    out.push_str("texture(sampler2D(");
+                    out.push_str(name);
+                    out.push_str(", ");
+                    out.push_str(name);
+                    out.push_str("_samp)");
+                    // Re-emit the separator whitespace exactly (the space in the
+                    // ` ,` variant); the comma itself is copied by the main loop.
+                    for _ in 0..sep_len {
+                        out.push(' ');
+                    }
+                    i = j + sep_len; // resume at the comma
+                    continue;
+                }
+            }
+        }
+        // Default: copy one UTF-8 char through unchanged.
+        let ch = src[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        out.push_str(&src[i..i + len]);
+        i += len;
     }
-
-    result
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -334,8 +439,11 @@ pub const MILKDROP_SAMPLERS: &[&str] = &[
     "sampler_noise_lq_lite",
     "sampler_noise_mq",
     "sampler_noise_hq",
-    "sampler_noise_hq_lite",
-    "sampler_pw_noise_lq",
+    // Two legacy-redundant slots are reserved for the named-texture atlas. The
+    // normalizer maps legacy hq-lite/point-lq uses to their equivalent base noise
+    // samplers before compilation, keeping the total binding count unchanged.
+    "sampler_named_linear",
+    "sampler_named_point",
     "sampler_noisevol_lq",
     "sampler_noisevol_hq",
 ];
@@ -375,6 +483,12 @@ vec3 GetBlur1(vec2 uv) { return texture(sampler2D(sampler_blur1, sampler_blur1_s
 vec3 GetBlur2(vec2 uv) { return texture(sampler2D(sampler_blur2, sampler_blur2_samp), uv).rgb * scale2 + bias2; }
 vec3 GetBlur3(vec2 uv) { return texture(sampler2D(sampler_blur3, sampler_blur3_samp), uv).rgb * scale3 + bias3; }
 vec3 GetPixel(vec2 uv) { return texture(sampler2D(sampler_main,  sampler_main_samp),  uv).rgb; }
+// MilkDrop's HLSL prefix defines lum as a dot product. HLSL accepts scalar and
+// float2 arguments here through its implicit width conversions; GLSL does not.
+// Keep those narrower overloads scalar so expressions such as
+// `uv -= lum(float2_value) * direction` preserve the authored HLSL width.
+float lum(float v) { return v; }
+float lum(vec2 v) { return dot(v, vec2(0.32, 0.49)); }
 vec3 lum(vec3 v) { return vec3(dot(v, vec3(0.32, 0.49, 0.29))); }
 vec3 lum(vec4 v) { return vec3(dot(v.rgb, vec3(0.32, 0.49, 0.29))); }
 // vec3-argument Get* overloads: presets call GetBlurN/GetMain/GetPixel with a vec3
@@ -393,6 +507,14 @@ float saturate(float x)  { return clamp(x, 0.0, 1.0); }
 vec2  saturate(vec2 x)   { return clamp(x, vec2(0.0), vec2(1.0)); }
 vec3  saturate(vec3 x)   { return clamp(x, vec3(0.0), vec3(1.0)); }
 vec4  saturate(vec4 x)   { return clamp(x, vec4(0.0), vec4(1.0)); }
+
+// HLSL exposes log10 for every floating genType; GLSL 4.50/naga does not.
+// Keep the overloads in the fixed preamble so authored shaders retain HLSL's
+// component-wise semantics without teaching the parser a synthetic builtin.
+float log10(float x) { return log(x) * 0.4342944819032518; }
+vec2  log10(vec2 x)  { return log(x) * 0.4342944819032518; }
+vec3  log10(vec3 x)  { return log(x) * 0.4342944819032518; }
+vec4  log10(vec4 x)  { return log(x) * 0.4342944819032518; }
 
 // Guarded reciprocal: returns 0 where the denominator is 0, emulating DX9/WebGL
 // fast-math where x/0->inf and inf*0->0 (so a /0 term harmlessly vanishes) instead
@@ -431,6 +553,7 @@ layout(set = 1, binding = {ubo_bind}) uniform PerFrame {{
     vec4 slow_roam_sin;
     vec4 roam_sin;
     vec4 rand_frame;
+    vec4 rand_start;
     vec4 rand_preset;
     vec4 _qa;
     vec4 _qb;
@@ -552,9 +675,10 @@ const MILK_STANDARD_SAMPLERS: &[&str] = &[
     "sampler_noise_lq_lite",
     "sampler_noise_mq",
     "sampler_noise_hq",
+    "sampler_named_linear",
+    "sampler_named_point",
     "sampler_noisevol_lq",
     "sampler_noisevol_hq",
-    "sampler_pw_noise_lq",
     "sampler_blur1",
     "sampler_blur2",
     "sampler_blur3",
@@ -563,10 +687,9 @@ const MILK_STANDARD_SAMPLERS: &[&str] = &[
 #[cfg(feature = "milk-native-converter")]
 fn try_native_convert_hlsl(body: &str) -> Option<String> {
     // hlsl2glslfork/glslopt segfaults on `const TYPE name[N] = { scalar, … }` array
-    // initialisers with flat scalar lists.  The `float4(…)` constructor form works, but
-    // the flat form (e.g. `const float4 arr[3] = {0.0, 1.0, 0.0, 1.0, …};`) triggers a
-    // crash deep in the C++ library that we cannot recover from.  Skip the native path
-    // for any body that declares a const array — it falls back to pure-Rust (<1% of corpus).
+    // initialisers with flat scalar lists. The subprocess boundary now contains
+    // that crash, but this known-doomed shape is still cheaper to route directly
+    // to the pure-Rust fallback (<1% of the corpus).
     if contains_const_array(body) {
         log::debug!(
             "native HLSL converter skipped (const array initialiser, falling back to pure-Rust)"
@@ -672,11 +795,18 @@ fn comp_gamma_postlude(_body: &str) -> &'static str {
 /// Strip HLSL-only `sampler X;` lines from `src`, returning (cleaned, custom_names).
 /// Standard samplers are dropped silently; custom (user-texture) ones are collected
 /// so callers can alias their references to a standard sampler.
-fn normalize_milkdrop_sampler_variants(src: &str) -> String {
+///
+/// `pub(crate)` so the renderer's blur-level detector (P2-VIS-017) can collapse a
+/// body through the SAME rewrite the compile path uses, guaranteeing the detector
+/// sees the identical `sampler_blurN` spelling the compiled shader samples (no
+/// mode-prefixed under-detection drift).
+pub(crate) fn normalize_milkdrop_sampler_variants(src: &str) -> String {
     let mut out = src.to_string();
     out = out.replace("sampler_pw_noise_lq_lite", "sampler_noise_lq_lite");
     out = out.replace("sampler_pw_noise_mq", "sampler_noise_mq");
     out = out.replace("sampler_pw_noise_hq", "sampler_noise_hq");
+    out = out.replace("sampler_noise_hq_lite", "sampler_noise_lq_lite");
+    out = out.replace("sampler_pw_noise_lq", "sampler_noise_lq");
     out = out.replace("sampler_pw_noisevol", "sampler_noisevol");
     for mode in ["fw_", "fc_", "pc_"] {
         out = out.replace(&format!("sampler_{mode}noise"), "sampler_noise");
@@ -853,6 +983,343 @@ fn strip_and_alias_hlsl_samplers(src: &str) -> (String, Vec<String>) {
     (out, custom)
 }
 
+/// Return custom/user-image sampler identifiers without discarding their names.
+///
+/// This is the metadata half of native named-texture support. It understands the
+/// HLSL declaration forms handled by the compile path plus undeclared samplers used
+/// directly as the first argument of `tex2D`/`tex3D`/`texture` calls. Built-in
+/// MilkDrop feedback, blur, and noise samplers are excluded. Order is first-seen and
+/// stable so the renderer can assign deterministic texture-array layers.
+pub fn custom_sampler_names(src: &str) -> Vec<String> {
+    let (_, declared) = strip_and_alias_hlsl_samplers(src);
+    let normalized = normalize_milkdrop_sampler_variants(src);
+    let without_comments = strip_comments(&normalized);
+    let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for name in declared
+        .into_iter()
+        .chain(texture_first_arg_identifiers(&without_comments))
+    {
+        if !name.is_empty()
+            && !is_builtin_sampler_name(&name)
+            && seen.insert(name.to_ascii_lowercase())
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn texture_first_arg_identifiers(src: &str) -> Vec<String> {
+    let bytes = src.as_bytes();
+    let mut names = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let function = &src[start..i];
+            if !matches!(function, "tex2D" | "tex2d" | "tex3D" | "tex3d" | "texture") {
+                continue;
+            }
+            let mut cursor = i;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() || bytes[cursor] != b'(' {
+                continue;
+            }
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let arg_start = cursor;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+            {
+                cursor += 1;
+            }
+            if cursor > arg_start {
+                names.push(src[arg_start..cursor].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    names
+}
+
+fn is_builtin_sampler_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if matches!(lower.as_str(), "sampler2d" | "sampler3d" | "samplercube") {
+        return true;
+    }
+    if MILK_STANDARD_SAMPLERS
+        .iter()
+        .chain(MILKDROP_SAMPLERS.iter())
+        .any(|known| known.eq_ignore_ascii_case(&lower))
+    {
+        return true;
+    }
+    // Sampling-mode variants are normalized by the compile path even when an exact
+    // spelling is absent from the fixed binding table.
+    let base = lower.strip_prefix("sampler_").unwrap_or(&lower);
+    let base = ["fw_", "fc_", "pw_", "pc_"]
+        .iter()
+        .find_map(|prefix| base.strip_prefix(prefix))
+        .unwrap_or(base);
+    base == "main"
+        || base.starts_with("main_")
+        || base == "noise"
+        || base.starts_with("noise_")
+        || base.starts_with("noisevol")
+        || base == "blur"
+        || base.starts_with("blur1")
+        || base.starts_with("blur2")
+        || base.starts_with("blur3")
+}
+
+/// Rewrite custom sampler identifiers through an explicit renderer-provided map.
+/// Companion `texsize_<asset>` identifiers are rewritten to the target sampler's
+/// `texsize_<asset>` spelling as well. The scan is token-based and simultaneous, so
+/// mappings cannot cascade through one another.
+///
+/// OjoDrop's legacy compile path calls this with every custom sampler mapped to
+/// `sampler_noise_lq`. A named-texture renderer instead maps identities to its fixed
+/// atlas/array sampler(s), while retaining [`custom_sampler_names`] as the layer
+/// manifest.
+pub fn rewrite_custom_sampler_identifiers(
+    src: &str,
+    replacements: &HashMap<String, String>,
+) -> String {
+    let mut tokens = replacements.clone();
+    for (from, to) in replacements {
+        if let (Some(from_base), Some(to_base)) =
+            (from.strip_prefix("sampler_"), to.strip_prefix("sampler_"))
+        {
+            tokens.insert(format!("texsize_{from_base}"), format!("texsize_{to_base}"));
+        }
+    }
+
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let token = &src[start..i];
+            out.push_str(tokens.get(token).map(String::as_str).unwrap_or(token));
+        } else {
+            let ch = src[i..].chars().next().expect("i is in bounds");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// One custom-sampler identity and its fixed named-texture-atlas location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedTextureRewriteBinding {
+    pub sampler_name: String,
+    pub layer: u32,
+    pub point_filter: bool,
+    pub clamp: bool,
+}
+
+/// Rewrite custom `tex2D`/GLSL `texture` calls to OjoDrop's two reserved atlas
+/// samplers without increasing the fixed MilkDrop binding count.
+///
+/// The atlas is a 4×4 grid with a two-texel replicated gutter around each image.
+/// UV wrap/clamp is encoded in the rewritten coordinate, so both reserved samplers
+/// may use clamp addressing; separate linear/point samplers preserve the HLSL
+/// `fw/fc` versus `pw/pc` filter mode. Call this on the raw body before the normal
+/// HLSL/GLSL conversion path. Remaining custom declarations are harmlessly stripped
+/// by that path, while their call sites retain real layer identity.
+pub fn rewrite_custom_sampler_calls_for_atlas(
+    src: &str,
+    bindings: &[NamedTextureRewriteBinding],
+    layer_size: u32,
+) -> String {
+    if bindings.is_empty() {
+        return src.to_string();
+    }
+    let layer_size = layer_size.clamp(1, 4096);
+    let by_name: HashMap<String, &NamedTextureRewriteBinding> = bindings
+        .iter()
+        .map(|binding| (binding.sampler_name.to_ascii_lowercase(), binding))
+        .collect();
+    let mut out = rewrite_custom_sampler_calls_inner(src, &by_name, layer_size);
+    // The atlas normalizes every layer to `layer_size`, which matches the existing
+    // 256² texsize constant in the canonical profile. Rewrite custom texsize symbols
+    // independently from sampler call rewriting so declarations remain parseable.
+    for binding in bindings {
+        if let Some(base) = binding.sampler_name.strip_prefix("sampler_") {
+            out = replace_word(&out, &format!("texsize_{base}"), "texsize_noise_mq");
+        }
+    }
+    out
+}
+
+fn rewrite_custom_sampler_calls_inner(
+    src: &str,
+    by_name: &HashMap<String, &NamedTextureRewriteBinding>,
+    layer_size: u32,
+) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 128);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let ident_start = i;
+            let mut ident_end = i + 1;
+            while ident_end < bytes.len()
+                && (bytes[ident_end].is_ascii_alphanumeric() || bytes[ident_end] == b'_')
+            {
+                ident_end += 1;
+            }
+            let function = &src[ident_start..ident_end];
+            let supported = matches!(function, "tex2D" | "tex2d" | "texture");
+            let mut open = ident_end;
+            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if supported && open < bytes.len() && bytes[open] == b'(' {
+                if let Some((sampler_arg, coord, consumed)) = split_two_args(&src[open + 1..]) {
+                    let sampler_name = combined_sampler_identifier(&sampler_arg);
+                    if let Some(binding) = by_name.get(&sampler_name.to_ascii_lowercase()) {
+                        let coord = rewrite_custom_sampler_calls_inner(&coord, by_name, layer_size);
+                        let target = if binding.point_filter {
+                            "sampler_named_point"
+                        } else {
+                            "sampler_named_linear"
+                        };
+                        let transformed = atlas_uv_expression(
+                            &coord,
+                            binding.layer,
+                            binding.clamp,
+                            layer_size,
+                            function == "texture",
+                        );
+                        out.push_str(if function == "texture" {
+                            "texture("
+                        } else {
+                            "tex2D("
+                        });
+                        out.push_str(target);
+                        out.push_str(", ");
+                        out.push_str(&transformed);
+                        out.push(')');
+                        i = open + 1 + consumed;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = src[i..].chars().next().expect("i is in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn combined_sampler_identifier(argument: &str) -> &str {
+    let argument = argument.trim();
+    for prefix in ["sampler2D(", "sampler3D("] {
+        if let Some(inner) = argument
+            .strip_prefix(prefix)
+            .and_then(|v| v.strip_suffix(')'))
+        {
+            return inner.split(',').next().unwrap_or("").trim();
+        }
+    }
+    argument
+}
+
+fn atlas_uv_expression(
+    coord: &str,
+    layer: u32,
+    clamp: bool,
+    layer_size: u32,
+    glsl: bool,
+) -> String {
+    const GRID: u32 = 4;
+    const GUTTER: u32 = 2;
+    let stride = layer_size + GUTTER * 2;
+    let atlas_size = stride * GRID;
+    let column = layer % GRID;
+    let row = layer / GRID;
+    let uv = if glsl {
+        if clamp {
+            format!("clamp(({coord}).xy, vec2(0.0), vec2(1.0))")
+        } else {
+            format!("fract(({coord}).xy)")
+        }
+    } else if clamp {
+        format!("saturate(({coord}).xy)")
+    } else {
+        format!("frac(({coord}).xy)")
+    };
+    let vec2 = if glsl { "vec2" } else { "float2" };
+    let origin_x = column * stride + GUTTER;
+    let origin_y = row * stride + GUTTER;
+    format!(
+        "({vec2}({:.1}, {:.1}) + ({uv}) * {:.1}) / {:.1}",
+        origin_x as f32 + 0.5,
+        origin_y as f32 + 0.5,
+        layer_size.saturating_sub(1) as f32,
+        atlas_size as f32,
+    )
+}
+
+pub fn hlsl_milk_body_to_naga_with_named_textures(
+    body: &str,
+    bindings: &[NamedTextureRewriteBinding],
+    layer_size: u32,
+) -> String {
+    hlsl_milk_body_to_naga(&rewrite_custom_sampler_calls_for_atlas(
+        body, bindings, layer_size,
+    ))
+}
+
+pub fn hlsl_milk_warp_body_to_naga_with_named_textures(
+    body: &str,
+    bindings: &[NamedTextureRewriteBinding],
+    layer_size: u32,
+) -> String {
+    hlsl_milk_warp_body_to_naga(&rewrite_custom_sampler_calls_for_atlas(
+        body, bindings, layer_size,
+    ))
+}
+
+pub fn glsl_milk_body_to_naga_with_named_textures(
+    body: &str,
+    bindings: &[NamedTextureRewriteBinding],
+    layer_size: u32,
+) -> String {
+    glsl_milk_body_to_naga(&rewrite_custom_sampler_calls_for_atlas(
+        body, bindings, layer_size,
+    ))
+}
+
+pub fn glsl_milk_warp_body_to_naga_with_named_textures(
+    body: &str,
+    bindings: &[NamedTextureRewriteBinding],
+    layer_size: u32,
+) -> String {
+    glsl_milk_warp_body_to_naga(&rewrite_custom_sampler_calls_for_atlas(
+        body, bindings, layer_size,
+    ))
+}
+
 /// Returns true if `src` contains a const-typed array declaration (`const TYPE name[`).
 #[cfg(feature = "milk-native-converter")]
 fn contains_const_array(src: &str) -> bool {
@@ -880,7 +1347,7 @@ fn contains_const_array(src: &str) -> bool {
 // and transforms never fire on `Unknown` — so valid shaders are left untouched.
 // ===========================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GTy {
     F,      // float scalar (ints folded in here — we only care about float context)
     V(u8),  // float vector, width 2..4
@@ -909,6 +1376,7 @@ fn seed_known_types(t: &mut TypeTable) {
         "slow_roam_sin",
         "roam_sin",
         "rand_frame",
+        "rand_start",
         "rand_preset",
         "vColor",
         "vDecay",
@@ -1123,7 +1591,12 @@ fn collect_decl_types(src: &str, t: &mut TypeTable) {
 fn builtin_ret(name: &str, arg0: GTy) -> Option<GTy> {
     Some(match name {
         "texture" | "texture2D" | "texture3D" | "textureLod" | "texelFetch" => GTy::V(4),
-        "GetMain" | "GetPixel" | "GetBlur1" | "GetBlur2" | "GetBlur3" | "lum" => GTy::V(3),
+        "GetMain" | "GetPixel" | "GetBlur1" | "GetBlur2" | "GetBlur3" => GTy::V(3),
+        "lum" => match arg0 {
+            GTy::F | GTy::V(2) => GTy::F,
+            GTy::V(3) | GTy::V(4) => GTy::V(3),
+            _ => return None,
+        },
         "length" | "distance" | "dot" | "determinant" | "float" => GTy::F,
         "cross" => GTy::V(3),
         "vec2" => GTy::V(2),
@@ -1136,7 +1609,8 @@ fn builtin_ret(name: &str, arg0: GTy) -> Option<GTy> {
         "normalize" | "abs" | "floor" | "ceil" | "fract" | "sin" | "cos" | "tan" | "asin"
         | "acos" | "atan" | "exp" | "exp2" | "log" | "log2" | "sqrt" | "inversesqrt" | "sign"
         | "radians" | "degrees" | "saturate" | "safeRecip" | "round" | "trunc" | "mix"
-        | "clamp" | "min" | "max" | "mod" | "pow" | "reflect" | "smoothstep" | "step" | "neg" => {
+        | "log10" | "clamp" | "min" | "max" | "mod" | "pow" | "reflect" | "smoothstep" | "step"
+        | "neg" => {
             if arg0 == GTy::Unknown {
                 return None;
             }
@@ -1423,9 +1897,11 @@ fn collect_fn_sigs(src: &str) -> HashMap<String, Vec<GTy>> {
 /// PUBLIC ENTRY: build a type table from the whole shader and apply the type-mismatch
 /// repairs. Applied at the compile_glsl choke point so it covers every conversion path.
 pub fn fix_glsl_vector_types(glsl: &str) -> String {
+    let glsl = lower_mutable_q_aliases(glsl);
+    let glsl = expand_simple_helper_aliases(&glsl);
     let mut table: TypeTable = HashMap::new();
     seed_known_types(&mut table);
-    collect_decl_types(glsl, &mut table);
+    collect_decl_types(&glsl, &mut table);
     // Re-assert the seeded builtin types: they are canonical MilkDrop names (uv→vec2,
     // ret→vec3, texsize→vec4, …) and must not be collapsed to Unknown by a conflicting
     // FUNCTION PARAMETER of the same name. The preamble's overloaded helpers bind `uv`
@@ -1433,7 +1909,7 @@ pub fn fix_glsl_vector_types(glsl: &str) -> String {
     // (via ins_ty conflict→Unknown) poison the global `uv`, silently disabling op-width /
     // assignment-width / relop repair for every uv-expression. Seeds win over params.
     seed_known_types(&mut table);
-    let sigs = collect_fn_sigs(glsl);
+    let sigs = collect_fn_sigs(&glsl);
     // Only rewrite the PRESET BODY (after the preamble marker). The fixed preamble
     // (UBO block, q #defines, GetBlur/lum/saturate/safeRecip helpers) is correct by
     // construction and must never be touched by a repair pass — two regressions came
@@ -1441,7 +1917,7 @@ pub fn fix_glsl_vector_types(glsl: &str) -> String {
     const MARK: &str = "// __MILK_BODY__";
     let (prefix, body) = match glsl.find(MARK) {
         Some(pos) => glsl.split_at(pos),
-        None => ("", glsl),
+        None => ("", glsl.as_str()),
     };
     let s0 = fix_array_brace_init(body);
     let s0b = join_logical_statements(&s0);
@@ -1455,48 +1931,300 @@ pub fn fix_glsl_vector_types(glsl: &str) -> String {
     let s3b = fix_return_width_mismatches(&s3, &table);
     let s3c = fix_dot_calls(&s3b, &table);
     let s3d = fix_typed_scalar_swizzles(&s3c, &table);
-    let s4 = fix_for_constructor_cond(&s3d);
+    // Removing a scalar bool swizzle exposes the underlying bool expression. Run
+    // assignment coercion once more so HLSL's bool-as-number assignment semantics
+    // are preserved (for example `float x = (a > b).x`).
+    let s3e = fix_assignment_width_mismatches(&s3d, &table);
+    let s3f = fix_int_compound_assignments(&s3e);
+    let s3g = fix_numeric_logical_not(&s3f, &table);
+    let s4 = fix_for_constructor_cond(&s3g);
     format!("{prefix}{s4}")
+}
+
+/// Expand the small class of object-like helper aliases emitted by MilkDrop
+/// shaders (`#define MyGet GetPixel`) before type inference. naga expands the
+/// macro later, but our conservative inference otherwise sees `MyGet` as an
+/// unknown function and cannot repair HLSL vector-to-scalar assignments. Only
+/// aliases to fixed, side-effect-free preamble helpers are accepted; all other
+/// directives are left verbatim.
+fn expand_simple_helper_aliases(glsl: &str) -> String {
+    const MARK: &str = "// __MILK_BODY__";
+    const HELPERS: &[&str] = &[
+        "GetMain", "GetPixel", "GetBlur1", "GetBlur2", "GetBlur3", "lum", "saturate",
+    ];
+    let Some(pos) = glsl.find(MARK) else {
+        return glsl.to_string();
+    };
+    let (prefix, body) = glsl.split_at(pos);
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut kept = String::with_capacity(body.len());
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let parsed = trimmed.strip_prefix("#define ").and_then(|rest| {
+            let mut words = rest.split_whitespace();
+            let alias = words.next()?;
+            let target = words.next()?;
+            (words.next().is_none()
+                && is_plain_ident(alias)
+                && is_plain_ident(target)
+                && HELPERS.contains(&target))
+            .then(|| (alias.to_string(), target.to_string()))
+        });
+        if let Some(alias) = parsed {
+            aliases.push(alias);
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    for (alias, target) in aliases {
+        kept = replace_word(&kept, &alias, &target);
+    }
+    format!("{prefix}{kept}")
+}
+
+fn is_plain_ident(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// GLSL expands the preamble's `q1..q32` macros directly onto the read-only
+/// `PerFrame` UBO. MilkDrop HLSL nevertheless permits shader-local q mutation
+/// (`q25 = 1;`) and expects later reads in the same fragment to observe it. Lower
+/// only q registers that are actually written to private per-invocation slots,
+/// initialized from the UBO at the start of `main`; mutations are discarded when
+/// the fragment ends and can never write through the uniform alias.
+fn lower_mutable_q_aliases(glsl: &str) -> String {
+    const MARK: &str = "// __MILK_BODY__";
+    let Some(mark_pos) = glsl.find(MARK) else {
+        return glsl.to_string();
+    };
+    let body_start = mark_pos + MARK.len();
+    let body = &glsl[body_start..];
+    let written = written_q_registers(body);
+    if written.is_empty() {
+        return glsl.to_string();
+    }
+
+    let rewritten = rewrite_q_registers(body, &written);
+    let Some(main_pos) = rewritten.find("void main()") else {
+        // The wrapper generators always emit this spelling. If a caller supplies
+        // an incomplete program, leave it untouched rather than creating globals
+        // with no initialization point.
+        return glsl.to_string();
+    };
+    let Some(open_rel) = rewritten[main_pos..].find('{') else {
+        return glsl.to_string();
+    };
+    let main_open = main_pos + open_rel;
+
+    let mut declarations = String::new();
+    let mut initializers = String::new();
+    for &q in &written {
+        declarations.push_str(&format!("\nfloat particle_local_q{q};"));
+        initializers.push_str(&format!(
+            "\n    particle_local_q{q} = {};",
+            q_uniform_component(q)
+        ));
+    }
+
+    let mut out = String::with_capacity(glsl.len() + declarations.len() + initializers.len());
+    out.push_str(&glsl[..body_start]);
+    out.push_str(&declarations);
+    out.push_str(&rewritten[..=main_open]);
+    out.push_str(&initializers);
+    out.push_str(&rewritten[main_open + 1..]);
+    out
+}
+
+fn q_register_number(token: &str) -> Option<u8> {
+    let digits = token.strip_prefix('q')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value: u8 = digits.parse().ok()?;
+    (1..=32).contains(&value).then_some(value)
+}
+
+fn q_uniform_component(q: u8) -> String {
+    let zero_based = q - 1;
+    let group = char::from(b'a' + zero_based / 4);
+    let component = ["x", "y", "z", "w"][(zero_based % 4) as usize];
+    format!("_q{group}.{component}")
+}
+
+fn written_q_registers(src: &str) -> Vec<u8> {
+    let bytes = src.as_bytes();
+    let mut written = [false; 33];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            i = skip_string_literal(bytes, i);
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let Some(q) = q_register_number(&src[start..i]) else {
+                continue;
+            };
+            let mut after = i;
+            while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            let suffix = bytes.get(after..after.saturating_add(2));
+            let suffix_write = matches!(
+                suffix,
+                Some(b"++")
+                    | Some(b"--")
+                    | Some(b"+=")
+                    | Some(b"-=")
+                    | Some(b"*=")
+                    | Some(b"/=")
+                    | Some(b"%=")
+            ) || (bytes.get(after) == Some(&b'=')
+                && bytes.get(after + 1) != Some(&b'='));
+            let before = src[..start].trim_end().as_bytes();
+            let prefix_write = before.ends_with(b"++") || before.ends_with(b"--");
+            if suffix_write || prefix_write {
+                written[q as usize] = true;
+            }
+            continue;
+        }
+        let ch = src[i..].chars().next().expect("i is in bounds");
+        i += ch.len_utf8();
+    }
+    (1..=32).filter(|&q| written[q]).map(|q| q as u8).collect()
+}
+
+fn rewrite_q_registers(src: &str, written: &[u8]) -> String {
+    let mut selected = [false; 33];
+    for &q in written {
+        selected[q as usize] = true;
+    }
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&src[start..i]);
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            out.push_str(&src[start..i]);
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let end = skip_string_literal(bytes, i);
+            out.push_str(&src[i..end]);
+            i = end;
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let token = &src[start..i];
+            if let Some(q) = q_register_number(token).filter(|q| selected[*q as usize]) {
+                out.push_str(&format!("particle_local_q{q}"));
+            } else {
+                out.push_str(token);
+            }
+            continue;
+        }
+        let ch = src[i..].chars().next().expect("i is in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn drop_duplicate_bare_decls_same_scope(src: &str) -> String {
     use std::collections::HashSet;
 
     let mut out = String::with_capacity(src.len());
-    let mut seen: HashSet<(i32, String, String)> = HashSet::new();
-    let mut depth = 0i32;
+    // Numeric brace depth is not a scope identity: two sibling helper functions
+    // both have locals at depth 1. Use a real scope stack so a declaration in one
+    // function can never suppress a same-named local in the next.
+    let mut scopes: Vec<HashSet<String>> = vec![HashSet::new()];
     for line in src.lines() {
         let trimmed = line.trim();
+        let mut replacement: Option<String> = None;
         let duplicate = parse_glsl_decl_line(trimmed).is_some_and(|(ty, names, bare)| {
-            if bare
-                && names
-                    .iter()
-                    .all(|name| seen.contains(&(depth, ty.clone(), name.clone())))
-            {
-                true
-            } else {
-                for name in names {
-                    seen.insert((depth, ty.clone(), name));
-                }
-                false
+            let scope = scopes.last_mut().expect("root scope is retained");
+            let already_seen = names.iter().all(|name| scope.contains(name));
+            if already_seen && bare {
+                return true;
             }
+            if already_seen && names.len() == 1 {
+                // HLSL accepts a same-scope redeclaration with an initializer. GLSL
+                // does not, so retain the side effect and lower it to assignment.
+                let indent = &line[..line.len() - line.trim_start().len()];
+                if let Some(rest) = trimmed.strip_prefix(&ty) {
+                    replacement = Some(format!("{indent}{}", rest.trim_start()));
+                    return false;
+                }
+            }
+            for name in names {
+                scope.insert(name);
+            }
+            false
         });
         if !duplicate {
-            out.push_str(line);
+            out.push_str(replacement.as_deref().unwrap_or(line));
             out.push('\n');
         }
-        depth += line.bytes().fold(0, |acc, byte| match byte {
-            b'{' => acc + 1,
-            b'}' => acc - 1,
-            _ => acc,
-        });
+        let brace_code = line.split_once("//").map_or(line, |(code, _)| code);
+        for byte in brace_code.bytes() {
+            match byte {
+                b'{' => scopes.push(HashSet::new()),
+                b'}' if scopes.len() > 1 => {
+                    scopes.pop();
+                }
+                _ => {}
+            }
+        }
     }
     out
 }
 
 fn parse_glsl_decl_line(line: &str) -> Option<(String, Vec<String>, bool)> {
     let body = line.strip_suffix(';')?.trim();
-    if body.contains('(') || body.starts_with("layout") || body.starts_with("return") {
+    if body.starts_with("layout") || body.starts_with("return") {
         return None;
     }
     let mut parts = body.splitn(2, char::is_whitespace);
@@ -1505,6 +2233,12 @@ fn parse_glsl_decl_line(line: &str) -> Option<(String, Vec<String>, bool)> {
     let rest = parts.next()?.trim();
     if rest.is_empty() {
         return None;
+    }
+    let name_end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    if rest[name_end..].trim_start().starts_with('(') {
+        return None; // function prototype/definition, not a local declaration
     }
     let bare = !rest.contains('=');
     let names_part = rest.split('=').next().unwrap_or(rest);
@@ -1529,6 +2263,80 @@ fn parse_glsl_decl_line(line: &str) -> Option<(String, Vec<String>, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutable_q_writes_use_private_fragment_slots() {
+        let io = "layout(location = 0) out vec4 fragColor;";
+        let glsl = format!(
+            "{}\n\
+             float authored_q_update() {{ q25 += 1.0; return q25; }}\n\
+             void main() {{\n\
+                 // q1 = 9.0; comments do not request a mutable slot\n\
+                 q25 = authored_q_update();\n\
+                 fragColor = vec4(q25);\n\
+             }}\n",
+            milk_fs_preamble(io)
+        );
+
+        let fixed = fix_glsl_vector_types(&glsl);
+        let body = fixed
+            .split_once("// __MILK_BODY__")
+            .expect("generated shader has body marker")
+            .1;
+        assert!(body.contains("float particle_local_q25;"), "{fixed}");
+        assert!(body.contains("particle_local_q25 = _qg.x;"), "{fixed}");
+        assert_eq!(count_word(body, "q25"), 0, "{fixed}");
+        assert!(!body.contains("particle_local_q1"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("mutable q shader did not compile: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn narrow_lum_overloads_preserve_scalar_expression_width() {
+        let hlsl = r#"shader_body {
+            float scalar = 0.25;
+            float2 pair = float2(0.5, 0.25);
+            ret.x = lerp(ret.x, lum(scalar), 0.2);
+            uv += float2(lum(pair));
+            ret += GetMain(uv);
+        }"#;
+
+        let glsl = hlsl_milk_warp_body_to_naga(hlsl);
+        assert!(glsl.contains("float lum(float v) { return v; }"), "{glsl}");
+        assert!(
+            glsl.contains("float lum(vec2 v) { return dot(v, vec2(0.32, 0.49)); }"),
+            "{glsl}"
+        );
+        let mut types = TypeTable::new();
+        types.insert("scalar".to_string(), GTy::F);
+        types.insert("pair".to_string(), GTy::V(2));
+        types.insert("color".to_string(), GTy::V(3));
+        assert_eq!(infer_ty("lum(scalar)", &types), GTy::F);
+        assert_eq!(infer_ty("lum(pair)", &types), GTy::F);
+        assert_eq!(infer_ty("lum(color)", &types), GTy::V(3));
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("narrow lum shader did not compile: {error}\n{glsl}"));
+    }
+
+    #[test]
+    fn scalar_splats_are_repaired_inside_void_main_scope() {
+        // The preamble has several helper parameters named `v` at different
+        // widths, so the global type table deliberately marks `v` Unknown. The
+        // generated void main() scope must override that with this local vec2.
+        let hlsl = r#"shader_body {
+            float2 v = 0.01;
+            v = 0.02;
+            ret = GetMain(uv + v * 0.0);
+        }"#;
+
+        let glsl = hlsl_milk_warp_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(fixed.contains("vec2 v = vec2(0.01);"), "{fixed}");
+        assert!(fixed.contains("v = vec2(0.02);"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl).unwrap_or_else(|error| {
+            panic!("scalar-splat shader did not compile: {error}\n{fixed}")
+        });
+    }
 
     #[test]
     fn scalarizes_vector_terms_in_float_return() {
@@ -1561,6 +2369,19 @@ mod tests {
 
         assert!(fixed.contains("return 1-((tmp).x"), "{fixed}");
         assert!(fixed.contains("1.0/255*((tmp)).x"), "{fixed}");
+    }
+
+    #[test]
+    fn scalar_swizzle_repair_leaves_function_call_prefix_intact() {
+        let glsl = "// __MILK_BODY__\nvec3 noise = texture(sampler2D(sampler_noise_lq, sampler_noise_lq_samp), uv).rgb;\n";
+
+        let fixed = fix_glsl_vector_types(glsl);
+
+        assert!(
+            fixed.contains("texture(sampler2D(sampler_noise_lq, sampler_noise_lq_samp), uv).rgb"),
+            "{fixed}"
+        );
+        assert!(!fixed.contains("texturevec"), "{fixed}");
     }
 
     #[test]
@@ -1615,6 +2436,355 @@ mod tests {
             rest.contains("float after = 1;"),
             "funcs={funcs}\nrest={rest}"
         );
+    }
+
+    #[test]
+    fn corpus_failure_multiline_dead_decl_and_reserved_sample_compile() {
+        let hlsl = r#"shader_body {
+            float4 dead_noise = float4(uv, 0, 1)
+                + float4(0, 0, 0, 0);
+            float3 sample = tex2D(sampler_main, uv).xyz;
+            ret = sample * sample * sample;
+        }"#;
+
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(!fixed.contains("dead_noise"), "{fixed}");
+        assert!(fixed.contains("particle_sample"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("reserved/dead-decl shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_matrix_pow_and_log10_compile() {
+        let hlsl = r#"shader_body {
+            float2x2 rot = { q10, q11, -q11, q10 };
+            float lum = (lum(ret)).x;
+            ret = pow(lum, 0.4 + 1.6 * rand_preset.xyz);
+            ret.xy = mul(rot, ret.xy);
+            ret += log10(abs(ret) + 1.0);
+        }"#;
+
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(fixed.contains("mat2 rot = mat2("), "{fixed}");
+        assert!(fixed.contains("pow(vec3(lum)"), "{fixed}");
+        assert!(fixed.contains("log10("), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("matrix/pow/log10 shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_helper_alias_enables_scalar_lum_repair() {
+        let hlsl = r#"shader_body {
+            #define MyGet GetPixel
+            float4 lums = 0;
+            lums.x = lum(MyGet(uv + texsize.zw));
+            ret = lums.xxx;
+        }"#;
+
+        let glsl = hlsl_milk_warp_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(!fixed.contains("#define MyGet"), "{fixed}");
+        assert!(fixed.contains("lum(GetPixel("), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("helper-alias shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_redeclarations_are_scope_aware() {
+        let hlsl = r#"
+            float helper_a(float2 domain) { float2 c = domain; return c.x; }
+            float helper_b(float2 domain) { float2 c = domain; return c.y; }
+            shader_body {
+                float2 d, uv1;
+                float3 dx, dy;
+                float2 d = texsize.zw;
+                float3 dx = float3(d, 0);
+                float3 dy = float3(d.yx, 0);
+                ret = helper_a(uv) + helper_b(uv) + dx + dy;
+            }
+        "#;
+
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert_eq!(
+            count_word(&fixed, "c"),
+            4,
+            "both helper locals survive: {fixed}"
+        );
+        assert!(!fixed.contains("vec2 d = texsize.zw"), "{fixed}");
+        assert!(!fixed.contains("vec3 dx = vec3"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("redeclaration shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_numeric_flags_compile_in_control_and_arithmetic() {
+        let hlsl = r#"shader_body {
+            int exist_count = 0;
+            exist_count += ((float3(rand_preset.xyz >= 0.7))).x;
+            int first = ((rand_preset.z > 0.5)).x;
+            float mask = 0;
+            if (!first) { mask = 1; }
+            ret = mask * (!first) + saturate(!mask) + exist_count;
+        }"#;
+
+        let glsl = hlsl_milk_warp_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(fixed.contains("exist_count += int("), "{fixed}");
+        assert!(fixed.contains("int first = int("), "{fixed}");
+        assert!(fixed.contains("float(float(first) == 0.0)"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("numeric-flag shader failed: {error}\n{fixed}"));
+    }
+
+    // ── P2-VIS-014: shader source/work budgets + one-pass preprocessing ───────
+
+    #[test]
+    fn over_budget_shader_source_is_rejected() {
+        // A source larger than MAX_SHADER_BYTES is rejected by an O(1) length check
+        // before any pass allocates or scans — bounded work regardless of size.
+        let huge = "a = b;\n".repeat(MAX_SHADER_BYTES / 6 + 10);
+        assert!(huge.len() > MAX_SHADER_BYTES);
+        assert!(matches!(
+            try_butterchurn_to_naga(&huge),
+            Err(PreprocessError::SourceTooLarge { .. })
+        ));
+        // The infallible entry point degrades to an inert empty program.
+        assert!(butterchurn_to_naga(&huge).is_empty());
+    }
+
+    #[test]
+    fn too_many_lines_shader_source_is_rejected() {
+        // Many short lines stay under the byte budget but blow the line budget; the
+        // scan bails during classification (bounded work), before emit/join.
+        let many_lines = "\n".repeat(MAX_SHADER_LINES + 5_000);
+        assert!(
+            many_lines.len() < MAX_SHADER_BYTES,
+            "stays under byte budget"
+        );
+        assert!(matches!(
+            try_butterchurn_to_naga(&many_lines),
+            Err(PreprocessError::TooManyLines { .. })
+        ));
+    }
+
+    #[test]
+    fn normal_shader_still_preprocesses() {
+        // A normal butterchurn shader converts correctly: version bump, precision
+        // strip, sampler split, in/out layout qualifiers, scalar → UBO, and the
+        // texture() sampler rewrite.
+        let src = "#version 300 es\n\
+precision highp float;\n\
+uniform sampler2D sampler_main;\n\
+uniform float time;\n\
+in vec2 uv;\n\
+out vec4 frag;\n\
+void main() {\n\
+    frag = texture(sampler_main, uv) * time;\n\
+}\n";
+        let out = butterchurn_to_naga(src);
+        assert!(out.contains("#version 450"), "{out}");
+        assert!(!out.contains("#version 300"), "{out}");
+        assert!(!out.contains("precision highp"), "{out}");
+        assert!(
+            out.contains("layout(set = 0, binding = 0) uniform texture2D sampler_main;"),
+            "{out}"
+        );
+        assert!(
+            out.contains("layout(set = 0, binding = 1) uniform sampler sampler_main_samp;"),
+            "{out}"
+        );
+        assert!(out.contains("layout(location = 0) in vec2 uv;"), "{out}");
+        assert!(out.contains("layout(location = 0) out vec4 frag;"), "{out}");
+        // scalar folded into the UBO block.
+        assert!(out.contains("uniform PerFrame {"), "{out}");
+        assert!(out.contains("float time;"), "{out}");
+        // texture() rewritten to the separated sampler2D form.
+        assert!(
+            out.contains("texture(sampler2D(sampler_main, sampler_main_samp), uv)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_texture_calls_is_linear_and_output_identical() {
+        let mut map: HashMap<String, u32> = HashMap::new();
+        map.insert("sampler_main".to_string(), 0);
+        map.insert("sampler_blur1".to_string(), 2);
+
+        // `texture(name,` variant.
+        assert_eq!(
+            rewrite_texture_calls("x = texture(sampler_main, uv);", &map),
+            "x = texture(sampler2D(sampler_main, sampler_main_samp), uv);"
+        );
+        // `texture(name ,` (one space before comma) variant — space preserved.
+        assert_eq!(
+            rewrite_texture_calls("texture(sampler_blur1 , uv)", &map),
+            "texture(sampler2D(sampler_blur1, sampler_blur1_samp) , uv)"
+        );
+        // A longer identifier that merely starts with a known sampler name is NOT a
+        // partial match (the whole token is compared), so it is left untouched.
+        assert_eq!(
+            rewrite_texture_calls("texture(sampler_main_extra, uv)", &map),
+            "texture(sampler_main_extra, uv)"
+        );
+        // Unknown sampler names pass through unchanged.
+        assert_eq!(
+            rewrite_texture_calls("texture(unknown, uv)", &map),
+            "texture(unknown, uv)"
+        );
+    }
+
+    #[test]
+    fn custom_sampler_metadata_preserves_names_and_ignores_builtins() {
+        let src = r#"
+sampler sampler_fw_worms;
+uniform sampler2D sampler_rose;
+ret = tex2D(sampler_rand00, uv).rgb;
+ret += tex2D(sampler_noise_lq, uv).rgb;
+"#;
+        assert_eq!(
+            custom_sampler_names(src),
+            ["sampler_fw_worms", "sampler_rose", "sampler_rand00"]
+        );
+        assert!(
+            custom_sampler_names("texture(sampler2D(sampler_main, sampler_main_samp), uv);")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fixed_sampler_table_reserves_named_atlas_slots_without_growing() {
+        assert_eq!(MILKDROP_SAMPLERS.len(), 16);
+        assert_eq!(MILKDROP_SAMPLERS[12], "sampler_named_linear");
+        assert_eq!(MILKDROP_SAMPLERS[13], "sampler_named_point");
+        assert!(!MILKDROP_SAMPLERS.contains(&"sampler_noise_hq_lite"));
+        assert!(!MILKDROP_SAMPLERS.contains(&"sampler_pw_noise_lq"));
+        assert_eq!(
+            normalize_milkdrop_sampler_variants("sampler_noise_hq_lite sampler_pw_noise_lq"),
+            "sampler_noise_lq_lite sampler_noise_lq"
+        );
+    }
+
+    #[test]
+    fn explicit_custom_sampler_rewrite_is_simultaneous_and_updates_texsize() {
+        let src = "ret = tex2D(sampler_rose, uv); float2 s = texsize_rose.xy; sampler_rosebud;";
+        let replacements = HashMap::from([
+            ("sampler_rose".to_string(), "sampler_named0".to_string()),
+            (
+                "sampler_named0".to_string(),
+                "sampler_should_not_cascade".to_string(),
+            ),
+        ]);
+        let out = rewrite_custom_sampler_identifiers(src, &replacements);
+        assert_eq!(
+            out,
+            "ret = tex2D(sampler_named0, uv); float2 s = texsize_named0.xy; sampler_rosebud;"
+        );
+    }
+
+    #[test]
+    fn rewrites_named_texture_calls_to_fixed_guttered_atlas_slots() {
+        let bindings = [
+            NamedTextureRewriteBinding {
+                sampler_name: "sampler_fw_worms".to_string(),
+                layer: 5,
+                point_filter: false,
+                clamp: false,
+            },
+            NamedTextureRewriteBinding {
+                sampler_name: "sampler_pc_rose".to_string(),
+                layer: 2,
+                point_filter: true,
+                clamp: true,
+            },
+        ];
+        let hlsl = "ret = tex2D(sampler_fw_worms, uv).rgb + tex2D(sampler_pc_rose, uv*2).rgb; float2 s=texsize_fw_worms.xy;";
+        let out = rewrite_custom_sampler_calls_for_atlas(hlsl, &bindings, 256);
+        assert!(out.contains("tex2D(sampler_named_linear"), "{out}");
+        assert!(out.contains("frac((uv).xy)"), "{out}");
+        assert!(out.contains("tex2D(sampler_named_point"), "{out}");
+        assert!(out.contains("saturate((uv*2).xy)"), "{out}");
+        assert!(out.contains("texsize_noise_mq.xy"), "{out}");
+    }
+
+    #[test]
+    fn rewrites_combined_glsl_sampler_calls_to_atlas() {
+        let bindings = [NamedTextureRewriteBinding {
+            sampler_name: "sampler_rose".to_string(),
+            layer: 0,
+            point_filter: false,
+            clamp: true,
+        }];
+        let glsl = "ret = texture(sampler2D(sampler_rose, sampler_rose_samp), uv).rgb;";
+        let out = rewrite_custom_sampler_calls_for_atlas(glsl, &bindings, 256);
+        assert!(out.contains("texture(sampler_named_linear"), "{out}");
+        assert!(
+            out.contains("clamp((uv).xy, vec2(0.0), vec2(1.0))"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn named_texture_hlsl_wrapper_produces_compilable_glsl() {
+        let bindings = [NamedTextureRewriteBinding {
+            sampler_name: "sampler_fw_worms".to_string(),
+            layer: 3,
+            point_filter: false,
+            clamp: false,
+        }];
+        let hlsl =
+            "sampler sampler_fw_worms;\nshader_body { ret = tex2D(sampler_fw_worms, uv).rgb; }";
+        let glsl = hlsl_milk_body_to_naga_with_named_textures(hlsl, &bindings, 256);
+        assert!(!glsl.contains("sampler_fw_worms"), "{glsl}");
+        assert!(glsl.contains("sampler_named_linear"), "{glsl}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|err| panic!("named-texture shader did not compile: {err}\n{glsl}"));
+    }
+
+    // ── P2-VIS-033: tokenized (comment/string/brace-aware) shader_body extract ─
+
+    #[test]
+    fn shader_body_extraction_ignores_braces_in_block_comment() {
+        // The body contains unbalanced `}` inside a block comment AND content after
+        // the real closing brace. A naive brace-count (only // aware) closes the
+        // wrapper at the first `}` inside the comment and truncates the body; the
+        // comment-aware scanner captures the whole body and drops the trailing junk.
+        let src = "shader_body {\n\
+    /* closing braces } } } inside a block comment */\n\
+    ret = vec3(1.0);\n\
+}\n\
+this_is_after_the_wrapper;";
+        let (before, inner) = split_shader_body_wrapper(src);
+        assert!(before.is_empty(), "before={before}");
+        assert!(
+            inner.contains("ret = vec3(1.0);"),
+            "body truncated: inner={inner}"
+        );
+        assert!(
+            !inner.contains("this_is_after_the_wrapper"),
+            "trailing content leaked: inner={inner}"
+        );
+    }
+
+    #[test]
+    fn shader_body_extraction_skips_keyword_substring_in_identifier() {
+        // A global whose NAME embeds `shader_body` is declared before the real
+        // wrapper. A plain substring find splits at the identifier, discarding the
+        // global; the token-aware scanner splits at the real `shader_body {`.
+        let src = "float shader_body_gain = 2.0;\n\
+shader_body {\n\
+    ret = vec3(shader_body_gain);\n\
+}";
+        let (before, inner) = split_shader_body_wrapper(src);
+        assert_eq!(before, "float shader_body_gain = 2.0;", "before={before}");
+        assert!(
+            inner.contains("ret = vec3(shader_body_gain);"),
+            "inner={inner}"
+        );
+        assert!(!inner.contains("shader_body {"), "inner={inner}");
     }
 }
 
@@ -1679,7 +2849,15 @@ fn parse_fn_header(s: &str) -> Option<(GTy, Vec<(String, GTy)>)> {
     if hp.next().is_some() {
         return None; // more than `<type> <name>` before `(` → not a header
     }
-    let ret = keyword_gty(kw)?;
+    // `main` and many authored helpers return void. Track those functions too so
+    // their local declarations override same-named preamble/helper parameters in
+    // the per-function type table. Unknown is intentional here: a void function
+    // has no return expression to coerce, while its locals still need repair.
+    let ret = if kw == "void" {
+        GTy::Unknown
+    } else {
+        keyword_gty(kw)?
+    };
     if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
@@ -2050,15 +3228,67 @@ fn fix_for_constructor_cond(src: &str) -> String {
 /// rejected by naga ("Unknown function 'pow'"). HLSL applies pow component-wise and
 /// truncates the wider operand. Truncate the wider arg to the narrower width. naga
 /// types an arithmetic base by the LEFTMOST vector operand width (NOT the max), so we
-/// mirror that with `leftmost_vec_width`. Conservative: only fires when BOTH widths are
-/// confidently known vectors (>=2) and differ; scalar/Unknown args are left untouched.
+/// mirror that with `leftmost_vec_width`. HLSL also broadcasts a scalar when the other
+/// argument is a vector; GLSL requires both arguments to have the same genType.
 fn fix_pow_arg_width(src: &str, t: &TypeTable) -> String {
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut in_fn = false;
+    let mut fn_level = 0i32;
+    let mut depth = 0i32;
+    let mut merged = t.clone();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if !in_fn {
+            if let Some((_ret, params)) = parse_fn_header(trimmed) {
+                in_fn = true;
+                fn_level = depth;
+                merged = t.clone();
+                for (name, ty) in params {
+                    merged.insert(name, ty);
+                }
+            }
+        }
+        if in_fn {
+            record_local_decls(trimmed, &mut merged);
+        }
+        out.push_str(&fix_pow_arg_width_with_table(
+            line,
+            if in_fn { &merged } else { t },
+        ));
+        out.push('\n');
+        for byte in line.bytes() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if in_fn && depth <= fn_level {
+                        in_fn = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn fix_pow_arg_width_with_table(src: &str, t: &TypeTable) -> String {
     rewrite_calls_named(src, "pow", |args| {
         if args.len() != 2 {
             return None;
         }
-        let wb = leftmost_vec_width(args[0].trim(), t);
-        let we = gty_width(infer_ty(args[1].trim(), t));
+        let base = args[0].trim();
+        let exponent = args[1].trim();
+        let tb = infer_ty(base, t);
+        let te = infer_ty(exponent, t);
+        let wb = leftmost_vec_width(base, t);
+        let we = gty_width(te);
+        if tb == GTy::F && we >= 2 {
+            return Some(vec![format!("vec{we}({base})"), args[1].clone()]);
+        }
+        if wb >= 2 && te == GTy::F {
+            return Some(vec![args[0].clone(), format!("vec{wb}({exponent})")]);
+        }
         if wb < 2 || we < 2 || wb == we {
             return None;
         }
@@ -2210,7 +3440,8 @@ fn fix_typed_scalar_swizzles(src: &str, t: &TypeTable) -> String {
                 i += 1;
             }
             let ident = &src[start..i];
-            if i < src.len() && b[i] == b'.' && t.get(ident).copied() == Some(GTy::F) {
+            let scalar_ty = t.get(ident).copied();
+            if i < src.len() && b[i] == b'.' && matches!(scalar_ty, Some(GTy::F | GTy::B)) {
                 let sw_start = i + 1;
                 let mut sw_end = sw_start;
                 while sw_end < src.len()
@@ -2225,6 +3456,8 @@ fn fix_typed_scalar_swizzles(src: &str, t: &TypeTable) -> String {
                     let width = sw_end - sw_start;
                     if width == 1 {
                         out.push_str(ident);
+                    } else if scalar_ty == Some(GTy::B) {
+                        out.push_str(&format!("bvec{width}({ident})"));
                     } else {
                         out.push_str(&format!("vec{width}({ident})"));
                     }
@@ -2235,10 +3468,16 @@ fn fix_typed_scalar_swizzles(src: &str, t: &TypeTable) -> String {
             out.push_str(ident);
             continue;
         }
-        if c == b'(' {
+        // A function call's `(` belongs to its callee. Treating it as a bare
+        // parenthesized scalar expression would turn
+        // `texture(...).rgb` into `texturevec3((...))`, which is invalid GLSL.
+        // Only repair a parenthesized expression when it is not immediately
+        // attached to an identifier (the function-call form).
+        if c == b'(' && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) {
             if let Some(close) = matching_close(src, i) {
                 let after = close + 1;
-                if after < src.len() && b[after] == b'.' && infer_ty(&src[i..=close], t) == GTy::F {
+                let scalar_ty = infer_ty(&src[i..=close], t);
+                if after < src.len() && b[after] == b'.' && matches!(scalar_ty, GTy::F | GTy::B) {
                     let sw_start = after + 1;
                     let mut sw_end = sw_start;
                     while sw_end < src.len()
@@ -2254,6 +3493,8 @@ fn fix_typed_scalar_swizzles(src: &str, t: &TypeTable) -> String {
                         let expr = &src[i..=close];
                         if width == 1 {
                             out.push_str(expr);
+                        } else if scalar_ty == GTy::B {
+                            out.push_str(&format!("bvec{width}({expr})"));
                         } else {
                             out.push_str(&format!("vec{width}({expr})"));
                         }
@@ -2502,6 +3743,11 @@ fn fix_array_brace_init(body: &str) -> String {
     let mut out = String::with_capacity(n + 64);
     let mut i = 0;
     while i < n {
+        if let Some((end, repl)) = try_matrix_brace_init(body, i) {
+            out.push_str(&repl);
+            i = end;
+            continue;
+        }
         if let Some((end, repl)) = try_array_brace_init(body, i) {
             out.push_str(&repl);
             i = end;
@@ -2512,6 +3758,90 @@ fn fix_array_brace_init(body: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// Translate an HLSL matrix brace initializer to a GLSL constructor:
+/// `mat2 rot = {a, b, c, d}` -> `mat2 rot = mat2(a, b, c, d)`.
+/// The element count must exactly match the square matrix dimensions.
+fn try_matrix_brace_init(body: &str, i: usize) -> Option<(usize, String)> {
+    let b = body.as_bytes();
+    let n = b.len();
+    if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
+        return None;
+    }
+    if i + 4 > n || &b[i..i + 3] != b"mat" || !matches!(b[i + 3], b'2' | b'3' | b'4') {
+        return None;
+    }
+    let width = (b[i + 3] - b'0') as usize;
+    let mut p = i + 4;
+    if p >= n || !b[p].is_ascii_whitespace() {
+        return None;
+    }
+    while p < n && b[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    let id0 = p;
+    while p < n && (b[p].is_ascii_alphanumeric() || b[p] == b'_') {
+        p += 1;
+    }
+    if p == id0 {
+        return None;
+    }
+    let ident = &body[id0..p];
+    while p < n && b[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    if p >= n || b[p] != b'=' || b.get(p + 1) == Some(&b'=') {
+        return None;
+    }
+    p += 1;
+    while p < n && b[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    if p >= n || b[p] != b'{' {
+        return None;
+    }
+    let open = p;
+    let mut depth = 0i32;
+    let mut close = open;
+    while close < n {
+        match b[close] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        close += 1;
+    }
+    if close >= n {
+        return None;
+    }
+    let inner = &body[open + 1..close];
+    if inner.contains('{') {
+        return None;
+    }
+    let mut pieces = split_top_level_commas(inner);
+    if pieces.last().is_some_and(|piece| piece.trim().is_empty()) {
+        pieces.pop();
+    }
+    if pieces.len() != width * width || pieces.iter().any(|piece| piece.trim().is_empty()) {
+        return None;
+    }
+    Some((
+        close + 1,
+        format!(
+            "mat{width} {ident} = mat{width}({})",
+            pieces
+                .iter()
+                .map(|piece| piece.trim())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
 }
 
 /// Try to parse `vecW <ident>[N] = { … }` starting exactly at byte `i`. Returns
@@ -3105,26 +4435,35 @@ fn fix_assign_segment(seg: &str, t: &TypeTable) -> String {
     if lhs.is_empty() || rhs.is_empty() {
         return seg.to_string();
     }
-    // LHS width: a `<type> name` declaration, or a plain identifier in the table.
+    // LHS type: a `<type> name` declaration, or a plain identifier/expression in
+    // the table. Keep bool distinct even though it has scalar width.
     let words: Vec<&str> = lhs.split_whitespace().collect();
-    let lw = if words.len() == 2 && !lhs.contains(',') && !lhs.contains('[') {
-        keyword_gty(words[0]).map(gty_width)
+    let lt = if words.len() == 2 && !lhs.contains(',') && !lhs.contains('[') {
+        keyword_gty(words[0])
     } else if lhs.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        t.get(lhs).map(|&g| gty_width(g))
+        t.get(lhs).copied()
     } else {
         let inferred = infer_ty(lhs, t);
-        let w = gty_width(inferred);
-        (w >= 1).then_some(w)
+        (gty_width(inferred) >= 1).then_some(inferred)
     };
-    let Some(lw) = lw.filter(|&w| w >= 1) else {
+    let Some(lt) = lt.filter(|ty| gty_width(*ty) >= 1) else {
         return seg.to_string();
     };
+    let lw = gty_width(lt);
     let rt = infer_ty(rhs, t);
     let rw = gty_width(rt);
-    if rw == 0 || rw == lw {
-        return seg.to_string(); // unknown or already matching
+    if rw == 0 {
+        return seg.to_string();
     }
-    let new_rhs = if rt == GTy::F && lw > 1 {
+    let new_rhs = if lt == GTy::F && rt == GTy::B {
+        format!("float({rhs})")
+    } else if matches!(lt, GTy::V(_)) && rt == GTy::B {
+        format!("vec{lw}(float({rhs}))")
+    } else if lt == GTy::B && rt == GTy::F {
+        format!("({rhs}) != 0.0")
+    } else if rw == lw {
+        return seg.to_string(); // already matching
+    } else if rt == GTy::F && lw > 1 {
         format!("vec{lw}({rhs})") // scalar → broadcast
     } else if rw > lw {
         let sw = &"xyzw"[..lw as usize];
@@ -3133,6 +4472,213 @@ fn fix_assign_segment(seg: &str, t: &TypeTable) -> String {
         return seg.to_string(); // narrower vector (vec2→vec3): can't safely widen
     };
     format!("{lead}{lhs} = {new_rhs}{trail}")
+}
+
+/// HLSL permits compound assignment from floating expressions to an `int` and
+/// truncates the result. GLSL/naga requires an explicit conversion. Track names
+/// that are declared exclusively as `int` in this body and wrap their compound
+/// RHS in `int(...)`. Casting an already-integer RHS is harmless, while avoiding
+/// broad scalar-kind changes to the vector-width type system above.
+fn fix_int_compound_assignments(src: &str) -> String {
+    use std::collections::{HashMap, HashSet};
+
+    let mut kinds: HashMap<String, bool> = HashMap::new();
+    for line in src.lines() {
+        for segment in line.split(';') {
+            let trimmed = segment.trim().rsplit('{').next().unwrap_or(segment).trim();
+            let mut words = trimmed.splitn(2, char::is_whitespace);
+            let Some(ty) = words.next() else { continue };
+            let Some(rest) = words.next() else { continue };
+            if keyword_gty(ty).is_none() {
+                continue;
+            }
+            let names = rest.split('=').next().unwrap_or(rest);
+            for item in split_top_level_commas(names) {
+                let name: String = item
+                    .trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    continue;
+                }
+                let is_int = ty == "int";
+                kinds
+                    .entry(name)
+                    .and_modify(|only_int| *only_int &= is_int)
+                    .or_insert(is_int);
+            }
+        }
+    }
+    let ints: HashSet<String> = kinds
+        .into_iter()
+        .filter_map(|(name, only_int)| only_int.then_some(name))
+        .collect();
+    if ints.is_empty() {
+        return src.to_string();
+    }
+
+    let mut out = String::with_capacity(src.len() + 16);
+    for line in src.lines() {
+        out.push_str(&fix_int_compound_line(line, &ints));
+        out.push('\n');
+    }
+    out
+}
+
+fn fix_int_compound_line(line: &str, ints: &std::collections::HashSet<String>) -> String {
+    let (code, comment) = match line.find("//") {
+        Some(pos) => (&line[..pos], &line[pos..]),
+        None => (line, ""),
+    };
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (i, byte) in code.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b';' if depth == 0 => {
+                out.push_str(&fix_int_compound_segment(&code[start..i], ints));
+                out.push(';');
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&code[start..]);
+    out.push_str(comment);
+    out
+}
+
+fn fix_int_compound_segment(segment: &str, ints: &std::collections::HashSet<String>) -> String {
+    let trimmed = segment.trim();
+    let lead = &segment[..segment.len() - segment.trim_start().len()];
+    let trail = &segment[segment.trim_end().len()..];
+    if let Some(rest) = trimmed.strip_prefix("int ") {
+        let name_end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        let name = &rest[..name_end];
+        let after_name = rest[name_end..].trim_start();
+        if !name.is_empty()
+            && ints.contains(name)
+            && after_name.starts_with('=')
+            && !after_name.starts_with("==")
+        {
+            let rhs = after_name[1..].trim();
+            if !rhs.is_empty() && !rhs.starts_with("int(") {
+                return format!("{lead}int {name} = int({rhs}){trail}");
+            }
+        }
+    }
+    let Some(op) = find_compound_assign(trimmed) else {
+        return segment.to_string();
+    };
+    let lhs = trimmed[..op].trim();
+    let rhs = trimmed[op + 2..].trim();
+    if !ints.contains(lhs) || rhs.is_empty() || rhs.starts_with("int(") {
+        return segment.to_string();
+    }
+    let operator = &trimmed[op..op + 2];
+    format!("{lead}{lhs} {operator} int({rhs}){trail}")
+}
+
+/// HLSL accepts logical-not on numeric values. GLSL requires a bool operand, and
+/// the result must be converted back to float when it flows into arithmetic.
+/// Lower `!numeric_ident` to a zero comparison in control headers, or to a 0/1
+/// float elsewhere.
+fn fix_numeric_logical_not(src: &str, global: &TypeTable) -> String {
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut in_fn = false;
+    let mut fn_level = 0i32;
+    let mut depth = 0i32;
+    let mut merged = global.clone();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if !in_fn {
+            if let Some((_ret, params)) = parse_fn_header(trimmed) {
+                in_fn = true;
+                fn_level = depth;
+                merged = global.clone();
+                for (name, ty) in params {
+                    merged.insert(name, ty);
+                }
+            }
+        }
+        if in_fn {
+            record_local_decls(trimmed, &mut merged);
+        }
+        out.push_str(&fix_numeric_logical_not_line(
+            line,
+            if in_fn { &merged } else { global },
+        ));
+        out.push('\n');
+        for byte in line.bytes() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if in_fn && depth <= fn_level {
+                        in_fn = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn fix_numeric_logical_not_line(line: &str, table: &TypeTable) -> String {
+    let bytes = line.as_bytes();
+    let trimmed = line.trim_start();
+    let leading = line.len() - trimmed.len();
+    let control_span = ["if", "while"].iter().find_map(|keyword| {
+        let rest = trimmed.strip_prefix(keyword)?;
+        if rest
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return None;
+        }
+        let open_rel = rest.find('(')? + keyword.len();
+        let open = leading + open_rel;
+        Some((open, matching_close(line, open)?))
+    });
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'!' || bytes.get(i + 1) == Some(&b'=') {
+            let ch = line[i..].chars().next().expect("i is in bounds");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let mut start = i + 1;
+        while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start || table.get(&line[start..end]).copied() != Some(GTy::F) {
+            out.push('!');
+            i += 1;
+            continue;
+        }
+        let ident = &line[start..end];
+        let as_bool = control_span.is_some_and(|(open, close)| i > open && i < close);
+        if as_bool {
+            out.push_str(&format!("(float({ident}) == 0.0)"));
+        } else {
+            out.push_str(&format!("float(float({ident}) == 0.0)"));
+        }
+        i = end;
+    }
+    out
 }
 
 /// Some converter output keeps control/block prefixes on the same physical segment,
@@ -3623,7 +5169,7 @@ void main() {{
     // comp_19 re-colors the grayscale luminance via pow(hue_shader, ret).
     // Previously vColor was a constant white (1,1,1) -> pow()->1 -> no color.
     float _ht = time * 30.0;
-    vec4 _hr = rand_preset; // rand_start phase offsets: r=.w, g=.y, b=.z
+    vec4 _hr = rand_start; // rand_start phase offsets: r=.w, g=.y, b=.z
     vec3 _hc0 = vec3(0.6+0.3*sin(_ht*0.0143+3.0+ 0.0+_hr.w),
                      0.6+0.3*sin(_ht*0.0107+1.0+ 0.0+_hr.y),
                      0.6+0.3*sin(_ht*0.0129+6.0+ 0.0+_hr.z));
@@ -3795,7 +5341,7 @@ void main() {{
     rad = length(uv - 0.5);
     ang = atan(uv.x - 0.5, uv.y - 0.5);
     float _ht = time * 30.0;
-    vec4 _hr = rand_preset;
+    vec4 _hr = rand_start;
     vec3 _hc0 = vec3(0.6+0.3*sin(_ht*0.0143+3.0+ 0.0+_hr.w),
                      0.6+0.3*sin(_ht*0.0107+1.0+ 0.0+_hr.y),
                      0.6+0.3*sin(_ht*0.0129+6.0+ 0.0+_hr.z));
@@ -3911,33 +5457,136 @@ fn strip_shader_body_wrapper(src: &str) -> String {
 /// trailing comments/content after the closing brace are correctly excluded.
 fn split_shader_body_wrapper(src: &str) -> (String, String) {
     let t = src.trim();
-    let Some(pos) = t.find("shader_body") else {
+    // Locate the `shader_body` keyword as a whole token in real code — NOT inside a
+    // comment/string, and NOT a substring of a larger identifier (`my_shader_body`,
+    // `shader_body2`). A plain `str::find("shader_body")` would match all of those.
+    let Some(pos) = find_shader_body_keyword(t) else {
         return (String::new(), t.to_string());
     };
     let before = t[..pos].trim().to_string();
     let after_kw = t[pos + "shader_body".len()..].trim_start();
-    let Some(open) = after_kw.find('{') else {
+    // The opening `{` must also be found in code (a `{` inside `/* … */` between the
+    // keyword and the real brace must not be mistaken for the wrapper open).
+    let Some(open) = find_code_byte(after_kw, b'{') else {
         return (before, after_kw.to_string());
     };
-    // Brace-count to find the matching close brace (skips // line comments).
+    // Brace-count to the matching close, comment- and string-aware.
     let body_src = &after_kw[open + 1..];
-    let inner = brace_extract(body_src);
-    (before, inner.trim().to_string())
+    let end = scan_to_matching_brace(body_src);
+    (before, body_src[..end].trim().to_string())
 }
 
-/// Extract everything up to (but not including) the brace that closes depth=0.
-/// Depth starts at 1 (we're already inside the opening `{`).
-fn brace_extract(src: &str) -> String {
-    let mut depth: i32 = 1;
-    let bytes = src.as_bytes();
+/// True for a byte that can appear inside a GLSL/HLSL identifier.
+pub(crate) fn is_ident_byte(c: u8) -> bool {
+    c == b'_' || c.is_ascii_alphanumeric()
+}
+
+/// Byte offset of the first `shader_body` keyword that appears as a whole identifier
+/// in real code: skips line comments (`//…`), block comments (`/* … */`), and
+/// string/char literals, and rejects matches where an identifier char abuts either
+/// side (so `my_shader_body` / `shader_body2` are not matched). Returns `None` when
+/// no such keyword exists. This is the comment-/string-/token-aware replacement for
+/// the previous `str::find("shader_body")` substring scan.
+pub(crate) fn find_shader_body_keyword(src: &str) -> Option<usize> {
+    const KW: &[u8] = b"shader_body";
+    let b = src.as_bytes();
+    let n = b.len();
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                // Skip to end of line.
-                while i < bytes.len() && bytes[i] != b'\n' {
+    while i < n {
+        match b[i] {
+            // line comment
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                i += 2;
+                while i < n && b[i] != b'\n' {
                     i += 1;
                 }
+            }
+            // block comment
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            // string / char literal
+            b'"' | b'\'' => {
+                i = skip_string_literal(b, i);
+            }
+            // keyword match in code
+            c if c == KW[0] && i + KW.len() <= n && &b[i..i + KW.len()] == KW => {
+                let before_ok = i == 0 || !is_ident_byte(b[i - 1]);
+                let after = i + KW.len();
+                let after_ok = after >= n || !is_ident_byte(b[after]);
+                if before_ok && after_ok {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Byte offset of the first occurrence of `target` that lies in real code (skipping
+/// comments and string/char literals). Returns `None` if not found in code.
+pub(crate) fn find_code_byte(src: &str, target: u8) -> Option<usize> {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                i += 2;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            b'"' | b'\'' => {
+                i = skip_string_literal(b, i);
+            }
+            c if c == target => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Given bytes positioned just AFTER an opening `{` (brace depth already 1), return
+/// the byte length of the inner content up to (but not including) the `}` that
+/// returns depth to 0. Comment- and string-aware, so braces inside `//…`, `/* … */`,
+/// or string/char literals are not counted. Returns the full length when no matching
+/// close is found (mirrors the previous best-effort behavior).
+pub(crate) fn scan_to_matching_brace(src: &str) -> usize {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut depth: i32 = 1;
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                i += 2;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            b'"' | b'\'' => {
+                i = skip_string_literal(b, i);
             }
             b'{' => {
                 depth += 1;
@@ -3946,16 +5595,36 @@ fn brace_extract(src: &str) -> String {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return src[..i].to_string();
+                    return i;
                 }
                 i += 1;
             }
-            _ => {
-                i += 1;
-            }
+            _ => i += 1,
         }
     }
-    src.to_string() // no matching close found — return everything
+    n
+}
+
+/// Advance past a string/char literal that begins at `start` (the opening quote),
+/// honoring backslash escapes. Returns the index just after the closing quote (or
+/// `n` if the literal is unterminated). GLSL/HLSL shader bodies contain no string
+/// literals, so on the real corpus this never fires; it is defensive so a stray
+/// quote can never make a scanner miscount braces.
+fn skip_string_literal(b: &[u8], start: usize) -> usize {
+    let n = b.len();
+    let quote = b[start];
+    let mut i = start + 1;
+    while i < n {
+        if b[i] == b'\\' && i + 1 < n {
+            i += 2;
+            continue;
+        }
+        if b[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    n
 }
 
 /// In a combined HLSL body (pre-shader_body globals + inner body):
@@ -4781,7 +6450,7 @@ void main() {{
     ang = atan(uv.x - 0.5, uv.y - 0.5);
     // hue_shader base (see hlsl_milk_body_to_naga for the derivation).
     float _ht = time * 30.0;
-    vec4 _hr = rand_preset;
+    vec4 _hr = rand_start;
     vec3 _hc0 = vec3(0.6+0.3*sin(_ht*0.0143+3.0+ 0.0+_hr.w),
                      0.6+0.3*sin(_ht*0.0107+1.0+ 0.0+_hr.y),
                      0.6+0.3*sin(_ht*0.0129+6.0+ 0.0+_hr.z));
@@ -4930,6 +6599,7 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
     let mut s = collapse_call_spaces(src);
     s = normalize_milkdrop_sampler_variants(&s);
     s = strip_comments(&s);
+    s = rename_reserved_sample_local(&s);
 
     // HLSL bool-as-number: cast a comparison used in arithmetic to float (naga rejects
     // `bool * float`). Same transform applied to the native pre-pass.
@@ -5394,12 +7064,11 @@ fn alias_with_customs(fragment: &str, customs: &[String]) -> String {
 }
 
 fn alias_custom_sampler_refs(mut src: String, customs: &[String]) -> String {
-    for name in customs {
-        src = replace_word(&src, name, "sampler_noise_lq");
-        if let Some(base) = name.strip_prefix("sampler_") {
-            src = replace_word(&src, &format!("texsize_{base}"), "texsize_noise_lq");
-        }
-    }
+    let replacements: HashMap<String, String> = customs
+        .iter()
+        .map(|name| (name.clone(), "sampler_noise_lq".to_string()))
+        .collect();
+    src = rewrite_custom_sampler_identifiers(&src, &replacements);
     src
 }
 
@@ -5615,12 +7284,13 @@ fn truncate_texture_decls(src: &str) -> String {
 /// oscillators / rand vectors). Wraps the RHS so GLSL/naga accept the narrower
 /// type: `vec3 lay1 = ...roam_cos;` → `vec3 lay1 = (...roam_cos).xyz;`.
 fn truncate_vec4_builtin_decls(src: &str) -> String {
-    const VEC4_BUILTINS: [&str; 6] = [
+    const VEC4_BUILTINS: [&str; 7] = [
         "roam_cos",
         "roam_sin",
         "slow_roam_cos",
         "slow_roam_sin",
         "rand_frame",
+        "rand_start",
         "rand_preset",
     ];
     let mut out: Vec<String> = Vec::new();
@@ -5683,8 +7353,12 @@ fn is_single_call(s: &str) -> bool {
 /// Remove single-line local declarations whose variable is never referenced
 /// again in the body (e.g. dead `float corr = <vec2>;` HLSL-truncation cruft).
 fn drop_unused_decls(src: &str) -> String {
+    // A declaration can span physical lines. Dropping only its first line leaves
+    // an orphaned continuation such as `+ time*vec3(...));`, which then fails to
+    // parse. Normalize to semicolon-complete logical statements first.
+    let logical = join_logical_statements(src);
     let mut out: Vec<&str> = Vec::new();
-    for line in src.lines() {
+    for line in logical.lines() {
         if let Some(ident) = decl_ident(line.trim_start()) {
             if count_word(src, &ident) <= 1 {
                 continue; // declared once, never used → drop
@@ -5693,6 +7367,41 @@ fn drop_unused_decls(src: &str) -> String {
         out.push(line);
     }
     out.join("\n")
+}
+
+/// `sample` is a reserved token in naga's GLSL frontend, but a legal HLSL local
+/// name. Rename it only when the shader actually declares a local with that name;
+/// this avoids touching sampling syntax or comments and preserves every use.
+fn rename_reserved_sample_local(src: &str) -> String {
+    let declares_sample = src.lines().any(|line| {
+        let trimmed = line.trim_start().trim_start_matches("static ").trim_start();
+        const TYPES: &[&str] = &[
+            "float", "float2", "float3", "float4", "int", "int2", "int3", "int4", "bool", "bool2",
+            "bool3", "bool4", "half", "half2", "half3", "half4", "double", "double2", "double3",
+            "double4",
+        ];
+        TYPES.iter().any(|ty| {
+            let Some(rest) = trimmed.strip_prefix(ty) else {
+                return false;
+            };
+            if !rest.starts_with(char::is_whitespace) {
+                return false;
+            }
+            let names = rest.trim_start().split('=').next().unwrap_or(rest);
+            split_top_level_commas(names).iter().any(|item| {
+                item.trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>()
+                    == "sample"
+            })
+        })
+    });
+    if declares_sample {
+        replace_word(src, "sample", "particle_sample")
+    } else {
+        src.to_string()
+    }
 }
 
 /// If `t` is `<type> <ident> = ...` (a scalar/vector local decl, not `==`),

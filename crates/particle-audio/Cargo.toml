@@ -22,3 +22,4 @@ env_logger.workspace = true
 [[example]]
 name = "meter"
 path = "examples/meter.rs"
+required-features = ["capture"]

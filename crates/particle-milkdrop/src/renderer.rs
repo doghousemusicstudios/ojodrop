@@ -1,22 +1,171 @@
 #![allow(dead_code)]
-use std::sync::Arc;
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
-use crate::equations::{EelProgram, EelState, Env, MegaBuf};
+use crate::equations::{EelProgram, EelRng, EelState, Env, EnvSlot, EnvSnapshot, MegaBuf};
+use crate::named_textures::{
+    NamedTexturePlan, NamedTextureResolver, DEFAULT_NAMED_TEXTURE_LAYER_SIZE,
+};
 use crate::parse_milk::{CustomWaveDef, MilkShaders, ShapeBaseVals};
 use crate::preprocess::{
-    fix_glsl_vector_types, glsl_milk_body_to_naga, glsl_milk_warp_body_to_naga,
-    hlsl_milk_body_to_naga, hlsl_milk_warp_body_to_naga, MILKDROP_SAMPLERS,
+    fix_glsl_vector_types, glsl_milk_body_to_naga_with_named_textures,
+    glsl_milk_warp_body_to_naga_with_named_textures, hlsl_milk_body_to_naga_with_named_textures,
+    hlsl_milk_warp_body_to_naga_with_named_textures, normalize_milkdrop_sampler_variants,
+    MILKDROP_SAMPLERS,
 };
-use std::cell::RefCell;
-use std::rc::Rc;
 
 // ── Warp mesh constants ──────────────────────────────────────────────────────
 
 const GRID_W: u32 = 48;
-const GRID_H: u32 = 32;
+const GRID_H: u32 = 36;
 const GPU_TIME_WRAP_SECONDS: f64 = 65_536.0;
 const GPU_FRAME_WRAP: u64 = 1 << 24;
+
+/// Quiet period before an interactive window resize commits a new set of
+/// MilkDrop feedback/blur targets. A resize reallocates several textures, so
+/// applying every drag event would turn a live window drag into a GPU-allocation
+/// storm. 150 ms keeps the final image responsive while coalescing the normal
+/// stream of platform resize events into one state-preserving resize.
+pub const INTERACTIVE_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Axis-aligned clip-space bounds of emitted custom geometry for one OjoDrop
+/// frame. This is populated only when geometry diagnostics are explicitly
+/// enabled on [`MilkdropRenderer`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MilkdropGeometryBounds {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+}
+
+/// Compact alpha evidence for emitted vertices or draw records.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MilkdropAlphaSummary {
+    pub sample_count: u32,
+    pub min: f32,
+    pub mean: f32,
+    pub max: f32,
+}
+
+/// Compact RGB evidence for emitted vertices or draw records. `visible_fraction`
+/// counts samples with at least one positive channel (the portion that survives
+/// an unorm render target), while `mean_abs_energy` also exposes signed-color
+/// programs whose samples are currently negative.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MilkdropRgbSummary {
+    pub sample_count: u32,
+    pub min: [f32; 3],
+    pub mean: [f32; 3],
+    pub max: [f32; 3],
+    pub visible_fraction: f32,
+    pub mean_abs_energy: f32,
+}
+
+/// Latest custom-shape geometry emitted by an OjoDrop frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MilkdropShapeGeometryDiagnostics {
+    pub enabled_pools: u32,
+    pub fill_draws: u32,
+    pub border_draws: u32,
+    pub fill_vertices: u32,
+    pub border_vertices: u32,
+    pub bounds: Option<MilkdropGeometryBounds>,
+    pub fill_alpha: Option<MilkdropAlphaSummary>,
+    pub border_alpha: Option<MilkdropAlphaSummary>,
+    pub fill_rgb: Option<MilkdropRgbSummary>,
+    pub border_rgb: Option<MilkdropRgbSummary>,
+}
+
+/// Latest custom-wave geometry emitted by an OjoDrop frame. Built-in waveform
+/// geometry is deliberately excluded so a blank custom-wave pool is visible.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MilkdropWaveGeometryDiagnostics {
+    pub enabled_pools: u32,
+    pub draws: u32,
+    pub vertices: u32,
+    pub bounds: Option<MilkdropGeometryBounds>,
+    pub alpha: Option<MilkdropAlphaSummary>,
+    pub rgb: Option<MilkdropRgbSummary>,
+}
+
+/// Opt-in, CPU-side evidence describing the latest OjoDrop custom geometry.
+/// Normal rendering does not collect or retain this snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MilkdropGeometryDiagnostics {
+    pub frame_index: u64,
+    pub custom_shapes: MilkdropShapeGeometryDiagnostics,
+    pub custom_waves: MilkdropWaveGeometryDiagnostics,
+    pub post_warp_rgb: Option<MilkdropRgbSummary>,
+    pub post_overlays_rgb: Option<MilkdropRgbSummary>,
+    pub post_comp_rgb: Option<MilkdropRgbSummary>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingMilkdropResize {
+    width: u32,
+    height: u32,
+    requested_at: Instant,
+}
+
+/// Coalesces interactive resize notifications for a [`MilkdropRenderer`].
+///
+/// Call [`Self::request`] for each platform resize event, then call
+/// [`Self::take_ready`] from the render loop. The caller applies a returned
+/// size through [`MilkdropRenderer::try_resize`], which preserves shaders, EEL
+/// state, frame counters, audio, and feedback history. Duplicate dimensions do
+/// not restart the quiet period.
+#[derive(Debug, Default)]
+pub struct MilkdropResizeDebouncer {
+    pending: Option<PendingMilkdropResize>,
+}
+
+impl MilkdropResizeDebouncer {
+    /// Queue the latest requested output size. Returns true when this replaces
+    /// the previously pending size; duplicate events are deliberately ignored.
+    pub fn request(&mut self, width: u32, height: u32, now: Instant) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self
+            .pending
+            .is_some_and(|pending| pending.width == width && pending.height == height)
+        {
+            return false;
+        }
+        self.pending = Some(PendingMilkdropResize {
+            width,
+            height,
+            requested_at: now,
+        });
+        true
+    }
+
+    /// Return the most recent requested size only after the resize stream has
+    /// been quiet for [`INTERACTIVE_RESIZE_DEBOUNCE`].
+    pub fn take_ready(&mut self, now: Instant) -> Option<(u32, u32)> {
+        let pending = self.pending?;
+        if now
+            .checked_duration_since(pending.requested_at)
+            .is_none_or(|elapsed| elapsed < INTERACTIVE_RESIZE_DEBOUNCE)
+        {
+            return None;
+        }
+        self.pending
+            .take()
+            .map(|pending| (pending.width, pending.height))
+    }
+
+    /// Drop a queued resize when a caller creates a fresh renderer at the
+    /// current dimensions (for example, after an intentional preset change).
+    pub fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    /// Whether a resize is still waiting for its quiet period.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
 
 fn deterministic_time_seconds(frame_idx: u64, time_per_frame: Option<f64>) -> Option<f64> {
     time_per_frame.map(|dt| {
@@ -26,6 +175,13 @@ fn deterministic_time_seconds(frame_idx: u64, time_per_frame: Option<f64>) -> Op
             0.0
         }
     })
+}
+
+fn effective_fps(time_per_frame: Option<f64>) -> f64 {
+    time_per_frame
+        .filter(|dt| dt.is_finite() && *dt > 0.0)
+        .map(|dt| 1.0 / dt)
+        .unwrap_or(60.0)
 }
 
 fn shader_time_seconds(time_seconds: f64) -> f32 {
@@ -84,6 +240,63 @@ struct WarpBase {
     wrap: bool,
 }
 
+/// Per-frame default-warp parameters consumed by the vertex shader. The final
+/// vector carries a CPU-mesh flag so presets with per-pixel EEL (or enabled
+/// motion vectors, which sample the CPU flow field) retain the exact legacy path.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct WarpGpuParams {
+    transform0: [f32; 4], // zoom, zoomexp, rot, warp
+    transform1: [f32; 4], // cx, cy, dx, dy
+    transform2: [f32; 4], // sx, sy, decay, warpscale
+    transform3: [f32; 4], // warpanimspeed, time, aspectx, aspecty
+    flags: [f32; 4],      // use_cpu_mesh, reserved...
+}
+const _: () = assert!(std::mem::size_of::<WarpGpuParams>() == 80);
+
+/// Pre-interned per-pixel variable slots. `reset` is intentionally limited to
+/// MilkDrop's ten authored warp controls; custom temporaries carry between mesh
+/// vertices. Inputs and OjoDrop's decay extension are overwritten directly.
+#[derive(Clone, Copy)]
+struct WarpEnvSlots {
+    reset: [EnvSlot; 10],
+    x: EnvSlot,
+    y: EnvSlot,
+    rad: EnvSlot,
+    ang: EnvSlot,
+    decay: EnvSlot,
+    decay_r: EnvSlot,
+    decay_g: EnvSlot,
+    decay_b: EnvSlot,
+}
+
+impl WarpEnvSlots {
+    fn intern(env: &mut Env) -> Self {
+        Self {
+            reset: [
+                env.intern_slot("warp"),
+                env.intern_slot("zoom"),
+                env.intern_slot("zoomexp"),
+                env.intern_slot("cx"),
+                env.intern_slot("cy"),
+                env.intern_slot("sx"),
+                env.intern_slot("sy"),
+                env.intern_slot("dx"),
+                env.intern_slot("dy"),
+                env.intern_slot("rot"),
+            ],
+            x: env.intern_slot("x"),
+            y: env.intern_slot("y"),
+            rad: env.intern_slot("rad"),
+            ang: env.intern_slot("ang"),
+            decay: env.intern_slot("decay"),
+            decay_r: env.intern_slot("decay_r"),
+            decay_g: env.intern_slot("decay_g"),
+            decay_b: env.intern_slot("decay_b"),
+        }
+    }
+}
+
 // ── Custom-shape vertex (interleaved pos/color/uv) ───────────────────────────
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -99,14 +312,6 @@ const _: () = assert!(std::mem::size_of::<ShapeVert>() == 32);
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct BorderVert {
     pos: [f32; 2],
-}
-
-// ── ShapeU uniform (textured flag) ───────────────────────────────────────────
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct ShapeU {
-    textured: f32,
-    _pad: [f32; 3],
 }
 
 // ── BorderU uniform (color + thick offset) ───────────────────────────────────
@@ -154,6 +359,10 @@ const _: () = assert!(std::mem::size_of::<DarkenVert>() == 24);
 const SIDES_MAX: usize = 100;
 // Each shape instance contributes (sides+2) fill verts.
 const SHAPE_FILL_VERTS_MAX: usize = SIDES_MAX + 2;
+// Upper bound on instances generated for one custom shape. A preset-controlled
+// `num_inst` is clamped to this BEFORE any CPU per-instance work so an absurd
+// count can't drive unbounded geometry/EEL evaluation (P2-VIS-018).
+const MAX_SHAPE_INSTANCES: usize = 1024;
 // Static fan index count = sides*3 for sides<=100 → 300.
 const SHAPE_FAN_IDX_MAX: usize = SIDES_MAX * 3;
 // Custom-shape fill geometry capacity (verts for ALL shapes×instances of a frame).
@@ -164,6 +373,10 @@ const SHAPE_VERT_CAP: usize = 65536;
 // line-strip) ≈ 4092 — right at the old 4096 cap, so the 4th wave of multi-wave
 // presets overflowed the upload and drew from a stale buffer tail.
 const WAVE_VERT_CAP: usize = 16384;
+// Sane upper bound on the per-frame audio arrays (PCM waveform + FFT spectrum).
+// Real feeds are ~512 samples; this 16× headroom bounds the CPU waveform-geometry
+// work + scratch allocations so a pathological feed can't blow up (P2-VIS-018).
+const MAX_AUDIO_SAMPLES: usize = 8192;
 // Border vertex capacity (per-frame across all shapes).
 const BORDER_VERT_CAP: usize = 65536;
 const BORDER_THICK_LINE_PASSES: usize = 4;
@@ -172,12 +385,216 @@ const BORDER_THICK_LINE_PASSES: usize = 4;
 const BORDER_UNIFORM_SLOTS: usize = 32768;
 const WAVE_THICK_LINE_PASSES: usize = 4;
 const WAVE_THICK_DOT_PASSES: usize = 9;
+/// Pure per-point programs at or above this compiled cost may use the adaptive
+/// 256-point quality fallback. Stateful EEL always retains its authored count.
+const CUSTOM_WAVE_LOD_OP_THRESHOLD: usize = 96;
+const CUSTOM_WAVE_LOD_SAMPLES: usize = 256;
+
+/// Per-render CPU storage. Every buffer is cleared and reused rather than
+/// allocated on each frame; capacities are bounded by the corresponding GPU
+/// buffers and retained for the lifetime of the renderer.
+#[derive(Default)]
+struct RendererScratch {
+    warp_verts: Vec<WarpVert>,
+    motion_verts: Vec<MVVert>,
+    darken_verts: Vec<DarkenVert>,
+    shape_fill_verts: Vec<ShapeVert>,
+    shape_fill_draws: Vec<ShapeFillDraw>,
+    shape_border_verts: Vec<BorderVert>,
+    shape_border_draws: Vec<BorderDraw>,
+    wave_verts: Vec<WaveVert>,
+    wave_draws: Vec<WaveDraw>,
+    frame_border_verts: Vec<BorderVert>,
+    frame_border_draws: Vec<(u32, u32)>,
+    border_uniform_bytes: Vec<u8>,
+    frame_border_uniform_bytes: Vec<u8>,
+}
+
+/// Cached slots for the frame/audio variables repeatedly seeded into shape and
+/// custom-wave pools. Keeping these handles beside the pool removes a dozen
+/// string hashes from every shape instance and wave frame.
+#[derive(Clone, Copy)]
+struct FrameEnvSlots {
+    time: EnvSlot,
+    frame: EnvSlot,
+    fps: EnvSlot,
+    bass: EnvSlot,
+    bass_att: EnvSlot,
+    mid: EnvSlot,
+    mid_att: EnvSlot,
+    treb: EnvSlot,
+    treb_att: EnvSlot,
+    vol: EnvSlot,
+    aspectx: EnvSlot,
+    aspecty: EnvSlot,
+}
+
+impl FrameEnvSlots {
+    fn intern(env: &mut Env) -> Self {
+        Self {
+            time: env.intern_slot("time"),
+            frame: env.intern_slot("frame"),
+            fps: env.intern_slot("fps"),
+            bass: env.intern_slot("bass"),
+            bass_att: env.intern_slot("bass_att"),
+            mid: env.intern_slot("mid"),
+            mid_att: env.intern_slot("mid_att"),
+            treb: env.intern_slot("treb"),
+            treb_att: env.intern_slot("treb_att"),
+            vol: env.intern_slot("vol"),
+            aspectx: env.intern_slot("aspectx"),
+            aspecty: env.intern_slot("aspecty"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn seed(
+        self,
+        env: &mut Env,
+        time: f64,
+        frame: u64,
+        fps: f64,
+        bass: f64,
+        mid: f64,
+        treb: f64,
+        vol: f64,
+        bass_att: f64,
+        mid_att: f64,
+        treb_att: f64,
+        aspectx: f64,
+        aspecty: f64,
+    ) {
+        env.set_slot_value(self.time, time);
+        env.set_slot_value(self.frame, frame as f64);
+        env.set_slot_value(self.fps, fps);
+        env.set_slot_value(self.bass, bass);
+        env.set_slot_value(self.bass_att, bass_att);
+        env.set_slot_value(self.mid, mid);
+        env.set_slot_value(self.mid_att, mid_att);
+        env.set_slot_value(self.treb, treb);
+        env.set_slot_value(self.treb_att, treb_att);
+        env.set_slot_value(self.vol, vol);
+        env.set_slot_value(self.aspectx, aspectx);
+        env.set_slot_value(self.aspecty, aspecty);
+    }
+}
+
+/// All authored shape inputs/outputs restored and read for each instance.
+#[derive(Clone, Copy)]
+struct ShapeEnvSlots {
+    frame: FrameEnvSlots,
+    instance: EnvSlot,
+    num_inst: EnvSlot,
+    sides: EnvSlot,
+    rad: EnvSlot,
+    ang: EnvSlot,
+    x: EnvSlot,
+    y: EnvSlot,
+    r: EnvSlot,
+    g: EnvSlot,
+    b: EnvSlot,
+    a: EnvSlot,
+    r2: EnvSlot,
+    g2: EnvSlot,
+    b2: EnvSlot,
+    a2: EnvSlot,
+    border_r: EnvSlot,
+    border_g: EnvSlot,
+    border_b: EnvSlot,
+    border_a: EnvSlot,
+    thickoutline: EnvSlot,
+    textured: EnvSlot,
+    tex_ang: EnvSlot,
+    tex_zoom: EnvSlot,
+    additive: EnvSlot,
+}
+
+impl ShapeEnvSlots {
+    fn intern(env: &mut Env) -> Self {
+        Self {
+            frame: FrameEnvSlots::intern(env),
+            instance: env.intern_slot("instance"),
+            num_inst: env.intern_slot("num_inst"),
+            sides: env.intern_slot("sides"),
+            rad: env.intern_slot("rad"),
+            ang: env.intern_slot("ang"),
+            x: env.intern_slot("x"),
+            y: env.intern_slot("y"),
+            r: env.intern_slot("r"),
+            g: env.intern_slot("g"),
+            b: env.intern_slot("b"),
+            a: env.intern_slot("a"),
+            r2: env.intern_slot("r2"),
+            g2: env.intern_slot("g2"),
+            b2: env.intern_slot("b2"),
+            a2: env.intern_slot("a2"),
+            border_r: env.intern_slot("border_r"),
+            border_g: env.intern_slot("border_g"),
+            border_b: env.intern_slot("border_b"),
+            border_a: env.intern_slot("border_a"),
+            thickoutline: env.intern_slot("thickoutline"),
+            textured: env.intern_slot("textured"),
+            tex_ang: env.intern_slot("tex_ang"),
+            tex_zoom: env.intern_slot("tex_zoom"),
+            additive: env.intern_slot("additive"),
+        }
+    }
+}
+
+/// Custom-wave control and point slots touched for every generated sample.
+#[derive(Clone, Copy)]
+struct WaveEnvSlots {
+    frame: FrameEnvSlots,
+    samples: EnvSlot,
+    sep: EnvSlot,
+    scaling: EnvSlot,
+    smoothing: EnvSlot,
+    spectrum: EnvSlot,
+    sample: EnvSlot,
+    value1: EnvSlot,
+    value2: EnvSlot,
+    x: EnvSlot,
+    y: EnvSlot,
+    r: EnvSlot,
+    g: EnvSlot,
+    b: EnvSlot,
+    a: EnvSlot,
+}
+
+impl WaveEnvSlots {
+    fn intern(env: &mut Env) -> Self {
+        Self {
+            frame: FrameEnvSlots::intern(env),
+            samples: env.intern_slot("samples"),
+            sep: env.intern_slot("sep"),
+            scaling: env.intern_slot("scaling"),
+            smoothing: env.intern_slot("smoothing"),
+            spectrum: env.intern_slot("spectrum"),
+            sample: env.intern_slot("sample"),
+            value1: env.intern_slot("value1"),
+            value2: env.intern_slot("value2"),
+            x: env.intern_slot("x"),
+            y: env.intern_slot("y"),
+            r: env.intern_slot("r"),
+            g: env.intern_slot("g"),
+            b: env.intern_slot("b"),
+            a: env.intern_slot("a"),
+        }
+    }
+}
 
 // Runtime state for one custom shape (base vals + per-frame program + var pool).
 struct ShapeRT {
     base: ShapeBaseVals,
     prog: Option<EelProgram>,
     env: Env,
+    /// Cached destinations for the preset-global reg00..reg99 snapshot.
+    reg_slots: [EnvSlot; 100],
+    q_slots: [EnvSlot; 32],
+    t_slots: [EnvSlot; 8],
+    slots: ShapeEnvSlots,
+    t_init: [f64; 8],
     /// Per-pool megabuf (private) sharing the preset-wide gmegabuf.
     state: EelState,
 }
@@ -188,8 +605,27 @@ struct WaveRT {
     per_frame_prog: Option<EelProgram>,
     per_point_prog: Option<EelProgram>,
     env: Env,
+    /// Cached destinations for the preset-global reg00..reg99 snapshot.
+    reg_slots: [EnvSlot; 100],
+    q_slots: [EnvSlot; 32],
+    t_slots: [EnvSlot; 8],
+    slots: WaveEnvSlots,
+    t_init: [f64; 8],
     /// Per-pool megabuf (private) sharing the preset-wide gmegabuf.
     state: EelState,
+    /// Persistent CPU storage reused across every frame for this wave.
+    scratch: WaveScratch,
+}
+
+#[derive(Default)]
+struct WaveScratch {
+    source_l: Vec<f32>,
+    source_r: Vec<f32>,
+    points_l: Vec<f32>,
+    points_r: Vec<f32>,
+    positions: Vec<[f32; 2]>,
+    colors: Vec<[f32; 4]>,
+    output: Vec<WaveVert>,
 }
 
 // One fill draw (a shape instance). base_vertex = vertex offset into shape_vert_buf.
@@ -197,6 +633,7 @@ struct ShapeFillDraw {
     base_vertex: i32,
     sides: u32, // index count = sides*3
     additive: bool,
+    border_draw_index: Option<usize>,
 }
 // One border source (rim verts already appended to border_vert_buf).
 struct BorderDraw {
@@ -206,12 +643,318 @@ struct BorderDraw {
     thick: bool,
 }
 // One waveform draw record.
+#[derive(Clone, Copy)]
 struct WaveDraw {
     start_vert: u32,
     count: u32,
     points: bool, // PointList vs LineStrip
     additive: bool,
     thick: bool, // 4-pass thick offset expansion
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CustomWaveGeometryExtent {
+    vertices: usize,
+    draws: usize,
+}
+
+#[derive(Debug, Default)]
+struct GeometryDiagnosticCollector {
+    enabled: bool,
+    latest: Option<MilkdropGeometryDiagnostics>,
+}
+
+#[derive(Debug)]
+struct GeometryStageReadback {
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    post_warp: wgpu::Buffer,
+    post_overlays: wgpu::Buffer,
+    post_comp: wgpu::Buffer,
+}
+
+impl GeometryStageReadback {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let unpadded_bytes_per_row = width.saturating_mul(4);
+        let padded_bytes_per_row = unpadded_bytes_per_row
+            .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            .saturating_mul(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let size = u64::from(padded_bytes_per_row).saturating_mul(u64::from(height));
+        let make_buffer = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        Self {
+            width,
+            height,
+            padded_bytes_per_row,
+            post_warp: make_buffer("milkdrop-diagnostic-post-warp"),
+            post_overlays: make_buffer("milkdrop-diagnostic-post-overlays"),
+            post_comp: make_buffer("milkdrop-diagnostic-post-comp"),
+        }
+    }
+
+    fn matches(&self, width: u32, height: u32) -> bool {
+        self.width == width && self.height == height
+    }
+
+    fn read_summaries(&self, device: &wgpu::Device) -> [Option<MilkdropRgbSummary>; 3] {
+        [
+            read_stage_rgb_summary(
+                device,
+                &self.post_warp,
+                self.width,
+                self.height,
+                self.padded_bytes_per_row,
+            ),
+            read_stage_rgb_summary(
+                device,
+                &self.post_overlays,
+                self.width,
+                self.height,
+                self.padded_bytes_per_row,
+            ),
+            read_stage_rgb_summary(
+                device,
+                &self.post_comp,
+                self.width,
+                self.height,
+                self.padded_bytes_per_row,
+            ),
+        ]
+    }
+}
+
+impl GeometryDiagnosticCollector {
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.latest = None;
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn latest(&self) -> Option<MilkdropGeometryDiagnostics> {
+        self.latest
+    }
+
+    fn capture(&mut self, build: impl FnOnce() -> MilkdropGeometryDiagnostics) {
+        if self.enabled {
+            self.latest = Some(build());
+        }
+    }
+}
+
+fn geometry_bounds<'a>(
+    positions: impl Iterator<Item = &'a [f32; 2]>,
+) -> Option<MilkdropGeometryBounds> {
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    let mut found = false;
+    for position in positions {
+        if !position[0].is_finite() || !position[1].is_finite() {
+            continue;
+        }
+        min[0] = min[0].min(position[0]);
+        min[1] = min[1].min(position[1]);
+        max[0] = max[0].max(position[0]);
+        max[1] = max[1].max(position[1]);
+        found = true;
+    }
+    found.then_some(MilkdropGeometryBounds { min, max })
+}
+
+fn alpha_summary(values: impl Iterator<Item = f32>) -> Option<MilkdropAlphaSummary> {
+    let mut sample_count = 0u32;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    for value in values {
+        if !value.is_finite() {
+            continue;
+        }
+        sample_count = sample_count.saturating_add(1);
+        min = min.min(value);
+        max = max.max(value);
+        sum += f64::from(value);
+    }
+    (sample_count > 0).then_some(MilkdropAlphaSummary {
+        sample_count,
+        min,
+        mean: (sum / f64::from(sample_count)) as f32,
+        max,
+    })
+}
+
+fn rgb_summary(values: impl Iterator<Item = [f32; 3]>) -> Option<MilkdropRgbSummary> {
+    let mut sample_count = 0u32;
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut sums = [0.0f64; 3];
+    let mut visible_count = 0u32;
+    let mut absolute_energy = 0.0f64;
+    for value in values {
+        if value.iter().any(|channel| !channel.is_finite()) {
+            continue;
+        }
+        sample_count = sample_count.saturating_add(1);
+        let mut sample_visible = false;
+        let mut sample_energy = 0.0f64;
+        for channel in 0..3 {
+            min[channel] = min[channel].min(value[channel]);
+            max[channel] = max[channel].max(value[channel]);
+            sums[channel] += f64::from(value[channel]);
+            sample_visible |= value[channel] > 1.0e-6;
+            sample_energy += f64::from(value[channel].abs());
+        }
+        visible_count = visible_count.saturating_add(u32::from(sample_visible));
+        absolute_energy += sample_energy / 3.0;
+    }
+    (sample_count > 0).then_some(MilkdropRgbSummary {
+        sample_count,
+        min,
+        mean: std::array::from_fn(|channel| (sums[channel] / f64::from(sample_count)) as f32),
+        max,
+        visible_fraction: visible_count as f32 / sample_count as f32,
+        mean_abs_energy: (absolute_energy / f64::from(sample_count)) as f32,
+    })
+}
+
+fn rgba8_rgb_summary(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+) -> Option<MilkdropRgbSummary> {
+    let active_bytes_per_row = usize::try_from(width).ok()?.checked_mul(4)?;
+    let padded_bytes_per_row = usize::try_from(padded_bytes_per_row).ok()?;
+    if active_bytes_per_row > padded_bytes_per_row {
+        return None;
+    }
+    let pixels = bytes
+        .chunks_exact(padded_bytes_per_row)
+        .take(height as usize)
+        .flat_map(|row| {
+            row[..active_bytes_per_row].chunks_exact(4).map(|rgba| {
+                [
+                    f32::from(rgba[0]) / 255.0,
+                    f32::from(rgba[1]) / 255.0,
+                    f32::from(rgba[2]) / 255.0,
+                ]
+            })
+        });
+    rgb_summary(pixels)
+}
+
+fn read_stage_rgb_summary(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+) -> Option<MilkdropRgbSummary> {
+    let slice = buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    receiver.recv().ok()?.ok()?;
+    let mapped = slice.get_mapped_range();
+    let summary = rgba8_rgb_summary(&mapped, width, height, padded_bytes_per_row);
+    drop(mapped);
+    buffer.unmap();
+    summary
+}
+
+fn encode_stage_texture_copy(
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    buffer: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+) {
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn summarize_custom_geometry(
+    frame_index: u64,
+    enabled_shape_pools: usize,
+    fill_verts: &[ShapeVert],
+    fill_draws: &[ShapeFillDraw],
+    border_verts: &[BorderVert],
+    border_draws: &[BorderDraw],
+    enabled_wave_pools: usize,
+    wave_verts: &[WaveVert],
+    wave_draws: &[WaveDraw],
+) -> MilkdropGeometryDiagnostics {
+    MilkdropGeometryDiagnostics {
+        frame_index,
+        custom_shapes: MilkdropShapeGeometryDiagnostics {
+            enabled_pools: enabled_shape_pools.min(u32::MAX as usize) as u32,
+            fill_draws: fill_draws.len().min(u32::MAX as usize) as u32,
+            border_draws: border_draws.len().min(u32::MAX as usize) as u32,
+            fill_vertices: fill_verts.len().min(u32::MAX as usize) as u32,
+            border_vertices: border_verts.len().min(u32::MAX as usize) as u32,
+            // Border positions duplicate the fill rim, so fill bounds cover both.
+            bounds: geometry_bounds(fill_verts.iter().map(|vertex| &vertex.pos)),
+            fill_alpha: alpha_summary(fill_verts.iter().map(|vertex| vertex.color[3])),
+            border_alpha: alpha_summary(border_draws.iter().map(|draw| draw.color[3])),
+            fill_rgb: rgb_summary(
+                fill_verts
+                    .iter()
+                    .map(|vertex| [vertex.color[0], vertex.color[1], vertex.color[2]]),
+            ),
+            border_rgb: rgb_summary(
+                border_draws
+                    .iter()
+                    .map(|draw| [draw.color[0], draw.color[1], draw.color[2]]),
+            ),
+        },
+        custom_waves: MilkdropWaveGeometryDiagnostics {
+            enabled_pools: enabled_wave_pools.min(u32::MAX as usize) as u32,
+            draws: wave_draws.len().min(u32::MAX as usize) as u32,
+            vertices: wave_verts.len().min(u32::MAX as usize) as u32,
+            bounds: geometry_bounds(wave_verts.iter().map(|vertex| &vertex.pos)),
+            alpha: alpha_summary(wave_verts.iter().map(|vertex| vertex.color[3])),
+            rgb: rgb_summary(
+                wave_verts
+                    .iter()
+                    .map(|vertex| [vertex.color[0], vertex.color[1], vertex.color[2]]),
+            ),
+        },
+        ..MilkdropGeometryDiagnostics::default()
+    }
 }
 
 fn build_warp_indices() -> Vec<u32> {
@@ -228,8 +971,24 @@ fn build_warp_indices() -> Vec<u32> {
     idx
 }
 
+fn build_static_warp_verts() -> Vec<WarpVert> {
+    let mut verts = Vec::with_capacity(((GRID_W + 1) * (GRID_H + 1)) as usize);
+    for j in 0..=GRID_H {
+        for i in 0..=GRID_W {
+            let x = (i as f32 / GRID_W as f32) * 2.0 - 1.0;
+            let y = (j as f32 / GRID_H as f32) * 2.0 - 1.0;
+            verts.push(WarpVert {
+                pos: [x, -y],
+                uv: [0.0; 2],
+                decay: [0.0; 4],
+            });
+        }
+    }
+    verts
+}
+
 // PerFrame uniform buffer — layout must exactly match the WGSL PerFrame struct
-// emitted by naga (16 vec4s + 29 f32s, padded to 384 bytes).
+// emitted by naga (17 leading vec4s followed by scalar controls).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct PerFrame {
@@ -240,51 +999,52 @@ struct PerFrame {
     slow_roam_sin: [f32; 4], //  64
     roam_sin: [f32; 4],      //  80
     rand_frame: [f32; 4],    //  96
-    rand_preset: [f32; 4],   // 112
-    _qa: [f32; 4],           // 128 — q1..q4
-    _qb: [f32; 4],           // 144 — q5..q8
-    _qc: [f32; 4],           // 160
-    _qd: [f32; 4],           // 176
-    _qe: [f32; 4],           // 192
-    _qf: [f32; 4],           // 208
-    _qg: [f32; 4],           // 224
-    _qh: [f32; 4],           // 240
-    time: f32,               // 256
-    fps: f32,                // 260
-    frame: f32,              // 264
-    progress: f32,           // 268
-    bass: f32,               // 272
-    mid: f32,                // 276
-    treb: f32,               // 280
-    vol: f32,                // 284
-    bass_att: f32,           // 288
-    mid_att: f32,            // 292
-    treb_att: f32,           // 296
-    vol_att: f32,            // 300
-    f_shader: f32,           // 304
-    gamma_adj: f32,          // 308
-    echo_zoom: f32,          // 312
-    echo_alpha: f32,         // 316
-    echo_orientation: f32,   // 320
-    blur1_min: f32,          // 324
-    blur1_max: f32,          // 328
-    blur2_min: f32,          // 332
-    blur2_max: f32,          // 336
-    blur3_min: f32,          // 340
-    blur3_max: f32,          // 344
-    scale1: f32,             // 348
-    scale2: f32,             // 352
-    scale3: f32,             // 356
-    bias1: f32,              // 360
-    bias2: f32,              // 364
-    bias3: f32,              // 368
-    brighten: f32,           // 372 — comp post-FX flags (bBrighten/bDarken/bSolarize/bInvert)
-    darken: f32,             // 376
-    solarize: f32,           // 380
-    invert: f32,             // 384
-    _pad: [f32; 3],          // 388 → pad to 400
+    rand_start: [f32; 4],    // 112 — built-in hue phase offsets
+    rand_preset: [f32; 4],   // 128 — custom shader rand_preset
+    _qa: [f32; 4],           // 144 — q1..q4
+    _qb: [f32; 4],           // 160 — q5..q8
+    _qc: [f32; 4],           // 176
+    _qd: [f32; 4],           // 192
+    _qe: [f32; 4],           // 208
+    _qf: [f32; 4],           // 224
+    _qg: [f32; 4],           // 240
+    _qh: [f32; 4],           // 256
+    time: f32,               // 272
+    fps: f32,                // 276
+    frame: f32,              // 280
+    progress: f32,           // 284
+    bass: f32,               // 288
+    mid: f32,                // 292
+    treb: f32,               // 296
+    vol: f32,                // 300
+    bass_att: f32,           // 304
+    mid_att: f32,            // 308
+    treb_att: f32,           // 312
+    vol_att: f32,            // 316
+    f_shader: f32,           // 320
+    gamma_adj: f32,          // 324
+    echo_zoom: f32,          // 328
+    echo_alpha: f32,         // 332
+    echo_orientation: f32,   // 336
+    blur1_min: f32,          // 340
+    blur1_max: f32,          // 344
+    blur2_min: f32,          // 348
+    blur2_max: f32,          // 352
+    blur3_min: f32,          // 356
+    blur3_max: f32,          // 360
+    scale1: f32,             // 364
+    scale2: f32,             // 368
+    scale3: f32,             // 372
+    bias1: f32,              // 376
+    bias2: f32,              // 380
+    bias3: f32,              // 384
+    brighten: f32,           // 388 — comp post-FX flags
+    darken: f32,             // 392
+    solarize: f32,           // 396
+    invert: f32,             // 400
+    _pad: [f32; 3],          // 404 → pad to 416
 }
-const _: () = assert!(std::mem::size_of::<PerFrame>() == 400);
+const _: () = assert!(std::mem::size_of::<PerFrame>() == 416);
 
 // ----- texture helpers -------------------------------------------------------
 
@@ -341,6 +1101,274 @@ fn make_tex2d_with_mips(
     tex
 }
 
+/// Butterchurn's canonical blur target ratios and target-size quantization.
+/// Widths use its slightly unusual `(size + 3) / 16` floor and heights use
+/// `(size + 3) / 4`, with a 16-pixel minimum on both axes.
+fn blur_dimensions(w: u32, h: u32) -> [(u32, u32); 6] {
+    let size = |ratio: f64| {
+        let x = ((w as f64 * ratio).max(16.0) as u32 + 3) / 16 * 16;
+        let y = ((h as f64 * ratio).max(16.0) as u32 + 3) / 4 * 4;
+        (x.max(16), y.max(16))
+    };
+    [
+        size(0.25),
+        size(0.125),
+        size(0.0625),
+        size(0.5),
+        size(0.125),
+        size(0.0625),
+    ]
+}
+
+fn milkdrop_angle(x: f64, y: f64, aspect_x: f64, aspect_y: f64) -> f64 {
+    (y * aspect_y)
+        .atan2(x * aspect_x)
+        .rem_euclid(std::f64::consts::TAU)
+}
+
+fn seed_equation_inputs(env: &mut Env, width: u32, height: u32) {
+    env.insert("frame", 0.0);
+    env.insert("time", 0.0);
+    env.insert("fps", 60.0);
+    for name in [
+        "bass", "bass_att", "mid", "mid_att", "treb", "treb_att", "vol", "vol_att",
+    ] {
+        env.insert(name, 1.0);
+    }
+    let (aspect_x, aspect_y) = if width >= height {
+        (1.0, height as f64 / width.max(1) as f64)
+    } else {
+        (width as f64 / height.max(1) as f64, 1.0)
+    };
+    env.insert("aspectx", 1.0 / aspect_x.max(f64::EPSILON));
+    env.insert("aspecty", 1.0 / aspect_y.max(f64::EPSILON));
+    env.insert("meshx", GRID_W as f64);
+    env.insert("meshy", GRID_H as f64);
+    env.insert("pixelsx", width as f64);
+    env.insert("pixelsy", height as f64);
+}
+
+fn seed_preset_base_env(env: &mut Env, shaders: &MilkShaders) {
+    let values = [
+        ("zoom", shaders.zoom),
+        ("zoomexp", shaders.zoomexp),
+        ("rot", shaders.rot),
+        ("warp", shaders.warp_amount),
+        ("cx", shaders.cx),
+        ("cy", shaders.cy),
+        ("dx", shaders.dx),
+        ("dy", shaders.dy),
+        ("sx", shaders.sx),
+        ("sy", shaders.sy),
+        ("warpscale", shaders.warpscale),
+        ("warpanimspeed", shaders.warpanimspeed),
+        ("decay", shaders.decay),
+        ("gamma", shaders.gamma_adj),
+        ("gammaadj", shaders.gamma_adj),
+        ("fshader", shaders.fshader),
+        ("echo_zoom", shaders.echo_zoom),
+        ("echo_alpha", shaders.echo_alpha),
+        ("echo_orient", shaders.echo_orient),
+        ("wave_mode", shaders.wave_mode),
+        ("wave_x", shaders.wave_x),
+        ("wave_y", shaders.wave_y),
+        ("wave_r", shaders.wave_r),
+        ("wave_g", shaders.wave_g),
+        ("wave_b", shaders.wave_b),
+        ("wave_a", shaders.wave_a),
+        ("wave_mystery", shaders.wave_mystery),
+        ("wave_scale", shaders.wave_scale),
+        ("wave_smoothing", shaders.wave_smoothing),
+        ("modwavealphastart", shaders.modwavealphastart),
+        ("modwavealphaend", shaders.modwavealphaend),
+        ("mv_x", shaders.mv_x),
+        ("mv_y", shaders.mv_y),
+        ("mv_dx", shaders.mv_dx),
+        ("mv_dy", shaders.mv_dy),
+        ("mv_l", shaders.mv_l),
+        ("mv_r", shaders.mv_r),
+        ("mv_g", shaders.mv_g),
+        ("mv_b", shaders.mv_b),
+        ("mv_a", shaders.mv_a),
+        ("ob_size", shaders.ob_size),
+        ("ob_r", shaders.ob_r),
+        ("ob_g", shaders.ob_g),
+        ("ob_b", shaders.ob_b),
+        ("ob_a", shaders.ob_a),
+        ("ib_size", shaders.ib_size),
+        ("ib_r", shaders.ib_r),
+        ("ib_g", shaders.ib_g),
+        ("ib_b", shaders.ib_b),
+        ("ib_a", shaders.ib_a),
+        ("b1n", shaders.b1n),
+        ("b1x", shaders.b1x),
+        ("b1ed", shaders.b1ed),
+        ("b2n", shaders.b2n),
+        ("b2x", shaders.b2x),
+        ("b3n", shaders.b3n),
+        ("b3x", shaders.b3x),
+    ];
+    for (name, value) in values {
+        env.insert(name, value as f64);
+    }
+    let flags = [
+        ("wrap", shaders.wrap),
+        ("wave_dots", shaders.wave_dots),
+        ("wave_thick", shaders.wave_thick),
+        ("additivewave", shaders.additive_wave),
+        ("wave_brighten", shaders.wave_brighten),
+        ("modwavealphabyvolume", shaders.modwavealphabyvolume),
+        ("brighten", shaders.brighten),
+        ("darken", shaders.darken),
+        ("solarize", shaders.solarize),
+        ("invert", shaders.invert),
+        ("darken_center", shaders.darken_center),
+    ];
+    for (name, value) in flags {
+        env.insert(name, if value { 1.0 } else { 0.0 });
+    }
+}
+
+fn seed_shape_base_env(env: &mut Env, base: &ShapeBaseVals) {
+    let values = [
+        ("enabled", base.enabled as f64),
+        ("sides", base.sides as f64),
+        ("additive", base.additive as f64),
+        ("thickoutline", base.thick_outline as f64),
+        ("textured", base.textured as f64),
+        ("num_inst", base.num_inst as f64),
+        ("x", base.x as f64),
+        ("y", base.y as f64),
+        ("rad", base.rad as f64),
+        ("ang", base.ang as f64),
+        ("tex_ang", base.tex_ang as f64),
+        ("tex_zoom", base.tex_zoom as f64),
+        ("r", base.r as f64),
+        ("g", base.g as f64),
+        ("b", base.b as f64),
+        ("a", base.a as f64),
+        ("r2", base.r2 as f64),
+        ("g2", base.g2 as f64),
+        ("b2", base.b2 as f64),
+        ("a2", base.a2 as f64),
+        ("border_r", base.border_r as f64),
+        ("border_g", base.border_g as f64),
+        ("border_b", base.border_b as f64),
+        ("border_a", base.border_a as f64),
+    ];
+    for (name, value) in values {
+        env.insert(name, value);
+    }
+}
+
+fn seed_wave_base_env(env: &mut Env, wave: &CustomWaveDef) {
+    let values = [
+        ("enabled", if wave.enabled { 1.0 } else { 0.0 }),
+        ("samples", wave.samples as f64),
+        ("sep", wave.sep as f64),
+        ("spectrum", if wave.spectrum { 1.0 } else { 0.0 }),
+        ("usedots", if wave.use_dots { 1.0 } else { 0.0 }),
+        ("thick", if wave.draw_thick { 1.0 } else { 0.0 }),
+        ("additive", if wave.additive { 1.0 } else { 0.0 }),
+        ("scaling", wave.scaling as f64),
+        ("smoothing", wave.smoothing as f64),
+        ("r", wave.r as f64),
+        ("g", wave.g as f64),
+        ("b", wave.b as f64),
+        ("a", wave.a as f64),
+    ];
+    for (name, value) in values {
+        env.insert(name, value);
+    }
+}
+
+/// Rejection reasons for external render dimensions, raised BEFORE any GPU
+/// allocation so a hostile preset / window size can't overflow the size math or
+/// request a multi-gigabyte texture (P2-VIS-019 + the P1-043 milkdrop slice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimensionError {
+    /// A zero width or height was requested.
+    Zero,
+    /// Width or height exceeds the device `max_texture_dimension_2d`.
+    ExceedsMaxTextureDimension { width: u32, height: u32, max: u32 },
+    /// The pixel-count / row-byte / total-byte arithmetic overflowed.
+    ArithmeticOverflow,
+    /// The total texture footprint exceeds the renderer's memory budget.
+    ExceedsMemoryBudget { bytes: u64, budget: u64 },
+}
+
+impl std::fmt::Display for DimensionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DimensionError::Zero => write!(f, "texture dimensions must be non-zero"),
+            DimensionError::ExceedsMaxTextureDimension { width, height, max } => write!(
+                f,
+                "texture dimensions {width}x{height} exceed device max_texture_dimension_2d ({max})"
+            ),
+            DimensionError::ArithmeticOverflow => {
+                write!(f, "texture dimension arithmetic overflowed")
+            }
+            DimensionError::ExceedsMemoryBudget { bytes, budget } => write!(
+                f,
+                "texture allocation of {bytes} bytes exceeds the {budget}-byte budget"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DimensionError {}
+
+/// Upper-bound multiple of the base w*h*4 RGBA8 footprint that a MilkdropRenderer
+/// allocates for one target: two mipmapped feedback targets (~1.34x each), three
+/// blur outputs (1/16 + 1/64 + 1/256), blur temps (1/4 + 1/64 + 1/256), one
+/// optional named-image atlas, and one comp target sum below ~4.5x for the
+/// canonical profile; 6x is a safe ceiling.
+const TEXTURE_FOOTPRINT_MULTIPLIER: u64 = 6;
+/// Hard ceiling on the total texture memory a single render target may request.
+/// A full 16384x16384 target (the common device max) is ~1 GiB base * 6 ≈ 6 GiB,
+/// so 8 GiB admits legitimate max-dimension targets while rejecting pathological
+/// (e.g. overflow-driven) sizes.
+const MAX_TEXTURE_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Validate an external (w, h) render size with CHECKED arithmetic before any
+/// resize or `create_texture`. `max_dim` is the device `max_texture_dimension_2d`.
+/// Passing this is the precondition for every w*h-derived allocation in the
+/// renderer (feedback/blur/comp textures and their CPU seed buffers).
+pub(crate) fn validate_texture_dims(max_dim: u32, w: u32, h: u32) -> Result<(), DimensionError> {
+    if w == 0 || h == 0 {
+        return Err(DimensionError::Zero);
+    }
+    if w > max_dim || h > max_dim {
+        return Err(DimensionError::ExceedsMaxTextureDimension {
+            width: w,
+            height: h,
+            max: max_dim,
+        });
+    }
+    // u32 `w * h` (the seed-buffer length) and `w * 4` (bytes_per_row) can WRAP;
+    // do the math in u64 with explicit overflow checks so an out-of-range request
+    // is rejected instead of silently under-sizing a buffer or a texture copy.
+    let pixels = (w as u64)
+        .checked_mul(h as u64)
+        .ok_or(DimensionError::ArithmeticOverflow)?;
+    let _row_bytes = (w as u64)
+        .checked_mul(4)
+        .ok_or(DimensionError::ArithmeticOverflow)?;
+    let base_bytes = pixels
+        .checked_mul(4)
+        .ok_or(DimensionError::ArithmeticOverflow)?;
+    let total_bytes = base_bytes
+        .checked_mul(TEXTURE_FOOTPRINT_MULTIPLIER)
+        .ok_or(DimensionError::ArithmeticOverflow)?;
+    if total_bytes > MAX_TEXTURE_MEMORY_BYTES {
+        return Err(DimensionError::ExceedsMemoryBudget {
+            bytes: total_bytes,
+            budget: MAX_TEXTURE_MEMORY_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn mip_level_count_2d(w: u32, h: u32) -> u32 {
     let max_dim = w.max(h).max(1);
     u32::BITS - max_dim.leading_zeros()
@@ -371,7 +1399,76 @@ fn generate_mip_chain(
     }
 }
 
+fn encode_blur_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    target: &wgpu::TextureView,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+fn downsample_rgba_volume(source: &[u8], source_size: u32) -> Vec<u8> {
+    let target_size = (source_size / 2).max(1);
+    let mut target =
+        vec![0u8; target_size as usize * target_size as usize * target_size as usize * 4];
+    for z in 0..target_size {
+        for y in 0..target_size {
+            for x in 0..target_size {
+                let mut sum = [0u32; 4];
+                for dz in 0..2 {
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let sx = (x * 2 + dx).min(source_size - 1);
+                            let sy = (y * 2 + dy).min(source_size - 1);
+                            let sz = (z * 2 + dz).min(source_size - 1);
+                            let offset =
+                                (((sz * source_size + sy) * source_size + sx) * 4) as usize;
+                            for channel in 0..4 {
+                                sum[channel] += source[offset + channel] as u32;
+                            }
+                        }
+                    }
+                }
+                let offset = (((z * target_size + y) * target_size + x) * 4) as usize;
+                for channel in 0..4 {
+                    target[offset + channel] = (sum[channel] / 8) as u8;
+                }
+            }
+        }
+    }
+    target
+}
+
 fn make_tex3d(device: &wgpu::Device, queue: &wgpu::Queue, s: u32, data: &[u8]) -> wgpu::Texture {
+    let mut mip_data = vec![data.to_vec()];
+    let mut size = s;
+    while size > 1 {
+        mip_data.push(downsample_rgba_volume(
+            mip_data.last().expect("base volume mip exists"),
+            size,
+        ));
+        size = (size / 2).max(1);
+    }
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d {
@@ -379,39 +1476,60 @@ fn make_tex3d(device: &wgpu::Device, queue: &wgpu::Queue, s: u32, data: &[u8]) -
             height: s,
             depth_or_array_layers: s,
         },
-        mip_level_count: 1,
+        mip_level_count: mip_data.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D3,
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        tex.as_image_copy(),
-        data,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(s * 4),
-            rows_per_image: Some(s),
-        },
-        wgpu::Extent3d {
-            width: s,
-            height: s,
-            depth_or_array_layers: s,
-        },
-    );
+    let mut size = s;
+    for (level, pixels) in mip_data.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 4),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: size,
+            },
+        );
+        size = (size / 2).max(1);
+    }
     tex
 }
 
 /// Derive a per-preset hue seed (Butterchurn's `rand_start`, normally 4× Math.random()
 /// chosen at load). We hash the preset's shader/equation text so each preset gets a
 /// distinct but reproducible hue (vs the old fixed 0.5 that biased everything green).
-fn preset_hue_seed(s: &str) -> [f32; 4] {
+fn preset_hash64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
+    // The shared LCG must not start from the all-zero-looking FNV offset for an
+    // empty preset; mix the length and avalanche the final hash.
+    h ^= s.len() as u64;
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+    h ^ (h >> 33)
+}
+
+fn preset_hue_seed(s: &str) -> [f32; 4] {
+    let mut h = preset_hash64(s);
     let mut out = [0.0f32; 4];
     for slot in out.iter_mut() {
         h ^= h << 13;
@@ -420,6 +1538,11 @@ fn preset_hue_seed(s: &str) -> [f32; 4] {
         *slot = ((h >> 40) as f32) / ((1u64 << 24) as f32); // → [0,1)
     }
     out
+}
+
+fn named_texture_resolver() -> &'static NamedTextureResolver {
+    static RESOLVER: OnceLock<NamedTextureResolver> = OnceLock::new();
+    RESOLVER.get_or_init(|| NamedTextureResolver::new(Default::default()))
 }
 
 fn noise_bytes(n: usize) -> Vec<u8> {
@@ -764,9 +1887,11 @@ fn build_sampler_bg(
     noise_mq_view: &wgpu::TextureView,
     noise_hq_view: &wgpu::TextureView,
     noise_lite_view: &wgpu::TextureView,
+    named_texture_view: &wgpu::TextureView,
     noisevol_lq_view: &wgpu::TextureView,
     noisevol_hq_view: &wgpu::TextureView,
-    samp: &wgpu::Sampler,
+    main_samp: &wgpu::Sampler,
+    repeat_samp: &wgpu::Sampler,
     samp_clamp: &wgpu::Sampler,
     samp_point: &wgpu::Sampler,
     samp_point_clamp: &wgpu::Sampler,
@@ -775,21 +1900,26 @@ fn build_sampler_bg(
     let mut entries: Vec<BindGroupEntry<'_>> = Vec::with_capacity(MILKDROP_SAMPLERS.len() * 2);
     for (i, name) in MILKDROP_SAMPLERS.iter().enumerate() {
         let (view, sampler) = match *name {
-            "sampler_main" | "sampler_fw_main" => (main_view, samp),
+            // `sampler_main` follows the live per-frame `wrap` value. The
+            // force-wrap variant remains repeat regardless of that value.
+            "sampler_main" => (main_view, main_samp),
+            "sampler_fw_main" => (main_view, repeat_samp),
             "sampler_fc_main" => (main_view, samp_clamp),
             "sampler_pw_main" => (main_view, samp_point),
             "sampler_pc_main" => (main_view, samp_point_clamp),
-            "sampler_blur1" => (blur1_view, samp),
-            "sampler_blur2" => (blur2_view, samp),
-            "sampler_blur3" => (blur3_view, samp),
-            "sampler_noise_lq" => (noise_lq_view, samp),
-            "sampler_noise_lq_lite" | "sampler_noise_hq_lite" => (noise_lite_view, samp),
-            "sampler_noise_mq" => (noise_mq_view, samp),
-            "sampler_noise_hq" => (noise_hq_view, samp),
+            "sampler_blur1" => (blur1_view, samp_clamp),
+            "sampler_blur2" => (blur2_view, samp_clamp),
+            "sampler_blur3" => (blur3_view, samp_clamp),
+            "sampler_noise_lq" => (noise_lq_view, repeat_samp),
+            "sampler_noise_lq_lite" | "sampler_noise_hq_lite" => (noise_lite_view, repeat_samp),
+            "sampler_noise_mq" => (noise_mq_view, repeat_samp),
+            "sampler_noise_hq" => (noise_hq_view, repeat_samp),
+            "sampler_named_linear" => (named_texture_view, samp_clamp),
+            "sampler_named_point" => (named_texture_view, samp_point_clamp),
             "sampler_pw_noise_lq" => (noise_lq_view, samp_point),
-            "sampler_noisevol_lq" => (noisevol_lq_view, samp),
-            "sampler_noisevol_hq" => (noisevol_hq_view, samp),
-            _ => (_noise2d_view, samp),
+            "sampler_noisevol_lq" => (noisevol_lq_view, repeat_samp),
+            "sampler_noisevol_hq" => (noisevol_hq_view, repeat_samp),
+            _ => (_noise2d_view, repeat_samp),
         };
         let tex_bind = (i * 2) as u32;
         entries.push(BindGroupEntry {
@@ -851,9 +1981,12 @@ pub fn compile_glsl(glsl: &str) -> Result<String, String> {
 
 #[derive(Clone, Debug)]
 pub struct CompiledMilkdropShaderBodies {
+    /// Always empty — the legacy fullscreen warp pipeline was removed (P2-VIS-016).
+    /// Kept only so the particle-core shader-cache byte accounting keeps compiling.
     pub warp_wgsl: String,
     pub warp_custom_wgsl: String,
     pub comp_wgsl: String,
+    pub named_texture_plan: NamedTexturePlan,
 }
 
 pub fn compile_milkdrop_shader_bodies(
@@ -872,8 +2005,9 @@ pub fn compile_milkdrop_shader_bodies_from_parts(
     comp: Option<&str>,
 ) -> Result<CompiledMilkdropShaderBodies, String> {
     // Compile warp/comp shaders. Fallback body passes through sampler_main.
-    // The legacy fullscreen warp FS (quad VS) is retained only as a dead
-    // fallback; the live custom-warp path uses warp_custom_wgsl (mesh VS).
+    // The live warp path is warp_custom_wgsl (the warped MESH VS). The legacy
+    // fullscreen warp FS (quad VS) is GONE (P2-VIS-016): nothing rendered it, yet
+    // its `compile_glsl` could fail and reject an otherwise-renderable preset.
     let warp_default = "ret = GetMain(uv);";
     let comp_default = "float _eh = mod(echo_orientation, 2.0); \
              float _ex = (_eh != 0.0) ? -1.0 : 1.0; \
@@ -888,27 +2022,39 @@ pub fn compile_milkdrop_shader_bodies_from_parts(
              if (solarize != 0.0) ret = ret * (1.0 - ret) * 4.0; \
              if (invert   != 0.0) ret = 1.0 - ret;";
 
+    let named_texture_plan = NamedTexturePlan::from_sources([warp, comp].into_iter().flatten());
+    let named_bindings = named_texture_plan.shader_rewrite_bindings();
+    let named_layer_size = DEFAULT_NAMED_TEXTURE_LAYER_SIZE;
+
     // shaders_glsl path (Butterchurn converted-JSON): the custom warp/comp
     // bodies are already GLSL, so compile them via the GLSL-body path.
-    let warp_legacy_glsl = match (shaders_glsl, warp) {
-        (true, Some(body)) => glsl_milk_body_to_naga(body),
-        _ => hlsl_milk_body_to_naga(warp.unwrap_or(warp_default)),
-    };
     let warp_custom_glsl = match (shaders_glsl, warp) {
-        (true, Some(body)) => glsl_milk_warp_body_to_naga(body),
-        _ => hlsl_milk_warp_body_to_naga(warp.unwrap_or(warp_default)),
+        (true, Some(body)) => {
+            glsl_milk_warp_body_to_naga_with_named_textures(body, &named_bindings, named_layer_size)
+        }
+        _ => hlsl_milk_warp_body_to_naga_with_named_textures(
+            warp.unwrap_or(warp_default),
+            &named_bindings,
+            named_layer_size,
+        ),
     };
     let comp_glsl = match (shaders_glsl, comp) {
-        (true, Some(body)) => glsl_milk_body_to_naga(body),
-        _ => hlsl_milk_body_to_naga(comp.unwrap_or(comp_default)),
+        (true, Some(body)) => {
+            glsl_milk_body_to_naga_with_named_textures(body, &named_bindings, named_layer_size)
+        }
+        _ => hlsl_milk_body_to_naga_with_named_textures(
+            comp.unwrap_or(comp_default),
+            &named_bindings,
+            named_layer_size,
+        ),
     };
 
     if std::env::var("MILKDROP_DUMP_GLSL").is_ok() {
-        eprintln!("==== legacy warp GLSL ====\n{warp_legacy_glsl}\n==== end legacy warp ====");
         eprintln!("==== custom warp GLSL ====\n{warp_custom_glsl}\n==== end custom warp ====");
         eprintln!("==== comp GLSL ====\n{comp_glsl}\n==== end comp ====");
     }
-    let warp_wgsl = compile_glsl(&warp_legacy_glsl)?;
+    // Only the LIVE paths are compiled. The dead legacy warp compile was removed
+    // (P2-VIS-016) so a legacy-only compile failure can no longer sink a preset.
     let warp_custom_wgsl = compile_glsl(&warp_custom_glsl)?;
     let comp_wgsl = compile_glsl(&comp_glsl)?;
     if std::env::var("MILKDROP_DUMP_WARP_WGSL").is_ok() {
@@ -916,10 +2062,57 @@ pub fn compile_milkdrop_shader_bodies_from_parts(
     }
 
     Ok(CompiledMilkdropShaderBodies {
-        warp_wgsl,
+        // Retained (empty) for the particle-core shader-cache byte-accounting ABI;
+        // the legacy fullscreen warp pipeline it fed no longer exists.
+        warp_wgsl: String::new(),
         warp_custom_wgsl,
         comp_wgsl,
+        named_texture_plan,
     })
+}
+
+/// Whether a MilkDrop shader body samples a given blur level (1..=3).
+///
+/// Presets read blur either through the `GetBlur1/2/3` preamble helpers or by
+/// sampling `sampler_blur1/2/3` directly; both forms contain the `blurN` token.
+/// Scanning the body (not the compiled WGSL, whose preamble always declares
+/// every sampler) is the reliable signal. The per-frame `blur1_min/max` range
+/// scalars live in the EEL equations, never in a warp/comp body, so they can't
+/// false-positive here.
+///
+/// The compile path first collapses mode-prefixed samplers
+/// (`sampler_{fw,fc,pw,pc}_blurN` → `sampler_blurN`) via
+/// [`normalize_milkdrop_sampler_variants`]. A body that samples e.g.
+/// `sampler_pw_blur2` therefore compiles and reads blur2 at runtime, so the
+/// detector runs the RAW body through that SAME normalizer before matching —
+/// otherwise it would miss the prefixed spelling and skip generating a level the
+/// shader actually samples (stale/black blur texture → corruption, P2-VIS-017).
+/// Reusing the normalizer (rather than re-listing the prefixes here) means the
+/// two can't drift.
+fn milkdrop_body_samples_blur(body: &str, level: u8) -> bool {
+    // Lowercase first so source-case variants (e.g. `SAMPLER_PW_BLUR2`) still hit
+    // the normalizer's lowercase prefix patterns; then collapse mode prefixes.
+    let normalized = normalize_milkdrop_sampler_variants(&body.to_ascii_lowercase());
+    let n = char::from(b'0' + level);
+    normalized.contains(&format!("getblur{n}")) || normalized.contains(&format!("sampler_blur{n}"))
+}
+
+/// Highest blur level (0..=3) that the active preset's warp/comp shaders sample.
+///
+/// The blur chain is PROGRESSIVE — blur2 is built from blur1 and blur3 from
+/// blur2 — so the renderer generates every level up to this maximum and skips the
+/// rest (P2-VIS-016 companion P2-VIS-017). A default preset (no custom warp/comp)
+/// samples no blur and returns 0 → zero blur draws.
+pub(crate) fn needed_blur_levels(warp: Option<&str>, comp: Option<&str>) -> u8 {
+    let mut level = 0u8;
+    for body in [warp, comp].into_iter().flatten() {
+        for candidate in 1..=3u8 {
+            if candidate > level && milkdrop_body_samples_blur(body, candidate) {
+                level = candidate;
+            }
+        }
+    }
+    level
 }
 
 // compute_warp_verts is now a method on MilkdropRenderer (see impl block) — it
@@ -936,7 +2129,9 @@ pub struct MilkdropRenderer {
     has_custom_comp: bool,
     /// preset's decay value (used in warp mesh pass)
     preset_decay: f32,
-    /// per-preset hue seed (Butterchurn rand_start) feeding the comp hue_shader
+    /// Persistent random vectors are distinct in Butterchurn: rand_start drives
+    /// built-in hue phases while rand_preset is visible to authored shaders.
+    rand_start: [f32; 4],
     rand_preset: [f32; 4],
 
     // ping-pong feedback textures (both RGBA8, same size as render)
@@ -962,6 +2157,13 @@ pub struct MilkdropRenderer {
     view_blur1: wgpu::TextureView,
     view_blur2: wgpu::TextureView,
     view_blur3: wgpu::TextureView,
+    // All-mip sampling views plus one-level views used to build each pyramid.
+    view_blur1_sample: wgpu::TextureView,
+    view_blur2_sample: wgpu::TextureView,
+    view_blur3_sample: wgpu::TextureView,
+    blur_mips1: Vec<wgpu::TextureView>,
+    blur_mips2: Vec<wgpu::TextureView>,
+    blur_mips3: Vec<wgpu::TextureView>,
     // separable-blur horizontal-pass intermediates (same res as blur1/2/3)
     btemp1: wgpu::Texture,
     btemp2: wgpu::Texture,
@@ -969,6 +2171,18 @@ pub struct MilkdropRenderer {
     view_btemp1: wgpu::TextureView,
     view_btemp2: wgpu::TextureView,
     view_btemp3: wgpu::TextureView,
+    view_btemp1_sample: wgpu::TextureView,
+    view_btemp2_sample: wgpu::TextureView,
+    view_btemp3_sample: wgpu::TextureView,
+    btemp_mips1: Vec<wgpu::TextureView>,
+    btemp_mips2: Vec<wgpu::TextureView>,
+    btemp_mips3: Vec<wgpu::TextureView>,
+
+    // Per-preset custom-image atlas. Custom sampler calls are rewritten to one
+    // of two reserved bindings (linear/point) that share this view.
+    #[allow(dead_code)]
+    named_texture_atlas: wgpu::Texture,
+    view_named_texture_atlas: wgpu::TextureView,
 
     // noise textures (Butterchurn-faithful; kept alive — views borrowed by bind groups)
     #[allow(dead_code)]
@@ -1008,6 +2222,7 @@ pub struct MilkdropRenderer {
 
     // UBO
     perframe_buf: wgpu::Buffer,
+    comp_perframe_buf: wgpu::Buffer,
 
     // blur pass uniform buffers (one per pass, holds texel size of source)
     blur1_ubo: wgpu::Buffer,
@@ -1015,8 +2230,9 @@ pub struct MilkdropRenderer {
     blur3_ubo: wgpu::Buffer,
 
     // pipelines
-    warp_pipeline: wgpu::RenderPipeline,
     /// Custom-warp FS driven by the warped MESH VS (per-pixel warp + decay path).
+    /// This is the ONLY custom-warp pipeline — the legacy fullscreen quad-VS warp
+    /// pipeline was removed (P2-VIS-016); it was never rendered.
     warp_custom_pipeline: wgpu::RenderPipeline,
     comp_pipeline: wgpu::RenderPipeline,
     blur_h_pipeline: wgpu::RenderPipeline,
@@ -1033,9 +2249,14 @@ pub struct MilkdropRenderer {
     fxaa_bg: wgpu::BindGroup,
     // standard warp mesh (used when no custom warp shader)
     warp_mesh_pipeline: wgpu::RenderPipeline,
-    warp_mesh_bg_a: wgpu::BindGroup, // reads from tex_a
-    warp_mesh_bg_b: wgpu::BindGroup, // reads from tex_b
+    warp_mesh_bg_a: wgpu::BindGroup, // reads from tex_a, repeat
+    warp_mesh_bg_b: wgpu::BindGroup, // reads from tex_b, repeat
+    warp_mesh_bg_a_clamp: wgpu::BindGroup,
+    warp_mesh_bg_b_clamp: wgpu::BindGroup,
     warp_mesh_bgl: wgpu::BindGroupLayout,
+    warp_params_buf: wgpu::Buffer,
+    warp_params_bgl: wgpu::BindGroupLayout,
+    warp_params_bg: wgpu::BindGroup,
     warp_vert_buf: wgpu::Buffer, // updated per frame
     warp_idx_buf: wgpu::Buffer,  // static
     warp_idx_count: u32,
@@ -1050,37 +2271,67 @@ pub struct MilkdropRenderer {
     // bg_read_b: sampler_main = view_b
     bg_read_a: wgpu::BindGroup,
     bg_read_b: wgpu::BindGroup,
+    bg_read_a_clamp: wgpu::BindGroup,
+    bg_read_b_clamp: wgpu::BindGroup,
 
     // perframe bind group
     perframe_bg: wgpu::BindGroup,
+    comp_perframe_bg: wgpu::BindGroup,
 
-    // blur bind groups for the separable H/V chain. blur1's H pass reads the warp
-    // output (write_view) so it is rebuilt each frame in render(); the rest are static.
+    // Blur bind groups for the separable H/V chain. Both possible blur1 sources
+    // are prebuilt so the frame loop never creates a bind group.
+    blur1_h_bg_a: wgpu::BindGroup,
+    blur1_h_bg_b: wgpu::BindGroup,
     blur1_v_bg: wgpu::BindGroup,
     blur2_h_bg: wgpu::BindGroup,
     blur2_v_bg: wgpu::BindGroup,
     blur3_h_bg: wgpu::BindGroup,
     blur3_v_bg: wgpu::BindGroup,
+    /// Highest blur level (0..=3) the active preset's shaders sample. Blur draws
+    /// above this level are skipped — a no-blur preset does zero blur passes
+    /// (P2-VIS-017). The chain is progressive, so levels 1..=blur_levels run.
+    blur_levels: u8,
+    /// Blur render passes issued on the most recent `render()` (0/2/4/6) — the
+    /// observable counter the P2-VIS-017 regression test asserts on.
+    last_blur_pass_count: u32,
 
     // EEL2 per-frame equations
     eel_program: Option<EelProgram>,
     eel_env: Env,
     /// Per-frame megabuf pool (private) + shared preset-wide gmegabuf handle.
     eel_state: EelState,
+    /// Preset-owned random stream shared by every EEL pool and shader randoms.
+    eel_rng: Arc<EelRng>,
     /// Preset-wide gmegabuf shared by all pools (per-frame/per-pixel/shape/wave).
     #[allow(dead_code)]
-    gmegabuf: Rc<RefCell<MegaBuf>>,
+    gmegabuf: Arc<Mutex<MegaBuf>>,
     /// q1..q32 post-init snapshot — re-applied at the top of every frame so
     /// accumulator-q presets don't drift (Butterchurn's per-frame q reset).
-    q_init: Vec<(String, f64)>,
+    q_init: [f64; 32],
 
     // Per-vertex warp (per_pixel) program + per-frame warp base values.
     per_pixel_prog: Option<EelProgram>,
     base_warp: WarpBase,
     /// Scratch EEL env reused across warp vertices (avoids per-vertex alloc).
     warp_env: Env,
+    /// Pre-interned dense slots used by the per-pixel hot loop.
+    warp_slots: WarpEnvSlots,
+    eel_reg_slots: [EnvSlot; 100],
+    eel_q_slots: [EnvSlot; 32],
+    warp_reg_slots: [EnvSlot; 100],
+    /// Dense ten-control snapshot restored before every per-pixel evaluation.
+    warp_snapshot: EnvSnapshot,
     /// Per-pixel megabuf pool (private) sharing the preset-wide gmegabuf.
     warp_state: EelState,
+
+    /// Allocation-stable geometry and uniform staging storage.
+    scratch: RendererScratch,
+    /// Disabled by default. When enabled, summarizes already-built CPU geometry
+    /// once per frame; no geometry scan runs on the production path.
+    geometry_diagnostics: GeometryDiagnosticCollector,
+    /// Three full-frame readback buffers allocated only while diagnostics are
+    /// enabled. Copies are encoded on the worker's extra untimed frame.
+    geometry_stage_readback: Option<GeometryStageReadback>,
 
     // frame state
     frame_idx: u64,
@@ -1111,8 +2362,7 @@ pub struct MilkdropRenderer {
     shape_bgl: wgpu::BindGroupLayout,
     border_bgl: wgpu::BindGroupLayout,
     shape_vert_buf: wgpu::Buffer,
-    shape_idx_buf: wgpu::Buffer,     // static fan triangulation, 300 u32
-    shape_uniform_buf: wgpu::Buffer, // ShapeU (textured)
+    shape_idx_buf: wgpu::Buffer, // static fan triangulation, 300 u32
     border_vert_buf: wgpu::Buffer,
     // border uniforms: dyn-offset buffer (4 slots of 256B = up to 4 thick passes)
     border_uniform_buf: wgpu::Buffer,
@@ -1120,6 +2370,8 @@ pub struct MilkdropRenderer {
     // shape fill bind groups, one per ping-pong read side (prev-frame texture)
     shape_bg_read_a: wgpu::BindGroup,
     shape_bg_read_b: wgpu::BindGroup,
+    shape_bg_read_a_clamp: wgpu::BindGroup,
+    shape_bg_read_b_clamp: wgpu::BindGroup,
 
     // ── Waveforms (built-in + custom) ────────────────────────────────────────
     waves: Vec<WaveRT>,
@@ -1129,8 +2381,10 @@ pub struct MilkdropRenderer {
     wave_pipeline_points_additive: wgpu::RenderPipeline,
     wave_bgl: wgpu::BindGroupLayout,
     wave_vert_buf: wgpu::Buffer,
-    wave_off_buf: wgpu::Buffer, // dyn-offset slots of 256B (thick offsets)
+    wave_off_buf: wgpu::Buffer, // texel size for instance-index thick offsets
     wave_bg: wgpu::BindGroup,
+    /// Guarded static LOD for expensive, side-effect-free custom per-point EEL.
+    custom_wave_adaptive_lod: bool,
 
     // built-in waveform scalar/bool state (parsed)
     bw_mode: f32,
@@ -1153,6 +2407,10 @@ pub struct MilkdropRenderer {
 
     // comp post-FX flags (bBrighten/bDarken/bSolarize/bInvert) for the built-in comp body
     comp_gamma_adj: f32,
+    comp_fshader: f32,
+    echo_zoom: f32,
+    echo_alpha: f32,
+    echo_orient: f32,
     comp_brighten: bool,
     comp_darken: bool,
     comp_solarize: bool,
@@ -1213,6 +2471,10 @@ pub struct MilkdropRenderer {
     // per-sample audio waveform (range ~[-1,1]); filled by set_waveform or synthesized.
     wave_l: Vec<f32>,
     wave_r: Vec<f32>,
+
+    // Compatibility/debug counter. Butterchurn-parity feedback starts black, so
+    // no feedback-seed noise is generated at init or resize and this stays zero.
+    noise_regen_count: u32,
 }
 
 impl MilkdropRenderer {
@@ -1260,41 +2522,30 @@ impl MilkdropRenderer {
         pipeline_cache: Option<&wgpu::PipelineCache>,
     ) -> Result<Self, String> {
         let (w, h) = (width.max(1), height.max(1));
+        // Reject overflowing / over-limit dimensions BEFORE allocating any texture
+        // or CPU seed buffer (P2-VIS-019 + P1-043 milkdrop slice).
+        validate_texture_dims(device.limits().max_texture_dimension_2d, w, h)
+            .map_err(|e| e.to_string())?;
 
         let has_custom_warp = shaders.warp.is_some();
         let has_custom_comp = shaders.comp.is_some();
-        let warp_wgsl = compiled.warp_wgsl.as_str();
+        let blur_levels = needed_blur_levels(shaders.warp.as_deref(), shaders.comp.as_deref());
         let warp_custom_wgsl = compiled.warp_custom_wgsl.as_str();
         let comp_wgsl = compiled.comp_wgsl.as_str();
 
-        // Create feedback textures — seed with low-level noise so the warp shader
-        // has non-uniform gradients to amplify from the very first frame.
+        // Butterchurn starts both feedback surfaces black. Authored waves/shapes
+        // seed the feedback naturally; injecting lattice noise here creates false
+        // detail and can hide genuinely blank presets.
         let fb_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::COPY_SRC;
         let feedback_mip_levels = mip_level_count_2d(w, h);
 
-        let seed_a = noise_bytes_scaled((w * h) as usize, 32); // 0–31 range (subtle)
-        let seed_b = noise_bytes_scaled((w * h) as usize, 32);
-        let tex_a = make_tex2d_with_mips(
-            &device,
-            &queue,
-            w,
-            h,
-            fb_usage,
-            feedback_mip_levels,
-            Some(&seed_a),
-        );
-        let tex_b = make_tex2d_with_mips(
-            &device,
-            &queue,
-            w,
-            h,
-            fb_usage,
-            feedback_mip_levels,
-            Some(&seed_b),
-        );
+        let tex_a =
+            make_tex2d_with_mips(&device, &queue, w, h, fb_usage, feedback_mip_levels, None);
+        let tex_b =
+            make_tex2d_with_mips(&device, &queue, w, h, fb_usage, feedback_mip_levels, None);
         let view_a = mip_level_view(&tex_a, 0);
         let view_b = mip_level_view(&tex_b, 0);
         let view_a_sample = tex_a.create_view(&Default::default());
@@ -1302,42 +2553,89 @@ impl MilkdropRenderer {
         let feedback_mips_a = mip_chain_views(&tex_a, feedback_mip_levels);
         let feedback_mips_b = mip_chain_views(&tex_b, feedback_mip_levels);
 
-        // Blur textures. Keep the established square level ratios here; the BC
-        // asymmetric blur-ratio experiment regressed the broad visual audit and
-        // needs a more surgical pass before it becomes the default.
-        let blur_usage =
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let (bw1, bh1) = ((w / 2).max(1), (h / 2).max(1));
-        let (bw2, bh2) = ((w / 4).max(1), (h / 4).max(1));
-        let (bw3, bh3) = ((w / 8).max(1), (h / 8).max(1));
-        let (btw1, bth1) = (bw1, bh1);
-        let (btw2, bth2) = (bw2, bh2);
-        let (btw3, bth3) = (bw3, bh3);
+        // Butterchurn's blur pyramid is asymmetric at level 1: horizontal temp
+        // is 1/2 resolution, while the finished level is 1/4. Levels 2 and 3
+        // are 1/8 and 1/16 respectively for both passes.
+        let blur_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let [(bw1, bh1), (bw2, bh2), (bw3, bh3), (btw1, bth1), (btw2, bth2), (btw3, bth3)] =
+            blur_dimensions(w, h);
 
-        let blur1 = make_tex2d(&device, &queue, bw1, bh1, blur_usage, None);
-        let blur2 = make_tex2d(&device, &queue, bw2, bh2, blur_usage, None);
-        let blur3 = make_tex2d(&device, &queue, bw3, bh3, blur_usage, None);
-        let view_blur1 = blur1.create_view(&Default::default());
-        let view_blur2 = blur2.create_view(&Default::default());
-        let view_blur3 = blur3.create_view(&Default::default());
+        let blur_levels1 = mip_level_count_2d(bw1, bh1);
+        let blur_levels2 = mip_level_count_2d(bw2, bh2);
+        let blur_levels3 = mip_level_count_2d(bw3, bh3);
+        let blur1 = make_tex2d_with_mips(&device, &queue, bw1, bh1, blur_usage, blur_levels1, None);
+        let blur2 = make_tex2d_with_mips(&device, &queue, bw2, bh2, blur_usage, blur_levels2, None);
+        let blur3 = make_tex2d_with_mips(&device, &queue, bw3, bh3, blur_usage, blur_levels3, None);
+        let view_blur1 = mip_level_view(&blur1, 0);
+        let view_blur2 = mip_level_view(&blur2, 0);
+        let view_blur3 = mip_level_view(&blur3, 0);
+        let view_blur1_sample = blur1.create_view(&Default::default());
+        let view_blur2_sample = blur2.create_view(&Default::default());
+        let view_blur3_sample = blur3.create_view(&Default::default());
+        let blur_mips1 = mip_chain_views(&blur1, blur_levels1);
+        let blur_mips2 = mip_chain_views(&blur2, blur_levels2);
+        let blur_mips3 = mip_chain_views(&blur3, blur_levels3);
 
-        // Separable blur needs a horizontal-pass intermediate per level.
-        let btemp1 = make_tex2d(&device, &queue, btw1, bth1, blur_usage, None);
-        let btemp2 = make_tex2d(&device, &queue, btw2, bth2, blur_usage, None);
-        let btemp3 = make_tex2d(&device, &queue, btw3, bth3, blur_usage, None);
-        let view_btemp1 = btemp1.create_view(&Default::default());
-        let view_btemp2 = btemp2.create_view(&Default::default());
-        let view_btemp3 = btemp3.create_view(&Default::default());
+        // Butterchurn generates mipmaps after the horizontal blur too; its
+        // vertical shader relies on implicit-LOD sampling of that pyramid.
+        // V1 downsamples btemp1 by 2×, so implicit derivatives can select mip1.
+        // Levels 2/3 are 1:1 H→V and only ever select LOD0; allocating/blitting
+        // their unused tails would add pure GPU work.
+        let btemp_levels1 = mip_level_count_2d(btw1, bth1).min(2);
+        let btemp_levels2 = 1;
+        let btemp_levels3 = 1;
+        let btemp1 =
+            make_tex2d_with_mips(&device, &queue, btw1, bth1, blur_usage, btemp_levels1, None);
+        let btemp2 =
+            make_tex2d_with_mips(&device, &queue, btw2, bth2, blur_usage, btemp_levels2, None);
+        let btemp3 =
+            make_tex2d_with_mips(&device, &queue, btw3, bth3, blur_usage, btemp_levels3, None);
+        let view_btemp1 = mip_level_view(&btemp1, 0);
+        let view_btemp2 = mip_level_view(&btemp2, 0);
+        let view_btemp3 = mip_level_view(&btemp3, 0);
+        let view_btemp1_sample = btemp1.create_view(&Default::default());
+        let view_btemp2_sample = btemp2.create_view(&Default::default());
+        let view_btemp3_sample = btemp3.create_view(&Default::default());
+        let btemp_mips1 = mip_chain_views(&btemp1, btemp_levels1);
+        let btemp_mips2 = mip_chain_views(&btemp2, btemp_levels2);
+        let btemp_mips3 = mip_chain_views(&btemp3, btemp_levels3);
 
         // Offscreen full-res comp target (Rgba8Unorm). COMP now writes here; the FXAA
         // OUTPUT pass reads it and resolves into the swapchain.
         let comp_tex = make_tex2d(&device, &queue, w, h, blur_usage, None);
         let comp_view = comp_tex.create_view(&Default::default());
 
+        let (named_width, named_height, named_pixels) = if compiled.named_texture_plan.is_empty() {
+            (1, 1, vec![0u8, 0, 0, 255])
+        } else {
+            let atlas = named_texture_resolver().resolve_plan_atlas(&compiled.named_texture_plan);
+            (atlas.width, atlas.height, atlas.rgba8)
+        };
+        // The atlas uses finite gutters between unrelated images. Keep the one
+        // safe minification level; deeper whole-atlas mips would bleed adjacent
+        // cells together (unlike Butterchurn's isolated image textures).
+        let named_texture_levels = mip_level_count_2d(named_width, named_height).min(2);
+        let named_texture_atlas = make_tex2d_with_mips(
+            &device,
+            &queue,
+            named_width,
+            named_height,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            named_texture_levels,
+            Some(&named_pixels),
+        );
+        let view_named_texture_atlas = named_texture_atlas.create_view(&Default::default());
+
         // Noise textures — Butterchurn-faithful value/lattice noise (noise.js).
         // LQ 256² zoom1 (random), MQ 256² zoom4 (smoothed), HQ 256² zoom8 (smoothed),
         // LQ-lite 32² zoom1, noisevol_lq 32³ zoom1, noisevol_hq 32³ zoom4 (smoothed).
-        let tex_binding = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        let tex_binding = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT;
         let mut rng = bc_rng();
         let n_lq = create_noise_tex(256, 1, &mut rng);
         let n_mq = create_noise_tex(256, 4, &mut rng);
@@ -1346,10 +2644,44 @@ impl MilkdropRenderer {
         let nv_lq = create_noise_vol_tex(32, 1, &mut rng);
         let nv_hq = create_noise_vol_tex(32, 4, &mut rng);
 
-        let noise_lq = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_lq));
-        let noise_mq = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_mq));
-        let noise_hq = make_tex2d(&device, &queue, 256, 256, tex_binding, Some(&n_hq));
-        let noise_lite = make_tex2d(&device, &queue, 32, 32, tex_binding, Some(&n_lite));
+        let noise_lq_levels = mip_level_count_2d(256, 256);
+        let noise_lite_levels = mip_level_count_2d(32, 32);
+        let noise_lq = make_tex2d_with_mips(
+            &device,
+            &queue,
+            256,
+            256,
+            tex_binding,
+            noise_lq_levels,
+            Some(&n_lq),
+        );
+        let noise_mq = make_tex2d_with_mips(
+            &device,
+            &queue,
+            256,
+            256,
+            tex_binding,
+            noise_lq_levels,
+            Some(&n_mq),
+        );
+        let noise_hq = make_tex2d_with_mips(
+            &device,
+            &queue,
+            256,
+            256,
+            tex_binding,
+            noise_lq_levels,
+            Some(&n_hq),
+        );
+        let noise_lite = make_tex2d_with_mips(
+            &device,
+            &queue,
+            32,
+            32,
+            tex_binding,
+            noise_lite_levels,
+            Some(&n_lite),
+        );
         let noisevol_lq = make_tex3d(&device, &queue, 32, &nv_lq);
         let noisevol_hq = make_tex3d(&device, &queue, 32, &nv_hq);
 
@@ -1368,7 +2700,16 @@ impl MilkdropRenderer {
         // Placeholder view for the unrelated fw/pw/pc sampler slots (2/6/8) — keep
         // a small 2D random texture for those, matching the old behaviour.
         let n_placeholder = noise_bytes(64 * 64);
-        let noise2d = make_tex2d(&device, &queue, 64, 64, tex_binding, Some(&n_placeholder));
+        let noise2d_levels = mip_level_count_2d(64, 64);
+        let noise2d = make_tex2d_with_mips(
+            &device,
+            &queue,
+            64,
+            64,
+            tex_binding,
+            noise2d_levels,
+            Some(&n_placeholder),
+        );
         let view_noise2d = noise2d.create_view(&Default::default());
 
         // Sampler
@@ -1420,16 +2761,58 @@ impl MilkdropRenderer {
                 .build();
         {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("feedback-seed-mips"),
+                label: Some("static-texture-mips"),
             });
             generate_mip_chain(&device, &feedback_mip_blitter, &mut enc, &feedback_mips_a);
             generate_mip_chain(&device, &feedback_mip_blitter, &mut enc, &feedback_mips_b);
+            generate_mip_chain(
+                &device,
+                &feedback_mip_blitter,
+                &mut enc,
+                &mip_chain_views(&noise_lq, noise_lq_levels),
+            );
+            generate_mip_chain(
+                &device,
+                &feedback_mip_blitter,
+                &mut enc,
+                &mip_chain_views(&noise_mq, noise_lq_levels),
+            );
+            generate_mip_chain(
+                &device,
+                &feedback_mip_blitter,
+                &mut enc,
+                &mip_chain_views(&noise_hq, noise_lq_levels),
+            );
+            generate_mip_chain(
+                &device,
+                &feedback_mip_blitter,
+                &mut enc,
+                &mip_chain_views(&noise_lite, noise_lite_levels),
+            );
+            generate_mip_chain(
+                &device,
+                &feedback_mip_blitter,
+                &mut enc,
+                &mip_chain_views(&noise2d, noise2d_levels),
+            );
+            generate_mip_chain(
+                &device,
+                &feedback_mip_blitter,
+                &mut enc,
+                &mip_chain_views(&named_texture_atlas, named_texture_levels),
+            );
             queue.submit(std::iter::once(enc.finish()));
         }
 
         // UBO
         let perframe_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("perframe-ubo"),
+            size: std::mem::size_of::<PerFrame>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let comp_perframe_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("comp-perframe-ubo"),
             size: std::mem::size_of::<PerFrame>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1460,17 +2843,17 @@ impl MilkdropRenderer {
         };
         let blur1_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur1-ubo"),
-            contents: bytemuck::cast_slice(&blur_ubo_contents(w, bh1)),
+            contents: bytemuck::cast_slice(&blur_ubo_contents(w, bth1)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let blur2_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur2-ubo"),
-            contents: bytemuck::cast_slice(&blur_ubo_contents(bw1, bh2)),
+            contents: bytemuck::cast_slice(&blur_ubo_contents(bw1, bth2)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let blur3_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur3-ubo"),
-            contents: bytemuck::cast_slice(&blur_ubo_contents(bw2, bh3)),
+            contents: bytemuck::cast_slice(&blur_ubo_contents(bw2, bth3)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -1478,11 +2861,50 @@ impl MilkdropRenderer {
         let sampler_bgl = sampler_bgl(&device);
         let perframe_bgl = perframe_bgl(&device);
         let blur_bgl = blur_bgl(&device);
+        let warp_params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("warp-params-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<WarpGpuParams>() as u64
+                    ),
+                },
+                count: None,
+            }],
+        });
+        let warp_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("warp-params-ubo"),
+            size: std::mem::size_of::<WarpGpuParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let warp_params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("warp-params-bg"),
+            layout: &warp_params_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: warp_params_buf.as_entire_binding(),
+            }],
+        });
 
-        // Pipeline layout for warp/comp
-        let milk_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("milk-pl"),
+        // Comp keeps the original two groups. Custom warp additionally consumes
+        // the default-warp parameter UBO in its vertex shader.
+        let comp_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("comp-pl"),
             bind_group_layouts: &[Some(&sampler_bgl), Some(&perframe_bgl)],
+            immediate_size: 0,
+        });
+        let warp_custom_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("warp-custom-pl"),
+            bind_group_layouts: &[
+                Some(&sampler_bgl),
+                Some(&perframe_bgl),
+                Some(&warp_params_bgl),
+            ],
             immediate_size: 0,
         });
         // Pipeline layout for blur
@@ -1499,37 +2921,6 @@ impl MilkdropRenderer {
             source: wgpu::ShaderSource::Wgsl(quad_src.into()),
         });
 
-        // Warp pipeline
-        let warp_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("warp-fs"),
-            source: wgpu::ShaderSource::Wgsl(warp_wgsl.into()),
-        });
-        let warp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("warp-pipeline"),
-            layout: Some(&milk_pl),
-            vertex: wgpu::VertexState {
-                module: &quad_mod,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &warp_mod,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: pipeline_cache,
-        });
-
         // Comp pipeline
         let comp_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("comp-fs"),
@@ -1537,7 +2928,7 @@ impl MilkdropRenderer {
         });
         let comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("comp-pipeline"),
-            layout: Some(&milk_pl),
+            layout: Some(&comp_pl),
             vertex: wgpu::VertexState {
                 module: &quad_mod,
                 entry_point: Some("vs_main"),
@@ -1672,22 +3063,32 @@ impl MilkdropRenderer {
                 resource: perframe_buf.as_entire_binding(),
             }],
         });
+        let comp_perframe_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("comp-perframe-bg"),
+            layout: &perframe_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: ubo_binding,
+                resource: comp_perframe_buf.as_entire_binding(),
+            }],
+        });
 
         // Sampler bind groups (two, one per ping-pong side)
         let bg_read_a = build_sampler_bg(
             &device,
             &sampler_bgl,
             &view_a_sample,
-            &view_blur1,
-            &view_blur2,
-            &view_blur3,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
             &view_noise2d,
             &view_noise_lq,
             &view_noise_mq,
             &view_noise_hq,
             &view_noise_lite,
+            &view_named_texture_atlas,
             &view_noisevol_lq,
             &view_noisevol_hq,
+            &linear_samp,
             &linear_samp,
             &clamp_samp,
             &point_samp,
@@ -1697,16 +3098,60 @@ impl MilkdropRenderer {
             &device,
             &sampler_bgl,
             &view_b_sample,
-            &view_blur1,
-            &view_blur2,
-            &view_blur3,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
             &view_noise2d,
             &view_noise_lq,
             &view_noise_mq,
             &view_noise_hq,
             &view_noise_lite,
+            &view_named_texture_atlas,
             &view_noisevol_lq,
             &view_noisevol_hq,
+            &linear_samp,
+            &linear_samp,
+            &clamp_samp,
+            &point_samp,
+            &point_clamp_samp,
+        );
+        let bg_read_a_clamp = build_sampler_bg(
+            &device,
+            &sampler_bgl,
+            &view_a_sample,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
+            &view_noise2d,
+            &view_noise_lq,
+            &view_noise_mq,
+            &view_noise_hq,
+            &view_noise_lite,
+            &view_named_texture_atlas,
+            &view_noisevol_lq,
+            &view_noisevol_hq,
+            &clamp_samp,
+            &linear_samp,
+            &clamp_samp,
+            &point_samp,
+            &point_clamp_samp,
+        );
+        let bg_read_b_clamp = build_sampler_bg(
+            &device,
+            &sampler_bgl,
+            &view_b_sample,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
+            &view_noise2d,
+            &view_noise_lq,
+            &view_noise_mq,
+            &view_noise_hq,
+            &view_noise_lite,
+            &view_named_texture_atlas,
+            &view_noisevol_lq,
+            &view_noisevol_hq,
+            &clamp_samp,
             &linear_samp,
             &clamp_samp,
             &point_samp,
@@ -1735,12 +3180,13 @@ impl MilkdropRenderer {
                 ],
             })
         };
-        // blur1 H reads the warp output (write_view) → rebuilt each frame in render().
-        let blur1_v_bg = make_blur_bg(&view_btemp1, &blur1_ubo);
-        let blur2_h_bg = make_blur_bg(&view_blur1, &blur2_ubo);
-        let blur2_v_bg = make_blur_bg(&view_btemp2, &blur2_ubo);
-        let blur3_h_bg = make_blur_bg(&view_blur2, &blur3_ubo);
-        let blur3_v_bg = make_blur_bg(&view_btemp3, &blur3_ubo);
+        let blur1_h_bg_a = make_blur_bg(&view_a, &blur1_ubo);
+        let blur1_h_bg_b = make_blur_bg(&view_b, &blur1_ubo);
+        let blur1_v_bg = make_blur_bg(&view_btemp1_sample, &blur1_ubo);
+        let blur2_h_bg = make_blur_bg(&view_blur1_sample, &blur2_ubo);
+        let blur2_v_bg = make_blur_bg(&view_btemp2_sample, &blur2_ubo);
+        let blur3_h_bg = make_blur_bg(&view_blur2_sample, &blur3_ubo);
+        let blur3_v_bg = make_blur_bg(&view_btemp3_sample, &blur3_ubo);
 
         // ── Warp mesh pipeline (used when no custom warp shader) ─────────────
         // Decay is now per-vertex (vertex buffer attribute 2), so the old decay
@@ -1767,13 +3213,9 @@ impl MilkdropRenderer {
             ],
         });
 
-        // bTexWrap: wrap=1 → repeat (linear_samp); wrap=0 → clamp (clamp_samp).
-        let mesh_samp: &wgpu::Sampler = if shaders.wrap {
-            &linear_samp
-        } else {
-            &clamp_samp
-        };
-        let make_mesh_bg = |tv: &wgpu::TextureView| {
+        // Prebuild both live wrap modes; per-frame EEL selects one without
+        // allocating or rebuilding bind groups.
+        let make_mesh_bg = |tv: &wgpu::TextureView, mesh_samp: &wgpu::Sampler| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &warp_mesh_bgl,
@@ -1789,15 +3231,16 @@ impl MilkdropRenderer {
                 ],
             })
         };
-        let warp_mesh_bg_a = make_mesh_bg(&view_a_sample);
-        let warp_mesh_bg_b = make_mesh_bg(&view_b_sample);
+        let warp_mesh_bg_a = make_mesh_bg(&view_a_sample, &linear_samp);
+        let warp_mesh_bg_b = make_mesh_bg(&view_b_sample, &linear_samp);
+        let warp_mesh_bg_a_clamp = make_mesh_bg(&view_a_sample, &clamp_samp);
+        let warp_mesh_bg_b_clamp = make_mesh_bg(&view_b_sample, &clamp_samp);
 
-        let num_verts = (GRID_W + 1) * (GRID_H + 1);
-        let warp_vert_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let static_warp_verts = build_static_warp_verts();
+        let warp_vert_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("warp-verts"),
-            size: (num_verts as usize * std::mem::size_of::<WarpVert>()) as u64,
+            contents: bytemuck::cast_slice(&static_warp_verts),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let warp_indices = build_warp_indices();
@@ -1810,7 +3253,7 @@ impl MilkdropRenderer {
 
         let warp_mesh_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("warp-mesh-pl"),
-            bind_group_layouts: &[Some(&warp_mesh_bgl)],
+            bind_group_layouts: &[Some(&warp_mesh_bgl), Some(&warp_params_bgl)],
             immediate_size: 0,
         });
         let warp_mesh_src = include_str!("shaders/warp_mesh.wgsl");
@@ -1870,8 +3313,8 @@ impl MilkdropRenderer {
         });
 
         // ── Custom-warp pipeline: warped mesh VS + the per-preset custom warp FS.
-        // Uses the milk_pl layout (sampler_bgl + perframe_bgl) so it can sample
-        // the full MilkDrop sampler set (sampler_main/fc_main/blur*) like comp.
+        // Uses sampler + perframe + default-warp parameter layouts so it can
+        // calculate equation-free UVs in the VS and sample the MilkDrop texture set.
         let warp_mesh_vs_src = include_str!("shaders/warp_mesh_vs.wgsl");
         let warp_mesh_vs_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("warp-mesh-vs"),
@@ -1883,7 +3326,7 @@ impl MilkdropRenderer {
         });
         let warp_custom_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("warp-custom-pipeline"),
-            layout: Some(&milk_pl),
+            layout: Some(&warp_custom_pl),
             vertex: wgpu::VertexState {
                 module: &warp_mesh_vs_mod,
                 entry_point: Some("vs_main"),
@@ -1913,6 +3356,10 @@ impl MilkdropRenderer {
         // ── Custom-shape pipelines/buffers ───────────────────────────────────
         let shape_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shape-bgl"),
+            // Only the prev-frame texture + sampler for textured shapes. The former
+            // ShapeU `textured` uniform (binding 2) was removed (P2-VIS-032): no
+            // shader read it — the textured flag is baked into a negative-UV vertex
+            // sentinel in shapes.wgsl instead.
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -1928,16 +3375,6 @@ impl MilkdropRenderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
                     count: None,
                 },
             ],
@@ -2113,12 +3550,6 @@ impl MilkdropRenderer {
             contents: bytemuck::cast_slice(&fan_idx),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let shape_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("shape-u"),
-            size: std::mem::size_of::<ShapeU>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         // border dyn-offset uniform: per-border color + up-to-4 thick offsets
         let border_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("border-u"),
@@ -2138,7 +3569,7 @@ impl MilkdropRenderer {
                 }),
             }],
         });
-        let make_shape_bg = |tv: &wgpu::TextureView| {
+        let make_shape_bg = |tv: &wgpu::TextureView, sampler: &wgpu::Sampler| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("shape-bg"),
                 layout: &shape_bgl,
@@ -2149,37 +3580,84 @@ impl MilkdropRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&linear_samp),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: shape_uniform_buf.as_entire_binding(),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             })
         };
-        let shape_bg_read_a = make_shape_bg(&view_a_sample);
-        let shape_bg_read_b = make_shape_bg(&view_b_sample);
+        let shape_bg_read_a = make_shape_bg(&view_a_sample, &linear_samp);
+        let shape_bg_read_b = make_shape_bg(&view_b_sample, &linear_samp);
+        let shape_bg_read_a_clamp = make_shape_bg(&view_a_sample, &clamp_samp);
+        let shape_bg_read_b_clamp = make_shape_bg(&view_b_sample, &clamp_samp);
+
+        // One deterministic stream owns the full preset lifecycle. Every EEL
+        // pool and both shader random vectors share it, while separate renderer
+        // instances remain isolated and reproducible.
+        let mut seed_src = String::new();
+        for source in [
+            shaders.warp.as_deref(),
+            shaders.comp.as_deref(),
+            shaders.per_frame_init.as_deref(),
+            shaders.per_frame.as_deref(),
+            shaders.per_pixel.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            seed_src.push_str(source);
+            seed_src.push('\n');
+        }
+        for shape in &shaders.shapes {
+            if let Some(source) = shape.per_frame_init.as_deref() {
+                seed_src.push_str(source);
+            }
+            if let Some(source) = shape.per_frame.as_deref() {
+                seed_src.push_str(source);
+            }
+        }
+        for wave in &shaders.waves {
+            for source in [
+                wave.per_frame_init.as_deref(),
+                wave.per_frame.as_deref(),
+                wave.per_point.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                seed_src.push_str(source);
+            }
+        }
+        let eel_rng = EelRng::shared(preset_hash64(&seed_src));
+        // Butterchurn consumes distinct persistent rand_start/rand_preset
+        // vectors before any init equation runs. Keep that lifecycle on the
+        // preset-owned stream so every later EEL/shader draw has the same order.
+        let rand_start = std::array::from_fn(|_| eel_rng.next_unit() as f32);
+        let rand_preset = std::array::from_fn(|_| eel_rng.next_unit() as f32);
 
         // Preset-wide gmegabuf, shared by every EEL pool (per-frame, per-pixel,
         // each shape, each wave). megabuf is per-pool (private to each EelState).
-        let gmegabuf: Rc<RefCell<MegaBuf>> = Rc::new(RefCell::new(MegaBuf::default()));
+        let gmegabuf: Arc<Mutex<MegaBuf>> = Arc::new(Mutex::new(MegaBuf::default()));
 
         // build ShapeRT list from parsed shapes
-        let shapes: Vec<ShapeRT> = shaders
+        let mut shapes: Vec<ShapeRT> = shaders
             .shapes
             .iter()
             .map(|sc| {
                 let mut env = Env::new();
-                let mut state = EelState::with_gmegabuf(gmegabuf.clone());
-                // Run shape per-frame-init ONCE into the shape env/megabuf at load.
-                if let Some(init) = sc.per_frame_init.as_deref() {
-                    EelProgram::parse(init).run_with(&mut env, &mut state);
-                }
+                let slots = ShapeEnvSlots::intern(&mut env);
+                let reg_slots = std::array::from_fn(|i| env.intern_slot(&format!("reg{i:02}")));
+                let q_slots = std::array::from_fn(|i| env.intern_slot(&format!("q{}", i + 1)));
+                let t_slots = std::array::from_fn(|i| env.intern_slot(&format!("t{}", i + 1)));
+                let state = EelState::with_shared(gmegabuf.clone(), eel_rng.clone());
                 ShapeRT {
                     base: sc.base.clone(),
                     prog: sc.per_frame.as_deref().map(EelProgram::parse),
                     env,
+                    reg_slots,
+                    q_slots,
+                    t_slots,
+                    slots,
+                    t_init: [0.0; 8],
                     state,
                 }
             })
@@ -2193,7 +3671,7 @@ impl MilkdropRenderer {
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
+                    has_dynamic_offset: false,
                     min_binding_size: std::num::NonZeroU64::new(16),
                 },
                 count: None,
@@ -2285,7 +3763,7 @@ impl MilkdropRenderer {
         });
         let wave_off_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wave-off"),
-            size: (WAVE_THICK_DOT_PASSES * 256) as u64,
+            size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2518,16 +3996,16 @@ impl MilkdropRenderer {
             mapped_at_creation: false,
         });
 
-        let waves: Vec<WaveRT> = shaders
+        let mut waves: Vec<WaveRT> = shaders
             .waves
             .iter()
             .map(|wd| {
                 let mut env = Env::new();
-                let mut state = EelState::with_gmegabuf(gmegabuf.clone());
-                // Run wave per-frame-init ONCE into the wave env/megabuf at load.
-                if let Some(init) = wd.per_frame_init.as_deref() {
-                    EelProgram::parse(init).run_with(&mut env, &mut state);
-                }
+                let slots = WaveEnvSlots::intern(&mut env);
+                let reg_slots = std::array::from_fn(|i| env.intern_slot(&format!("reg{i:02}")));
+                let q_slots = std::array::from_fn(|i| env.intern_slot(&format!("q{}", i + 1)));
+                let t_slots = std::array::from_fn(|i| env.intern_slot(&format!("t{}", i + 1)));
+                let state = EelState::with_shared(gmegabuf.clone(), eel_rng.clone());
                 WaveRT {
                     def: CustomWaveDef {
                         index: wd.index,
@@ -2551,7 +4029,13 @@ impl MilkdropRenderer {
                     per_frame_prog: wd.per_frame.as_deref().map(EelProgram::parse),
                     per_point_prog: wd.per_point.as_deref().map(EelProgram::parse),
                     env,
+                    reg_slots,
+                    q_slots,
+                    t_slots,
+                    slots,
+                    t_init: [0.0; 8],
                     state,
+                    scratch: WaveScratch::default(),
                 }
             })
             .collect();
@@ -2559,15 +4043,13 @@ impl MilkdropRenderer {
         // EEL2 per-frame equations
         let eel_program = shaders.per_frame.as_deref().map(EelProgram::parse);
         let mut eel_env = Env::new();
-        let mut eel_state = EelState::with_gmegabuf(gmegabuf.clone());
-        // Seed header echo/gamma defaults so header-only echo presets work and the
-        // values persist across frames if the per-frame program never assigns them.
-        // EEL/Butterchurn use the var name "echo_orient" (NOT "echo_orientation").
-        eel_env.insert("echo_zoom".into(), shaders.echo_zoom as f64);
-        eel_env.insert("echo_alpha".into(), shaders.echo_alpha as f64);
-        eel_env.insert("echo_orient".into(), shaders.echo_orient as f64);
-        eel_env.insert("gamma".into(), shaders.gamma_adj as f64);
-        eel_env.insert("gammaadj".into(), shaders.gamma_adj as f64);
+        let mut eel_state = EelState::with_shared(gmegabuf.clone(), eel_rng.clone());
+        let eel_reg_slots =
+            std::array::from_fn(|index| eel_env.intern_slot(&format!("reg{index:02}")));
+        let eel_q_slots =
+            std::array::from_fn(|index| eel_env.intern_slot(&format!("q{}", index + 1)));
+        seed_preset_base_env(&mut eel_env, shaders);
+        seed_equation_inputs(&mut eel_env, w, h);
 
         // Run per-frame INIT equations ONCE before frame 0, into the persistent
         // per-frame env/megabuf. per_frame then sees the initialized vars. We then
@@ -2576,16 +4058,71 @@ impl MilkdropRenderer {
         if let Some(init) = shaders.per_frame_init.as_deref() {
             EelProgram::parse(init).run_with(&mut eel_env, &mut eel_state);
         }
-        let q_init: Vec<(String, f64)> = (1..=32)
-            .filter_map(|i| {
-                let k = format!("q{i}");
-                eel_env.get(&k).copied().map(|v| (k, v))
-            })
-            .collect();
+        let q_init: [f64; 32] = std::array::from_fn(|index| eel_env.slot_value(eel_q_slots[index]));
+
+        // Butterchurn executes an initial main frame before custom-wave and
+        // custom-shape init programs. It then threads reg00..reg99 through each
+        // enabled wave (index order) followed by each enabled shape. This makes
+        // init-time q/reg/base reads deterministic and preserves authored state.
+        seed_preset_base_env(&mut eel_env, shaders);
+        seed_equation_inputs(&mut eel_env, w, h);
+        for (slot, value) in eel_q_slots.iter().zip(&q_init) {
+            eel_env.set_slot_value(*slot, *value);
+        }
+        if let Some(program) = &eel_program {
+            program.run_with(&mut eel_env, &mut eel_state);
+        }
+        let q_after_init_frame: [f64; 32] =
+            std::array::from_fn(|index| eel_env.slot_value(eel_q_slots[index]));
+        let mut init_regs: [f64; 100] =
+            std::array::from_fn(|index| eel_env.slot_value(eel_reg_slots[index]));
+
+        for (wave, parsed) in waves.iter_mut().zip(&shaders.waves) {
+            if !parsed.enabled {
+                continue;
+            }
+            seed_wave_base_env(&mut wave.env, parsed);
+            seed_equation_inputs(&mut wave.env, w, h);
+            for (slot, value) in wave.q_slots.iter().zip(&q_after_init_frame) {
+                wave.env.set_slot_value(*slot, *value);
+            }
+            for (slot, value) in wave.reg_slots.iter().zip(&init_regs) {
+                wave.env.set_slot_value(*slot, *value);
+            }
+            if let Some(source) = parsed.per_frame_init.as_deref() {
+                EelProgram::parse(source).run_with(&mut wave.env, &mut wave.state);
+                init_regs = std::array::from_fn(|index| wave.env.slot_value(wave.reg_slots[index]));
+            }
+            wave.t_init = std::array::from_fn(|index| wave.env.slot_value(wave.t_slots[index]));
+            seed_wave_base_env(&mut wave.env, parsed);
+        }
+        for (shape, parsed) in shapes.iter_mut().zip(&shaders.shapes) {
+            if parsed.base.enabled == 0 {
+                continue;
+            }
+            seed_shape_base_env(&mut shape.env, &parsed.base);
+            seed_equation_inputs(&mut shape.env, w, h);
+            for (slot, value) in shape.q_slots.iter().zip(&q_after_init_frame) {
+                shape.env.set_slot_value(*slot, *value);
+            }
+            for (slot, value) in shape.reg_slots.iter().zip(&init_regs) {
+                shape.env.set_slot_value(*slot, *value);
+            }
+            if let Some(source) = parsed.per_frame_init.as_deref() {
+                EelProgram::parse(source).run_with(&mut shape.env, &mut shape.state);
+                init_regs =
+                    std::array::from_fn(|index| shape.env.slot_value(shape.reg_slots[index]));
+            }
+            shape.t_init = std::array::from_fn(|index| shape.env.slot_value(shape.t_slots[index]));
+            seed_shape_base_env(&mut shape.env, &parsed.base);
+        }
+        for (slot, value) in eel_reg_slots.iter().zip(&init_regs) {
+            eel_env.set_slot_value(*slot, *value);
+        }
 
         // Per-vertex warp (per_pixel) program + per-frame warp base values.
         let per_pixel_prog = shaders.per_pixel.as_deref().map(EelProgram::parse);
-        let warp_state = EelState::with_gmegabuf(gmegabuf.clone());
+        let warp_state = EelState::with_shared(gmegabuf.clone(), eel_rng.clone());
         let base_warp = WarpBase {
             zoom: shaders.zoom,
             zoomexp: shaders.zoomexp,
@@ -2602,15 +4139,11 @@ impl MilkdropRenderer {
             decay: shaders.decay,
             wrap: shaders.wrap,
         };
-        let warp_env = Env::new();
-
-        // Per-preset hue seed (Butterchurn rand_start). Hash the shader/equation text so
-        // each preset gets a distinct, reproducible hue instead of the green-biased 0.5.
-        let mut seed_src = String::new();
-        seed_src.push_str(shaders.warp.as_deref().unwrap_or(""));
-        seed_src.push_str(shaders.comp.as_deref().unwrap_or(""));
-        seed_src.push_str(shaders.per_frame.as_deref().unwrap_or(""));
-        let rand_preset = preset_hue_seed(&seed_src);
+        let mut warp_env = Env::new();
+        let warp_slots = WarpEnvSlots::intern(&mut warp_env);
+        let warp_reg_slots =
+            std::array::from_fn(|index| warp_env.intern_slot(&format!("reg{index:02}")));
+        let warp_snapshot = EnvSnapshot::default();
 
         Ok(Self {
             device,
@@ -2618,6 +4151,7 @@ impl MilkdropRenderer {
             has_custom_warp,
             has_custom_comp,
             preset_decay: shaders.decay,
+            rand_start,
             rand_preset,
             tex_a,
             tex_b,
@@ -2635,12 +4169,26 @@ impl MilkdropRenderer {
             view_blur1,
             view_blur2,
             view_blur3,
+            view_blur1_sample,
+            view_blur2_sample,
+            view_blur3_sample,
+            blur_mips1,
+            blur_mips2,
+            blur_mips3,
             btemp1,
             btemp2,
             btemp3,
             view_btemp1,
             view_btemp2,
             view_btemp3,
+            view_btemp1_sample,
+            view_btemp2_sample,
+            view_btemp3_sample,
+            btemp_mips1,
+            btemp_mips2,
+            btemp_mips3,
+            named_texture_atlas,
+            view_named_texture_atlas,
             noise2d,
             noise_lq,
             noise_mq,
@@ -2660,10 +4208,10 @@ impl MilkdropRenderer {
             point_samp,
             point_clamp_samp,
             perframe_buf,
+            comp_perframe_buf,
             blur1_ubo,
             blur2_ubo,
             blur3_ubo,
-            warp_pipeline,
             warp_custom_pipeline,
             comp_pipeline,
             blur_h_pipeline,
@@ -2677,7 +4225,12 @@ impl MilkdropRenderer {
             warp_mesh_pipeline,
             warp_mesh_bg_a,
             warp_mesh_bg_b,
+            warp_mesh_bg_a_clamp,
+            warp_mesh_bg_b_clamp,
             warp_mesh_bgl,
+            warp_params_buf,
+            warp_params_bgl,
+            warp_params_bg,
             warp_vert_buf,
             warp_idx_buf,
             warp_idx_count,
@@ -2686,21 +4239,51 @@ impl MilkdropRenderer {
             blur_bgl,
             bg_read_a,
             bg_read_b,
+            bg_read_a_clamp,
+            bg_read_b_clamp,
             perframe_bg,
+            comp_perframe_bg,
+            blur1_h_bg_a,
+            blur1_h_bg_b,
             blur1_v_bg,
             blur2_h_bg,
             blur2_v_bg,
             blur3_h_bg,
             blur3_v_bg,
+            blur_levels,
+            last_blur_pass_count: 0,
             eel_program,
             eel_env,
             eel_state,
+            eel_rng,
             gmegabuf,
             q_init,
             per_pixel_prog,
             base_warp,
             warp_env,
+            warp_slots,
+            eel_reg_slots,
+            eel_q_slots,
+            warp_reg_slots,
+            warp_snapshot,
             warp_state,
+            scratch: RendererScratch {
+                warp_verts: Vec::with_capacity(((GRID_W + 1) * (GRID_H + 1)) as usize),
+                motion_verts: Vec::with_capacity(MV_VERT_CAP),
+                darken_verts: Vec::with_capacity(12),
+                shape_fill_verts: Vec::new(),
+                shape_fill_draws: Vec::new(),
+                shape_border_verts: Vec::new(),
+                shape_border_draws: Vec::new(),
+                wave_verts: Vec::new(),
+                wave_draws: Vec::new(),
+                frame_border_verts: Vec::with_capacity(48),
+                frame_border_draws: Vec::with_capacity(2),
+                border_uniform_bytes: Vec::new(),
+                frame_border_uniform_bytes: Vec::with_capacity(512),
+            },
+            geometry_diagnostics: GeometryDiagnosticCollector::default(),
+            geometry_stage_readback: None,
             frame_idx: 0,
             start: std::time::Instant::now(),
             time_per_frame: None,
@@ -2719,12 +4302,13 @@ impl MilkdropRenderer {
             border_bgl,
             shape_vert_buf,
             shape_idx_buf,
-            shape_uniform_buf,
             border_vert_buf,
             border_uniform_buf,
             border_bg,
             shape_bg_read_a,
             shape_bg_read_b,
+            shape_bg_read_a_clamp,
+            shape_bg_read_b_clamp,
 
             waves,
             wave_pipeline_lines_alpha,
@@ -2735,6 +4319,7 @@ impl MilkdropRenderer {
             wave_vert_buf,
             wave_off_buf,
             wave_bg,
+            custom_wave_adaptive_lod: true,
 
             bw_mode: shaders.wave_mode,
             bw_x: shaders.wave_x,
@@ -2755,6 +4340,10 @@ impl MilkdropRenderer {
             bw_modalphaend: shaders.modwavealphaend,
 
             comp_gamma_adj: shaders.gamma_adj,
+            comp_fshader: shaders.fshader,
+            echo_zoom: shaders.echo_zoom,
+            echo_alpha: shaders.echo_alpha,
+            echo_orient: shaders.echo_orient,
             comp_brighten: shaders.brighten,
             comp_darken: shaders.darken,
             comp_solarize: shaders.solarize,
@@ -2806,20 +4395,46 @@ impl MilkdropRenderer {
 
             wave_l: Vec::new(),
             wave_r: Vec::new(),
+            noise_regen_count: 0,
         })
+    }
+
+    /// Number of feedback-seed noise generations. This remains zero because
+    /// OjoDrop now follows Butterchurn's black feedback initialization.
+    pub fn noise_regen_count(&self) -> u32 {
+        self.noise_regen_count
+    }
+
+    /// Current backing-target dimensions. Hosts use this to decide whether an
+    /// explicitly retried resize still needs to run after a previous allocation
+    /// failure; it intentionally reports the last successfully committed size.
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// Resize the GPU targets without rebuilding the preset runtime.
     ///
     /// Shader programs, EEL environments, audio state, and frame counters stay
-    /// intact. The feedback ping-pong textures are recreated at the new size,
-    /// seeded with subtle noise, then the overlapping region of the previous
-    /// feedback is copied into them before mip generation.
+    /// intact. The feedback ping-pong textures are recreated black, then the
+    /// overlapping region of the previous feedback is copied into them before
+    /// mip generation.
     pub fn resize(&mut self, width: u32, height: u32) {
+        // Decline (keep the current size) rather than panic/allocate when the new
+        // size is over-limit or overflows the size math (P2-VIS-019).
+        if let Err(e) = self.try_resize(width, height) {
+            log::warn!("milkdrop resize to {width}x{height} rejected: {e}");
+        }
+    }
+
+    /// Fallible resize: validates the requested dimensions with checked arithmetic
+    /// against the device `max_texture_dimension_2d` + a memory budget BEFORE
+    /// recreating any texture, returning a [`DimensionError`] on rejection.
+    pub fn try_resize(&mut self, width: u32, height: u32) -> Result<(), DimensionError> {
         let (w, h) = (width.max(1), height.max(1));
         if self.width == w && self.height == h {
-            return;
+            return Ok(());
         }
+        validate_texture_dims(self.device.limits().max_texture_dimension_2d, w, h)?;
 
         let device = self.device.clone();
         let queue = self.queue.clone();
@@ -2829,26 +4444,10 @@ impl MilkdropRenderer {
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::COPY_SRC;
         let feedback_mip_levels = mip_level_count_2d(w, h);
-        let seed_a = noise_bytes_scaled((w * h) as usize, 32);
-        let seed_b = noise_bytes_scaled((w * h) as usize, 32);
-        let tex_a = make_tex2d_with_mips(
-            &device,
-            &queue,
-            w,
-            h,
-            fb_usage,
-            feedback_mip_levels,
-            Some(&seed_a),
-        );
-        let tex_b = make_tex2d_with_mips(
-            &device,
-            &queue,
-            w,
-            h,
-            fb_usage,
-            feedback_mip_levels,
-            Some(&seed_b),
-        );
+        let tex_a =
+            make_tex2d_with_mips(&device, &queue, w, h, fb_usage, feedback_mip_levels, None);
+        let tex_b =
+            make_tex2d_with_mips(&device, &queue, w, h, fb_usage, feedback_mip_levels, None);
         let view_a = mip_level_view(&tex_a, 0);
         let view_b = mip_level_view(&tex_b, 0);
         let view_a_sample = tex_a.create_view(&Default::default());
@@ -2856,25 +4455,46 @@ impl MilkdropRenderer {
         let feedback_mips_a = mip_chain_views(&tex_a, feedback_mip_levels);
         let feedback_mips_b = mip_chain_views(&tex_b, feedback_mip_levels);
 
-        let blur_usage =
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let (bw1, bh1) = ((w / 2).max(1), (h / 2).max(1));
-        let (bw2, bh2) = ((w / 4).max(1), (h / 4).max(1));
-        let (bw3, bh3) = ((w / 8).max(1), (h / 8).max(1));
+        let blur_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let [(bw1, bh1), (bw2, bh2), (bw3, bh3), (btw1, bth1), (btw2, bth2), (btw3, bth3)] =
+            blur_dimensions(w, h);
+        let blur_levels1 = mip_level_count_2d(bw1, bh1);
+        let blur_levels2 = mip_level_count_2d(bw2, bh2);
+        let blur_levels3 = mip_level_count_2d(bw3, bh3);
 
-        let blur1 = make_tex2d(&device, &queue, bw1, bh1, blur_usage, None);
-        let blur2 = make_tex2d(&device, &queue, bw2, bh2, blur_usage, None);
-        let blur3 = make_tex2d(&device, &queue, bw3, bh3, blur_usage, None);
-        let view_blur1 = blur1.create_view(&Default::default());
-        let view_blur2 = blur2.create_view(&Default::default());
-        let view_blur3 = blur3.create_view(&Default::default());
+        let blur1 = make_tex2d_with_mips(&device, &queue, bw1, bh1, blur_usage, blur_levels1, None);
+        let blur2 = make_tex2d_with_mips(&device, &queue, bw2, bh2, blur_usage, blur_levels2, None);
+        let blur3 = make_tex2d_with_mips(&device, &queue, bw3, bh3, blur_usage, blur_levels3, None);
+        let view_blur1 = mip_level_view(&blur1, 0);
+        let view_blur2 = mip_level_view(&blur2, 0);
+        let view_blur3 = mip_level_view(&blur3, 0);
+        let view_blur1_sample = blur1.create_view(&Default::default());
+        let view_blur2_sample = blur2.create_view(&Default::default());
+        let view_blur3_sample = blur3.create_view(&Default::default());
+        let blur_mips1 = mip_chain_views(&blur1, blur_levels1);
+        let blur_mips2 = mip_chain_views(&blur2, blur_levels2);
+        let blur_mips3 = mip_chain_views(&blur3, blur_levels3);
 
-        let btemp1 = make_tex2d(&device, &queue, bw1, bh1, blur_usage, None);
-        let btemp2 = make_tex2d(&device, &queue, bw2, bh2, blur_usage, None);
-        let btemp3 = make_tex2d(&device, &queue, bw3, bh3, blur_usage, None);
-        let view_btemp1 = btemp1.create_view(&Default::default());
-        let view_btemp2 = btemp2.create_view(&Default::default());
-        let view_btemp3 = btemp3.create_view(&Default::default());
+        let btemp_levels1 = mip_level_count_2d(btw1, bth1).min(2);
+        let btemp_levels2 = 1;
+        let btemp_levels3 = 1;
+        let btemp1 =
+            make_tex2d_with_mips(&device, &queue, btw1, bth1, blur_usage, btemp_levels1, None);
+        let btemp2 =
+            make_tex2d_with_mips(&device, &queue, btw2, bth2, blur_usage, btemp_levels2, None);
+        let btemp3 =
+            make_tex2d_with_mips(&device, &queue, btw3, bth3, blur_usage, btemp_levels3, None);
+        let view_btemp1 = mip_level_view(&btemp1, 0);
+        let view_btemp2 = mip_level_view(&btemp2, 0);
+        let view_btemp3 = mip_level_view(&btemp3, 0);
+        let view_btemp1_sample = btemp1.create_view(&Default::default());
+        let view_btemp2_sample = btemp2.create_view(&Default::default());
+        let view_btemp3_sample = btemp3.create_view(&Default::default());
+        let btemp_mips1 = mip_chain_views(&btemp1, btemp_levels1);
+        let btemp_mips2 = mip_chain_views(&btemp2, btemp_levels2);
+        let btemp_mips3 = mip_chain_views(&btemp3, btemp_levels3);
 
         let comp_tex = make_tex2d(&device, &queue, w, h, blur_usage, None);
         let comp_view = comp_tex.create_view(&Default::default());
@@ -2913,17 +4533,17 @@ impl MilkdropRenderer {
         queue.write_buffer(
             &self.blur1_ubo,
             0,
-            bytemuck::cast_slice(&blur_texel(w, bh1)),
+            bytemuck::cast_slice(&blur_texel(w, bth1)),
         );
         queue.write_buffer(
             &self.blur2_ubo,
             0,
-            bytemuck::cast_slice(&blur_texel(bw1, bh2)),
+            bytemuck::cast_slice(&blur_texel(bw1, bth2)),
         );
         queue.write_buffer(
             &self.blur3_ubo,
             0,
-            bytemuck::cast_slice(&blur_texel(bw2, bh3)),
+            bytemuck::cast_slice(&blur_texel(bw2, bth3)),
         );
         queue.write_buffer(
             &self.fxaa_ubo,
@@ -2935,16 +4555,18 @@ impl MilkdropRenderer {
             &device,
             &self.sampler_bgl,
             &view_a_sample,
-            &view_blur1,
-            &view_blur2,
-            &view_blur3,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
             &self.view_noise2d,
             &self.view_noise_lq,
             &self.view_noise_mq,
             &self.view_noise_hq,
             &self.view_noise_lite,
+            &self.view_named_texture_atlas,
             &self.view_noisevol_lq,
             &self.view_noisevol_hq,
+            &self.linear_samp,
             &self.linear_samp,
             &self.clamp_samp,
             &self.point_samp,
@@ -2954,16 +4576,60 @@ impl MilkdropRenderer {
             &device,
             &self.sampler_bgl,
             &view_b_sample,
-            &view_blur1,
-            &view_blur2,
-            &view_blur3,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
             &self.view_noise2d,
             &self.view_noise_lq,
             &self.view_noise_mq,
             &self.view_noise_hq,
             &self.view_noise_lite,
+            &self.view_named_texture_atlas,
             &self.view_noisevol_lq,
             &self.view_noisevol_hq,
+            &self.linear_samp,
+            &self.linear_samp,
+            &self.clamp_samp,
+            &self.point_samp,
+            &self.point_clamp_samp,
+        );
+        let bg_read_a_clamp = build_sampler_bg(
+            &device,
+            &self.sampler_bgl,
+            &view_a_sample,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
+            &self.view_noise2d,
+            &self.view_noise_lq,
+            &self.view_noise_mq,
+            &self.view_noise_hq,
+            &self.view_noise_lite,
+            &self.view_named_texture_atlas,
+            &self.view_noisevol_lq,
+            &self.view_noisevol_hq,
+            &self.clamp_samp,
+            &self.linear_samp,
+            &self.clamp_samp,
+            &self.point_samp,
+            &self.point_clamp_samp,
+        );
+        let bg_read_b_clamp = build_sampler_bg(
+            &device,
+            &self.sampler_bgl,
+            &view_b_sample,
+            &view_blur1_sample,
+            &view_blur2_sample,
+            &view_blur3_sample,
+            &self.view_noise2d,
+            &self.view_noise_lq,
+            &self.view_noise_mq,
+            &self.view_noise_hq,
+            &self.view_noise_lite,
+            &self.view_named_texture_atlas,
+            &self.view_noisevol_lq,
+            &self.view_noisevol_hq,
+            &self.clamp_samp,
             &self.linear_samp,
             &self.clamp_samp,
             &self.point_samp,
@@ -2990,11 +4656,13 @@ impl MilkdropRenderer {
                 ],
             })
         };
-        let blur1_v_bg = make_blur_bg(&view_btemp1, &self.blur1_ubo);
-        let blur2_h_bg = make_blur_bg(&view_blur1, &self.blur2_ubo);
-        let blur2_v_bg = make_blur_bg(&view_btemp2, &self.blur2_ubo);
-        let blur3_h_bg = make_blur_bg(&view_blur2, &self.blur3_ubo);
-        let blur3_v_bg = make_blur_bg(&view_btemp3, &self.blur3_ubo);
+        let blur1_h_bg_a = make_blur_bg(&view_a, &self.blur1_ubo);
+        let blur1_h_bg_b = make_blur_bg(&view_b, &self.blur1_ubo);
+        let blur1_v_bg = make_blur_bg(&view_btemp1_sample, &self.blur1_ubo);
+        let blur2_h_bg = make_blur_bg(&view_blur1_sample, &self.blur2_ubo);
+        let blur2_v_bg = make_blur_bg(&view_btemp2_sample, &self.blur2_ubo);
+        let blur3_h_bg = make_blur_bg(&view_blur2_sample, &self.blur3_ubo);
+        let blur3_v_bg = make_blur_bg(&view_btemp3_sample, &self.blur3_ubo);
 
         let fxaa_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fxaa-bg"),
@@ -3015,12 +4683,7 @@ impl MilkdropRenderer {
             ],
         });
 
-        let mesh_samp = if self.base_warp.wrap {
-            &self.linear_samp
-        } else {
-            &self.clamp_samp
-        };
-        let make_mesh_bg = |tv: &wgpu::TextureView| {
+        let make_mesh_bg = |tv: &wgpu::TextureView, sampler: &wgpu::Sampler| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.warp_mesh_bgl,
@@ -3031,15 +4694,17 @@ impl MilkdropRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(mesh_samp),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             })
         };
-        let warp_mesh_bg_a = make_mesh_bg(&view_a_sample);
-        let warp_mesh_bg_b = make_mesh_bg(&view_b_sample);
+        let warp_mesh_bg_a = make_mesh_bg(&view_a_sample, &self.linear_samp);
+        let warp_mesh_bg_b = make_mesh_bg(&view_b_sample, &self.linear_samp);
+        let warp_mesh_bg_a_clamp = make_mesh_bg(&view_a_sample, &self.clamp_samp);
+        let warp_mesh_bg_b_clamp = make_mesh_bg(&view_b_sample, &self.clamp_samp);
 
-        let make_shape_bg = |tv: &wgpu::TextureView| {
+        let make_shape_bg = |tv: &wgpu::TextureView, sampler: &wgpu::Sampler| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("shape-bg"),
                 layout: &self.shape_bgl,
@@ -3050,17 +4715,15 @@ impl MilkdropRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.linear_samp),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.shape_uniform_buf.as_entire_binding(),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             })
         };
-        let shape_bg_read_a = make_shape_bg(&view_a_sample);
-        let shape_bg_read_b = make_shape_bg(&view_b_sample);
+        let shape_bg_read_a = make_shape_bg(&view_a_sample, &self.linear_samp);
+        let shape_bg_read_b = make_shape_bg(&view_b_sample, &self.linear_samp);
+        let shape_bg_read_a_clamp = make_shape_bg(&view_a_sample, &self.clamp_samp);
+        let shape_bg_read_b_clamp = make_shape_bg(&view_b_sample, &self.clamp_samp);
 
         self.tex_a = tex_a;
         self.tex_b = tex_b;
@@ -3076,19 +4739,37 @@ impl MilkdropRenderer {
         self.view_blur1 = view_blur1;
         self.view_blur2 = view_blur2;
         self.view_blur3 = view_blur3;
+        self.view_blur1_sample = view_blur1_sample;
+        self.view_blur2_sample = view_blur2_sample;
+        self.view_blur3_sample = view_blur3_sample;
+        self.blur_mips1 = blur_mips1;
+        self.blur_mips2 = blur_mips2;
+        self.blur_mips3 = blur_mips3;
         self.btemp1 = btemp1;
         self.btemp2 = btemp2;
         self.btemp3 = btemp3;
         self.view_btemp1 = view_btemp1;
         self.view_btemp2 = view_btemp2;
         self.view_btemp3 = view_btemp3;
+        self.view_btemp1_sample = view_btemp1_sample;
+        self.view_btemp2_sample = view_btemp2_sample;
+        self.view_btemp3_sample = view_btemp3_sample;
+        self.btemp_mips1 = btemp_mips1;
+        self.btemp_mips2 = btemp_mips2;
+        self.btemp_mips3 = btemp_mips3;
         self.comp_tex = comp_tex;
         self.comp_view = comp_view;
         self.fxaa_bg = fxaa_bg;
         self.warp_mesh_bg_a = warp_mesh_bg_a;
         self.warp_mesh_bg_b = warp_mesh_bg_b;
+        self.warp_mesh_bg_a_clamp = warp_mesh_bg_a_clamp;
+        self.warp_mesh_bg_b_clamp = warp_mesh_bg_b_clamp;
         self.bg_read_a = bg_read_a;
         self.bg_read_b = bg_read_b;
+        self.bg_read_a_clamp = bg_read_a_clamp;
+        self.bg_read_b_clamp = bg_read_b_clamp;
+        self.blur1_h_bg_a = blur1_h_bg_a;
+        self.blur1_h_bg_b = blur1_h_bg_b;
         self.blur1_v_bg = blur1_v_bg;
         self.blur2_h_bg = blur2_h_bg;
         self.blur2_v_bg = blur2_v_bg;
@@ -3096,14 +4777,75 @@ impl MilkdropRenderer {
         self.blur3_v_bg = blur3_v_bg;
         self.shape_bg_read_a = shape_bg_read_a;
         self.shape_bg_read_b = shape_bg_read_b;
+        self.shape_bg_read_a_clamp = shape_bg_read_a_clamp;
+        self.shape_bg_read_b_clamp = shape_bg_read_b_clamp;
         self.width = w;
         self.height = h;
+        if self.geometry_diagnostics.enabled() {
+            self.geometry_stage_readback = Some(GeometryStageReadback::new(&self.device, w, h));
+        }
+        Ok(())
+    }
+
+    /// Highest blur level (0..=3) the active preset's shaders sample. Blur levels
+    /// above this are skipped every frame (P2-VIS-017).
+    pub fn blur_levels(&self) -> u8 {
+        self.blur_levels
+    }
+
+    /// Number of blur render passes issued on the most recent [`Self::render`]
+    /// call (0, 2, 4, or 6 — two per generated level).
+    pub fn last_blur_pass_count(&self) -> u32 {
+        self.last_blur_pass_count
     }
 
     /// Switch to deterministic fixed-timestep timing (for offscreen animation
     /// export). Each rendered frame advances `time` by `1/fps` seconds.
     pub fn set_fixed_fps(&mut self, fps: f32) {
-        self.time_per_frame = Some(1.0 / f64::from(fps.max(1.0)));
+        let fps = if fps.is_finite() { fps.max(1.0) } else { 60.0 };
+        self.time_per_frame = Some(1.0 / f64::from(fps));
+    }
+
+    /// Enable or disable the guarded custom-wave sample LOD. When enabled, only
+    /// expensive, side-effect-free per-point programs are reduced to 256 points;
+    /// dots and programs using loops, random, megabuf, or gmegabuf stay exact.
+    pub fn set_custom_wave_adaptive_lod(&mut self, enabled: bool) {
+        self.custom_wave_adaptive_lod = enabled;
+    }
+
+    /// Opt in to compact CPU-side summaries of custom shape/wave geometry.
+    /// Disabling collection also drops the latest retained snapshot.
+    pub fn set_geometry_diagnostics_enabled(&mut self, enabled: bool) {
+        self.geometry_diagnostics.set_enabled(enabled);
+        if enabled {
+            if !self
+                .geometry_stage_readback
+                .as_ref()
+                .is_some_and(|readback| readback.matches(self.width, self.height))
+            {
+                self.geometry_stage_readback = Some(GeometryStageReadback::new(
+                    &self.device,
+                    self.width,
+                    self.height,
+                ));
+            }
+        } else {
+            self.geometry_stage_readback = None;
+        }
+    }
+
+    /// Return the most recently collected custom-geometry snapshot, or `None`
+    /// when collection is disabled or no enabled frame has rendered yet.
+    pub fn geometry_diagnostics(&self) -> Option<MilkdropGeometryDiagnostics> {
+        let mut diagnostics = self.geometry_diagnostics.latest()?;
+        if let Some(readback) = self.geometry_stage_readback.as_ref() {
+            let [post_warp_rgb, post_overlays_rgb, post_comp_rgb] =
+                readback.read_summaries(&self.device);
+            diagnostics.post_warp_rgb = post_warp_rgb;
+            diagnostics.post_overlays_rgb = post_overlays_rgb;
+            diagnostics.post_comp_rgb = post_comp_rgb;
+        }
+        Some(diagnostics)
     }
 
     /// Feed live audio reactivity for the next frame. Values are MilkDrop-style
@@ -3125,43 +4867,55 @@ impl MilkdropRenderer {
     /// the next frame. Used by `bSpectrum` custom waveforms. Pass an empty slice
     /// (or never call) to keep the time-domain fallback.
     pub fn set_freq_spectrum(&mut self, spectrum: &[f32]) {
-        self.freq_spectrum.clear();
-        self.freq_spectrum.extend_from_slice(spectrum);
+        // Keep the long-input behavior identical to the original setter: cap the
+        // accepted row before storing it rather than resampling an unbounded tail.
+        let n = spectrum.len().min(MAX_AUDIO_SAMPLES);
+        self.set_freq_spectrum_resampled(&spectrum[..n], n);
+    }
+
+    /// Feed a spectrum row and resample it directly into renderer-owned storage.
+    /// This lets legacy short spectrum rows reach MilkDrop's 512-bin input without
+    /// an allocation in the host bridge on every frame.
+    pub fn set_freq_spectrum_resampled(&mut self, spectrum: &[f32], sample_count: usize) {
+        replace_audio_samples(
+            &mut self.freq_spectrum,
+            spectrum,
+            sample_count.min(MAX_AUDIO_SAMPLES),
+            false,
+        );
     }
 
     /// Feed per-sample PCM waveform for the next frame (range ~[-1,1]). Used by
     /// the built-in and custom waveforms. Length equals the audio buffer length.
     pub fn set_waveform(&mut self, left: &[f32], right: &[f32]) {
-        let n = left.len().min(right.len());
-        self.wave_l.clear();
-        self.wave_r.clear();
-        self.wave_l.extend(
-            left.iter()
-                .take(n)
-                .map(|v| finite_clamp(*v, -1.0, 1.0, 0.0)),
-        );
-        self.wave_r.extend(
-            right
-                .iter()
-                .take(n)
-                .map(|v| finite_clamp(*v, -1.0, 1.0, 0.0)),
-        );
+        // Preserve the original shared-length contract for direct callers. The
+        // explicitly resampled setter below is used when legacy left/right rows
+        // have different source lengths.
+        let n = left.len().min(right.len()).min(MAX_AUDIO_SAMPLES);
+        self.set_waveform_resampled(&left[..n], &right[..n], n);
     }
 
-    /// Get the per-sample waveform for this frame, synthesizing a deterministic
-    /// animated waveform when no real audio is available (headless/anim).
-    fn frame_waveform(&self, t: f32) -> (Vec<f32>, Vec<f32>) {
-        let n = self.wave_l.len().min(self.wave_r.len());
-        if n > 0 {
-            return (self.wave_l[..n].to_vec(), self.wave_r[..n].to_vec());
-        }
+    /// Feed a waveform and resample it directly into renderer-owned storage. Like
+    /// [`Self::set_freq_spectrum_resampled`], this keeps legacy short rows from
+    /// creating transient audio vectors on the live render path.
+    pub fn set_waveform_resampled(&mut self, left: &[f32], right: &[f32], sample_count: usize) {
+        let target_len = sample_count.min(MAX_AUDIO_SAMPLES);
+        replace_audio_samples(&mut self.wave_l, left, target_len, true);
+        replace_audio_samples(&mut self.wave_r, right, target_len, true);
+    }
+
+    /// Fill reusable waveform scratch with the deterministic animated fallback
+    /// used when no live PCM row has been supplied.
+    fn synthesize_waveform(t: f32, left: &mut Vec<f32>, right: &mut Vec<f32>) {
         // Synthesize 512 samples in [-1,1] that animate with time so the wave moves.
         // 512 (matching real butterchurn-parity feeds) is required so built-in modes
         // 1/2/3/5 (which index wave[i+32]) and 4/6/7 (capped at ~width/3) have enough
         // samples and don't degenerate or index out of bounds.
         let n = 512usize;
-        let mut l = Vec::with_capacity(n);
-        let mut r = Vec::with_capacity(n);
+        left.clear();
+        right.clear();
+        left.reserve(n.saturating_sub(left.capacity()));
+        right.reserve(n.saturating_sub(right.capacity()));
         for i in 0..n {
             let fi = i as f32;
             let a = 0.5 * (t * 6.0 + fi * 0.49).sin()
@@ -3170,10 +4924,9 @@ impl MilkdropRenderer {
             let b = 0.5 * (t * 5.3 + fi * 0.55 + 1.7).sin()
                 + 0.3 * (t * 2.7 + fi * 0.19 + 0.4).sin()
                 + 0.18 * (t * 9.1 + fi * 0.77 + 2.1).sin();
-            l.push(a.clamp(-1.0, 1.0));
-            r.push(b.clamp(-1.0, 1.0));
+            left.push(a.clamp(-1.0, 1.0));
+            right.push(b.clamp(-1.0, 1.0));
         }
-        (l, r)
     }
 
     /// Build CPU-side fill + border geometry for all enabled shapes this frame.
@@ -3193,6 +4946,7 @@ impl MilkdropRenderer {
         aspectx: f32,
         aspecty: f32,
         q: &[f64; 32],
+        regs: &[f64; 100],
     ) -> (
         Vec<ShapeVert>,
         Vec<ShapeFillDraw>,
@@ -3200,18 +4954,31 @@ impl MilkdropRenderer {
         Vec<BorderDraw>,
     ) {
         use std::f32::consts::PI;
-        let mut fill_verts: Vec<ShapeVert> = Vec::new();
-        let mut fill_draws: Vec<ShapeFillDraw> = Vec::new();
-        let mut border_verts: Vec<BorderVert> = Vec::new();
-        let mut border_draws: Vec<BorderDraw> = Vec::new();
+        let mut fill_verts = std::mem::take(&mut self.scratch.shape_fill_verts);
+        let mut fill_draws = std::mem::take(&mut self.scratch.shape_fill_draws);
+        let mut border_verts = std::mem::take(&mut self.scratch.shape_border_verts);
+        let mut border_draws = std::mem::take(&mut self.scratch.shape_border_draws);
+        fill_verts.clear();
+        fill_draws.clear();
+        border_verts.clear();
+        border_draws.clear();
+        let fps = effective_fps(self.time_per_frame);
 
         for s in self.shapes.iter_mut() {
             if s.base.enabled == 0 {
                 continue;
             }
-            let num_inst = (s.base.num_inst.max(1)).min(1024);
+            let num_inst = (s.base.num_inst.max(1)).min(MAX_SHAPE_INSTANCES as i32);
 
             for j in 0..num_inst {
+                // Bound CPU geometry (and the fixed-size vertex buffer it fills) to
+                // its capacity BEFORE doing any per-instance EEL/geometry work. An
+                // absurd `num_inst`/`sides` therefore can't generate more shape verts
+                // than the permanent buffer can hold (P2-VIS-018). SHAPE_FILL_VERTS_MAX
+                // is the worst-case per-instance cost (SIDES_MAX + 2).
+                if fill_verts.len() + SHAPE_FILL_VERTS_MAX > SHAPE_VERT_CAP {
+                    break;
+                }
                 // Resolve per-instance vals: run per-frame eqs if present, else base.
                 let (
                     sides_f,
@@ -3241,70 +5008,80 @@ impl MilkdropRenderer {
                 if let Some(prog) = &s.prog {
                     // Reset shape vars from base each instance (butterchurn semantics).
                     let env = &mut s.env;
-                    env.insert("time".into(), t as f64);
-                    env.insert("frame".into(), self.frame_idx as f64);
-                    env.insert("fps".into(), 60.0);
-                    env.insert("bass".into(), bass);
-                    env.insert("bass_att".into(), bass_att);
-                    env.insert("mid".into(), mid);
-                    env.insert("mid_att".into(), mid_att);
-                    env.insert("treb".into(), treb);
-                    env.insert("treb_att".into(), treb_att);
-                    env.insert("vol".into(), vol);
-                    env.insert("aspectx".into(), aspectx as f64);
-                    env.insert("aspecty".into(), aspecty as f64);
-                    for (i, qv) in q.iter().enumerate() {
-                        env.insert(format!("q{}", i + 1), *qv);
+                    let slots = s.slots;
+                    for (slot, value) in s.reg_slots.iter().zip(regs) {
+                        env.set_slot_value(*slot, *value);
                     }
-                    env.insert("instance".into(), j as f64);
-                    env.insert("num_inst".into(), num_inst as f64);
+                    for (slot, value) in s.t_slots.iter().zip(&s.t_init) {
+                        env.set_slot_value(*slot, *value);
+                    }
+                    slots.frame.seed(
+                        env,
+                        t,
+                        self.frame_idx,
+                        fps,
+                        bass,
+                        mid,
+                        treb,
+                        vol,
+                        bass_att,
+                        mid_att,
+                        treb_att,
+                        aspectx as f64,
+                        aspecty as f64,
+                    );
+                    for (slot, value) in s.q_slots.iter().zip(q) {
+                        env.set_slot_value(*slot, *value);
+                    }
+                    env.set_slot_value(slots.instance, j as f64);
+                    env.set_slot_value(slots.num_inst, num_inst as f64);
                     let bv = &s.base;
-                    env.insert("sides".into(), bv.sides as f64);
-                    env.insert("rad".into(), bv.rad as f64);
-                    env.insert("ang".into(), bv.ang as f64);
-                    env.insert("x".into(), bv.x as f64);
-                    env.insert("y".into(), bv.y as f64);
-                    env.insert("r".into(), bv.r as f64);
-                    env.insert("g".into(), bv.g as f64);
-                    env.insert("b".into(), bv.b as f64);
-                    env.insert("a".into(), bv.a as f64);
-                    env.insert("r2".into(), bv.r2 as f64);
-                    env.insert("g2".into(), bv.g2 as f64);
-                    env.insert("b2".into(), bv.b2 as f64);
-                    env.insert("a2".into(), bv.a2 as f64);
-                    env.insert("border_r".into(), bv.border_r as f64);
-                    env.insert("border_g".into(), bv.border_g as f64);
-                    env.insert("border_b".into(), bv.border_b as f64);
-                    env.insert("border_a".into(), bv.border_a as f64);
-                    env.insert("thickoutline".into(), bv.thick_outline as f64);
-                    env.insert("textured".into(), bv.textured as f64);
-                    env.insert("tex_ang".into(), bv.tex_ang as f64);
-                    env.insert("tex_zoom".into(), bv.tex_zoom as f64);
-                    env.insert("additive".into(), bv.additive as f64);
+                    env.set_slot_value(slots.sides, bv.sides as f64);
+                    env.set_slot_value(slots.rad, bv.rad as f64);
+                    env.set_slot_value(slots.ang, bv.ang as f64);
+                    env.set_slot_value(slots.x, bv.x as f64);
+                    env.set_slot_value(slots.y, bv.y as f64);
+                    env.set_slot_value(slots.r, bv.r as f64);
+                    env.set_slot_value(slots.g, bv.g as f64);
+                    env.set_slot_value(slots.b, bv.b as f64);
+                    env.set_slot_value(slots.a, bv.a as f64);
+                    env.set_slot_value(slots.r2, bv.r2 as f64);
+                    env.set_slot_value(slots.g2, bv.g2 as f64);
+                    env.set_slot_value(slots.b2, bv.b2 as f64);
+                    env.set_slot_value(slots.a2, bv.a2 as f64);
+                    env.set_slot_value(slots.border_r, bv.border_r as f64);
+                    env.set_slot_value(slots.border_g, bv.border_g as f64);
+                    env.set_slot_value(slots.border_b, bv.border_b as f64);
+                    env.set_slot_value(slots.border_a, bv.border_a as f64);
+                    env.set_slot_value(slots.thickoutline, bv.thick_outline as f64);
+                    env.set_slot_value(slots.textured, bv.textured as f64);
+                    env.set_slot_value(slots.tex_ang, bv.tex_ang as f64);
+                    env.set_slot_value(slots.tex_zoom, bv.tex_zoom as f64);
+                    env.set_slot_value(slots.additive, bv.additive as f64);
                     prog.run_with(env, &mut s.state);
-                    let rd = |k: &str, d: f64| env.get(k).copied().unwrap_or(d) as f32;
-                    sides_f = rd("sides", bv.sides as f64);
-                    rad = rd("rad", bv.rad as f64);
-                    ang = rd("ang", bv.ang as f64);
-                    x = rd("x", bv.x as f64);
-                    y = rd("y", bv.y as f64);
-                    r = rd("r", bv.r as f64);
-                    g = rd("g", bv.g as f64);
-                    b = rd("b", bv.b as f64);
-                    a = rd("a", bv.a as f64);
-                    r2 = rd("r2", bv.r2 as f64);
-                    g2 = rd("g2", bv.g2 as f64);
-                    b2 = rd("b2", bv.b2 as f64);
-                    a2 = rd("a2", bv.a2 as f64);
-                    border_r = rd("border_r", bv.border_r as f64);
-                    border_g = rd("border_g", bv.border_g as f64);
-                    border_b = rd("border_b", bv.border_b as f64);
-                    border_a = rd("border_a", bv.border_a as f64);
-                    thick = rd("thickoutline", bv.thick_outline as f64);
-                    textured = rd("textured", bv.textured as f64);
-                    tex_ang = rd("tex_ang", bv.tex_ang as f64);
-                    tex_zoom = rd("tex_zoom", bv.tex_zoom as f64);
-                    additive = rd("additive", bv.additive as f64);
+                    let rd = |slot: EnvSlot| env.slot_value(slot) as f32;
+                    sides_f = rd(slots.sides);
+                    rad = rd(slots.rad);
+                    ang = rd(slots.ang);
+                    x = rd(slots.x);
+                    y = rd(slots.y);
+                    r = rd(slots.r);
+                    g = rd(slots.g);
+                    b = rd(slots.b);
+                    a = rd(slots.a);
+                    r2 = rd(slots.r2);
+                    g2 = rd(slots.g2);
+                    b2 = rd(slots.b2);
+                    a2 = rd(slots.a2);
+                    border_r = rd(slots.border_r);
+                    border_g = rd(slots.border_g);
+                    border_b = rd(slots.border_b);
+                    border_a = rd(slots.border_a);
+                    thick = rd(slots.thickoutline);
+                    textured = rd(slots.textured);
+                    tex_ang = rd(slots.tex_ang);
+                    tex_zoom = rd(slots.tex_zoom);
+                    additive = rd(slots.additive);
                 } else {
                     let bv = &s.base;
                     sides_f = bv.sides;
@@ -3351,7 +5128,11 @@ impl MilkdropRenderer {
                 let border_g = fin(border_g, 0.0).clamp(0.0, 1.0);
                 let border_b = fin(border_b, 0.0).clamp(0.0, 1.0);
                 let border_alpha = fin(border_a, 0.0).clamp(0.0, 1.0) * blend_progress;
-                let has_border = border_alpha > 0.0;
+                // Also bound the border vertex buffer: drop the rim when it would
+                // overflow BORDER_VERT_CAP rather than generating verts we can't
+                // upload (P2-VIS-018). Rim cost is (sides + 1) verts.
+                let has_border = border_alpha > 0.0
+                    && border_verts.len() + (sides as usize + 1) <= BORDER_VERT_CAP;
                 let quarter_pi = PI * 0.25;
 
                 let base_vertex = fill_verts.len() as i32;
@@ -3399,6 +5180,7 @@ impl MilkdropRenderer {
                     base_vertex,
                     sides,
                     additive: is_additive,
+                    border_draw_index: has_border.then_some(border_draws.len()),
                 });
 
                 if has_border {
@@ -3437,9 +5219,16 @@ impl MilkdropRenderer {
         wave_l: &[f32],
         wave_r: &[f32],
         freq: &[f32],
-    ) -> (Vec<WaveVert>, Vec<WaveDraw>) {
-        let mut verts: Vec<WaveVert> = Vec::new();
-        let mut draws: Vec<WaveDraw> = Vec::new();
+        regs: &[f64; 100],
+    ) -> (
+        Vec<WaveVert>,
+        Vec<WaveDraw>,
+        Option<CustomWaveGeometryExtent>,
+    ) {
+        let mut verts = std::mem::take(&mut self.scratch.wave_verts);
+        let mut draws = std::mem::take(&mut self.scratch.wave_draws);
+        verts.clear();
+        draws.clear();
         let audio_len = wave_l.len();
 
         // ── Custom waveforms first (index order), then built-in last ─────────
@@ -3457,9 +5246,17 @@ impl MilkdropRenderer {
             wave_l,
             wave_r,
             freq,
+            regs,
             &mut verts,
             &mut draws,
         );
+        let custom_extent =
+            self.geometry_diagnostics
+                .enabled()
+                .then_some(CustomWaveGeometryExtent {
+                    vertices: verts.len(),
+                    draws: draws.len(),
+                });
 
         if audio_len > 0 {
             // Built-in waveform alpha is the post-per-frame `wave_a` (butterchurn reads
@@ -3489,7 +5286,7 @@ impl MilkdropRenderer {
             );
         }
 
-        (verts, draws)
+        (verts, draws, custom_extent)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3911,79 +5708,119 @@ impl MilkdropRenderer {
         time_l: &[f32],
         time_r: &[f32],
         freq: &[f32],
+        regs: &[f64; 100],
         verts: &mut Vec<WaveVert>,
         draws: &mut Vec<WaveDraw>,
     ) {
         let max_samples = time_l.len();
-        if max_samples == 0 {
-            return;
-        }
         let wave_scale_base = self.bw_scale;
         let frame_idx = self.frame_idx;
+        let fps = effective_fps(self.time_per_frame);
+        let adaptive_lod = self.custom_wave_adaptive_lod;
         // q1..q32 from the main per-frame EEL — custom waveforms read these (ORB's
         // laser tubes are entirely q1-driven). Captured before the &mut waves loop.
         // Full q1..q32 (was capped at q8) to match MilkDrop/Butterchurn shape/wave semantics.
-        let mut qv = [0.0f64; 32];
-        for i in 0..32 {
-            qv[i] = self
-                .eel_env
-                .get(format!("q{}", i + 1).as_str())
-                .copied()
-                .unwrap_or(0.0);
-        }
+        let qv: [f64; 32] = std::array::from_fn(|i| self.eel_env.slot_value(self.eel_q_slots[i]));
 
-        for wv in self.waves.iter_mut() {
+        // Independent custom-wave pools are ideal coarse-grained parallel work:
+        // the expensive Dancer presets commonly carry four 512-point programs,
+        // while each program's points must remain serial because EEL locals may
+        // intentionally carry from one point to the next. Only programs touching
+        // preset-wide gmegabuf or the shared RNG retain authored wave ordering on
+        // the render thread; loops and private megabuf state remain pool-local.
+        let parallel_safe = self.waves.iter().filter(|wv| wv.def.enabled).all(|wv| {
+            wv.per_frame_prog
+                .as_ref()
+                .is_none_or(EelProgram::custom_wave_parallel_safe)
+                && wv
+                    .per_point_prog
+                    .as_ref()
+                    .is_none_or(EelProgram::custom_wave_parallel_safe)
+        });
+        let build_wave = |wv: &mut WaveRT| -> Option<WaveDraw> {
+            wv.scratch.output.clear();
             if !wv.def.enabled {
-                continue;
+                return None;
             }
 
             // ── per-frame run ────────────────────────────────────────────────
             let env = &mut wv.env;
-            env.insert("time".into(), t as f64);
-            env.insert("frame".into(), frame_idx as f64);
-            env.insert("fps".into(), 60.0);
-            env.insert("bass".into(), bass);
-            env.insert("bass_att".into(), bass_att);
-            env.insert("mid".into(), mid);
-            env.insert("mid_att".into(), mid_att);
-            env.insert("treb".into(), treb);
-            env.insert("treb_att".into(), treb_att);
-            env.insert("vol".into(), vol);
-            env.insert("aspectx".into(), inv_aspectx as f64);
-            env.insert("aspecty".into(), inv_aspecty as f64);
-            for (i, q) in qv.iter().enumerate() {
-                env.insert(format!("q{}", i + 1), *q);
+            let slots = wv.slots;
+            for (slot, value) in wv.reg_slots.iter().zip(regs) {
+                env.set_slot_value(*slot, *value);
             }
-            env.insert("samples".into(), wv.def.samples as f64);
-            env.insert("sep".into(), wv.def.sep as f64);
-            env.insert("scaling".into(), wv.def.scaling as f64);
-            env.insert("smoothing".into(), wv.def.smoothing as f64);
-            env.insert("spectrum".into(), if wv.def.spectrum { 1.0 } else { 0.0 });
-            env.insert("r".into(), wv.def.r as f64);
-            env.insert("g".into(), wv.def.g as f64);
-            env.insert("b".into(), wv.def.b as f64);
-            env.insert("a".into(), wv.def.a as f64);
+            for (slot, value) in wv.t_slots.iter().zip(&wv.t_init) {
+                env.set_slot_value(*slot, *value);
+            }
+            slots.frame.seed(
+                env,
+                t,
+                frame_idx,
+                fps,
+                bass,
+                mid,
+                treb,
+                vol,
+                bass_att,
+                mid_att,
+                treb_att,
+                inv_aspectx as f64,
+                inv_aspecty as f64,
+            );
+            for (slot, value) in wv.q_slots.iter().zip(&qv) {
+                env.set_slot_value(*slot, *value);
+            }
+            env.set_slot_value(slots.samples, wv.def.samples as f64);
+            env.set_slot_value(slots.sep, wv.def.sep as f64);
+            env.set_slot_value(slots.scaling, wv.def.scaling as f64);
+            env.set_slot_value(slots.smoothing, wv.def.smoothing as f64);
+            env.set_slot_value(slots.spectrum, if wv.def.spectrum { 1.0 } else { 0.0 });
+            env.set_slot_value(slots.r, wv.def.r as f64);
+            env.set_slot_value(slots.g, wv.def.g as f64);
+            env.set_slot_value(slots.b, wv.def.b as f64);
+            env.set_slot_value(slots.a, wv.def.a as f64);
             if let Some(p) = &wv.per_frame_prog {
                 p.run_with(env, &mut wv.state);
             }
-            let rd = |env: &Env, k: &str, d: f64| env.get(k).copied().unwrap_or(d);
-            let pf_samples = rd(env, "samples", wv.def.samples as f64).floor().max(0.0) as usize;
-            let pf_sep = rd(env, "sep", wv.def.sep as f64).floor() as i32;
-            let pf_scaling = rd(env, "scaling", wv.def.scaling as f64) as f32;
-            let pf_spectrum = rd(env, "spectrum", if wv.def.spectrum { 1.0 } else { 0.0 }) != 0.0;
-            let pf_smoothing = rd(env, "smoothing", wv.def.smoothing as f64) as f32;
-            let frame_r = rd(env, "r", wv.def.r as f64) as f32;
-            let frame_g = rd(env, "g", wv.def.g as f64) as f32;
-            let frame_b = rd(env, "b", wv.def.b as f64) as f32;
-            let frame_a = rd(env, "a", wv.def.a as f64) as f32;
+            // Custom-wave per-frame equations are part of the authored state
+            // lifecycle even when no PCM buffer is available yet. Preserve
+            // those side effects, then skip only the point-generation work.
+            if max_samples == 0 {
+                return None;
+            }
+            let pf_samples = env.slot_value(slots.samples).floor().max(0.0) as usize;
+            let pf_sep = env.slot_value(slots.sep).floor() as i32;
+            let pf_scaling = env.slot_value(slots.scaling) as f32;
+            let pf_spectrum = env.slot_value(slots.spectrum) != 0.0;
+            let pf_smoothing = env.slot_value(slots.smoothing) as f32;
+            let frame_r = env.slot_value(slots.r) as f32;
+            let frame_g = env.slot_value(slots.g) as f32;
+            let frame_b = env.slot_value(slots.b) as f32;
+            let frame_a = env.slot_value(slots.a) as f32;
 
             // ── sample prep (generateWaveform) ───────────────────────────────
-            let mut samples = pf_samples.min(max_samples);
+            let mut authored_samples = pf_samples.min(max_samples);
             let sep = pf_sep.max(0) as usize;
-            samples = samples.saturating_sub(sep);
-            if !(samples >= 2 || (wv.def.use_dots && samples >= 1)) {
-                continue;
+            authored_samples = authored_samples.saturating_sub(sep);
+            if !(authored_samples >= 2 || (wv.def.use_dots && authored_samples >= 1)) {
+                return None;
             }
+            // LOD is deliberately conservative: point stamps and any equation with
+            // observable side effects retain every authored point. Pure, expensive
+            // programs keep the same source span and endpoints at a lower density.
+            let lod_safe = wv
+                .per_point_prog
+                .as_ref()
+                .map(|program| {
+                    program.custom_wave_lod_safe()
+                        && program.operation_count() >= CUSTOM_WAVE_LOD_OP_THRESHOLD
+                })
+                .unwrap_or(false);
+            let samples = if adaptive_lod && lod_safe && !wv.def.use_dots {
+                authored_samples.min(CUSTOM_WAVE_LOD_SAMPLES)
+            } else {
+                authored_samples
+            };
 
             // The *128 converts our normalized [-1,1] TIME samples to butterchurn's Int8
             // [-128,127] range that the 0.004 constant assumes. The SPECTRUM branch must
@@ -3996,24 +5833,46 @@ impl MilkdropRenderer {
             // bSpectrum waveforms read the FFT freqArray (butterchurn customWaveform.js:
             // pointsLeft = useSpectrum ? freqArrayL : timeArrayL). Our freq array is still
             // mono, but honor sep as an offset into that spectrum so value1/value2 do not
-            // collapse to the same bin. When no live freq is available, fall back to time data.
-            let use_freq = pf_spectrum && freq.len() == max_samples;
-            let (src_l, src_r): (&[f32], &[f32]) = if use_freq {
-                (freq, freq)
+            // collapse to the same bin. The FFT and PCM arrays are resampled to
+            // `max_samples` INDEPENDENTLY: a spectrum wave uses the (resampled) FFT even
+            // when its length differs from the PCM length — no time-domain fallback on a
+            // mere length mismatch (P2-VIS-031). Time data is used only with no live FFT.
+            // Reuse persistent source buffers only when a row truly needs
+            // resampling. Canonical 512-sample PCM/FFT rows are borrowed directly.
+            let scratch = &mut wv.scratch;
+            let (src_l, src_r): (&[f32], &[f32]) = if pf_spectrum && !freq.is_empty() {
+                if freq.len() == max_samples {
+                    (freq, freq)
+                } else {
+                    resample_linear_into(freq, max_samples, &mut scratch.source_l, false);
+                    (&scratch.source_l, &scratch.source_l)
+                }
             } else {
-                (time_l, time_r)
+                let left = if time_l.len() == max_samples {
+                    time_l
+                } else {
+                    resample_linear_into(time_l, max_samples, &mut scratch.source_l, false);
+                    &scratch.source_l
+                };
+                let right = if time_r.len() == max_samples {
+                    time_r
+                } else {
+                    resample_linear_into(time_r, max_samples, &mut scratch.source_r, false);
+                    &scratch.source_r
+                };
+                (left, right)
             };
-            let (j0, j1, step) = if pf_spectrum {
+            let (j0, j1, source_step) = if pf_spectrum {
                 (
                     0usize,
                     sep.min(max_samples.saturating_sub(1)),
-                    ((max_samples.saturating_sub(sep)).max(1) / samples.max(1)).max(1),
+                    ((max_samples.saturating_sub(sep)).max(1) / authored_samples.max(1)).max(1),
                 )
             } else {
-                let j0 = ((max_samples as f32 - samples as f32) / 2.0 - sep as f32 / 2.0)
+                let j0 = ((max_samples as f32 - authored_samples as f32) / 2.0 - sep as f32 / 2.0)
                     .floor()
                     .max(0.0) as usize;
-                let j1 = ((max_samples as f32 - samples as f32) / 2.0 + sep as f32 / 2.0)
+                let j1 = ((max_samples as f32 - authored_samples as f32) / 2.0 + sep as f32 / 2.0)
                     .floor()
                     .max(0.0) as usize;
                 (j0, j1, 1usize)
@@ -4021,100 +5880,176 @@ impl MilkdropRenderer {
             let mix1 = (pf_smoothing * 0.98).max(0.0).powf(0.5);
             let mix2 = 1.0 - mix1;
 
-            let mut pts_l = vec![0.0f32; samples];
-            let mut pts_r = vec![0.0f32; samples];
-            pts_l[0] = *src_l.get(j0.min(max_samples - 1)).unwrap_or(&0.0);
-            pts_r[0] = *src_r.get(j1.min(max_samples - 1)).unwrap_or(&0.0);
-            for j in 1..samples {
-                let il = (j * step + j0).min(max_samples - 1);
-                let ir = (j * step + j1).min(max_samples - 1);
-                pts_l[j] = src_l[il] * mix2 + pts_l[j - 1] * mix1;
-                pts_r[j] = src_r[ir] * mix2 + pts_r[j - 1] * mix1;
+            scratch.points_l.resize(authored_samples, 0.0);
+            scratch.points_r.resize(authored_samples, 0.0);
+            scratch.points_l[0] = *src_l.get(j0.min(max_samples - 1)).unwrap_or(&0.0);
+            scratch.points_r[0] = *src_r.get(j1.min(max_samples - 1)).unwrap_or(&0.0);
+            for j in 1..authored_samples {
+                let il = (j * source_step + j0).min(max_samples - 1);
+                let ir = (j * source_step + j1).min(max_samples - 1);
+                scratch.points_l[j] = src_l[il] * mix2 + scratch.points_l[j - 1] * mix1;
+                scratch.points_r[j] = src_r[ir] * mix2 + scratch.points_r[j - 1] * mix1;
             }
-            for j in (0..samples - 1).rev() {
-                pts_l[j] = pts_l[j] * mix2 + pts_l[j + 1] * mix1;
-                pts_r[j] = pts_r[j] * mix2 + pts_r[j + 1] * mix1;
+            for j in (0..authored_samples - 1).rev() {
+                scratch.points_l[j] = scratch.points_l[j] * mix2 + scratch.points_l[j + 1] * mix1;
+                scratch.points_r[j] = scratch.points_r[j] * mix2 + scratch.points_r[j + 1] * mix1;
             }
-            for j in 0..samples {
-                pts_l[j] *= scale;
-                pts_r[j] *= scale;
+            for j in 0..authored_samples {
+                scratch.points_l[j] *= scale;
+                scratch.points_r[j] *= scale;
             }
 
             // ── per-point loop ───────────────────────────────────────────────
-            let mut positions: Vec<[f32; 2]> = Vec::with_capacity(samples);
-            let mut colors: Vec<[f32; 4]> = Vec::with_capacity(samples);
+            // A gmegabuf point program makes the complete custom-wave schedule
+            // serial. Hold its shared-buffer lock for this authored point batch
+            // instead of taking the same uncontended mutex once per sample.
+            let point_gmegabuf_handle = wv
+                .per_point_prog
+                .as_ref()
+                .filter(|program| program.uses_gmegabuf())
+                .map(|_| wv.state.gmegabuf.clone());
+            let mut point_gmegabuf_guard = point_gmegabuf_handle.as_ref().map(|handle| {
+                handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            scratch.positions.clear();
+            scratch.colors.clear();
+            scratch
+                .positions
+                .reserve(samples.saturating_sub(scratch.positions.capacity()));
+            scratch
+                .colors
+                .reserve(samples.saturating_sub(scratch.colors.capacity()));
             for j in 0..samples {
-                let value1 = pts_l[j];
-                let value2 = pts_r[j];
+                let authored_j = if samples <= 1 {
+                    0
+                } else {
+                    (j * (authored_samples - 1) + (samples - 1) / 2) / (samples - 1)
+                };
+                let value1 = scratch.points_l[authored_j];
+                let value2 = scratch.points_r[authored_j];
                 let sample_t = if samples <= 1 {
                     0.0
                 } else {
                     j as f64 / (samples - 1) as f64
                 };
-                let env = &mut wv.env;
-                env.insert("sample".into(), sample_t);
-                env.insert("value1".into(), value1 as f64);
-                env.insert("value2".into(), value2 as f64);
-                env.insert("x".into(), 0.5 + value1 as f64);
-                env.insert("y".into(), 0.5 + value2 as f64);
-                env.insert("r".into(), frame_r as f64);
-                env.insert("g".into(), frame_g as f64);
-                env.insert("b".into(), frame_b as f64);
-                env.insert("a".into(), frame_a as f64);
-                if let Some(p) = &wv.per_point_prog {
-                    p.run_with(env, &mut wv.state);
-                }
-                let px = (rd(env, "x", 0.5) * 2.0 - 1.0) * inv_aspectx as f64;
-                let py = (rd(env, "y", 0.5) * -2.0 + 1.0) * inv_aspecty as f64;
-                // Clamp per-point color/alpha and guard NaN/inf (audio-gated point
-                // eqs can drive these out of range under synthetic audio → an alpha
-                // of 0/neg/NaN makes the wave vanish).
+                let (px, py, cr, cg, cb, ca) = if let Some(p) = &wv.per_point_prog {
+                    let env = &mut wv.env;
+                    env.set_slot_value(slots.sample, sample_t);
+                    env.set_slot_value(slots.value1, value1 as f64);
+                    env.set_slot_value(slots.value2, value2 as f64);
+                    env.set_slot_value(slots.x, 0.5 + value1 as f64);
+                    env.set_slot_value(slots.y, 0.5 + value2 as f64);
+                    env.set_slot_value(slots.r, frame_r as f64);
+                    env.set_slot_value(slots.g, frame_g as f64);
+                    env.set_slot_value(slots.b, frame_b as f64);
+                    env.set_slot_value(slots.a, frame_a as f64);
+                    if let Some(gmegabuf) = point_gmegabuf_guard.as_deref_mut() {
+                        p.run_with_prelocked_gmegabuf(env, &mut wv.state, gmegabuf);
+                    } else {
+                        p.run_with(env, &mut wv.state);
+                    }
+                    (
+                        ((env.slot_value(slots.x) * 2.0 - 1.0) * inv_aspectx as f64) as f32,
+                        ((env.slot_value(slots.y) * -2.0 + 1.0) * inv_aspecty as f64) as f32,
+                        env.slot_value(slots.r) as f32,
+                        env.slot_value(slots.g) as f32,
+                        env.slot_value(slots.b) as f32,
+                        env.slot_value(slots.a) as f32,
+                    )
+                } else {
+                    // Equation-free fast path: no environment traffic or VM call.
+                    (
+                        value1 * 2.0 * inv_aspectx,
+                        value2 * -2.0 * inv_aspecty,
+                        frame_r,
+                        frame_g,
+                        frame_b,
+                        frame_a,
+                    )
+                };
                 let fin = |v: f32, d: f32| if v.is_finite() { v } else { d };
-                let cr = fin(rd(env, "r", frame_r as f64) as f32, frame_r).clamp(0.0, 1.0);
-                let cg = fin(rd(env, "g", frame_g as f64) as f32, frame_g).clamp(0.0, 1.0);
-                let cb = fin(rd(env, "b", frame_b as f64) as f32, frame_b).clamp(0.0, 1.0);
-                let ca = fin(rd(env, "a", frame_a as f64) as f32, frame_a).clamp(0.0, 1.0);
-                let (px, py) = (fin(px as f32, 0.0), fin(py as f32, 0.0));
-                positions.push([px, py]);
-                colors.push([cr, cg, cb, ca]);
+                scratch.positions.push([fin(px, 0.0), fin(py, 0.0)]);
+                scratch.colors.push([
+                    fin(cr, frame_r).clamp(0.0, 1.0),
+                    fin(cg, frame_g).clamp(0.0, 1.0),
+                    fin(cb, frame_b).clamp(0.0, 1.0),
+                    fin(ca, frame_a).clamp(0.0, 1.0),
+                ]);
             }
+            drop(point_gmegabuf_guard);
 
             if wv.def.use_dots {
-                let start = verts.len() as u32;
-                for (p, c) in positions.iter().zip(colors.iter()) {
-                    verts.push(WaveVert { pos: *p, color: *c });
+                scratch.output.reserve(
+                    scratch
+                        .positions
+                        .len()
+                        .saturating_sub(scratch.output.capacity()),
+                );
+                for (p, c) in scratch.positions.iter().zip(scratch.colors.iter()) {
+                    scratch.output.push(WaveVert { pos: *p, color: *c });
                 }
-                draws.push(WaveDraw {
-                    start_vert: start,
-                    count: positions.len() as u32,
+                let draw = WaveDraw {
+                    start_vert: 0,
+                    count: scratch.positions.len() as u32,
                     points: true,
                     additive: wv.def.additive,
                     thick: wv.def.draw_thick || wv.def.use_dots,
-                });
+                };
+                Some(draw)
             } else {
-                let (sp, sc) = smooth_wave_and_color(&positions, &colors);
-                let start = verts.len() as u32;
-                for (p, c) in sp.iter().zip(sc.iter()) {
-                    verts.push(WaveVert { pos: *p, color: *c });
-                }
-                draws.push(WaveDraw {
-                    start_vert: start,
-                    count: sp.len() as u32,
+                let count = emit_smoothed_wave_and_color(
+                    &scratch.positions,
+                    &scratch.colors,
+                    &mut scratch.output,
+                );
+                let draw = WaveDraw {
+                    start_vert: 0,
+                    count,
                     points: false,
                     additive: wv.def.additive,
                     thick: wv.def.draw_thick,
-                });
+                };
+                Some(draw)
+            }
+        };
+        let outputs: Vec<Option<WaveDraw>> = if parallel_safe {
+            self.waves.par_iter_mut().map(&build_wave).collect()
+        } else {
+            self.waves.iter_mut().map(&build_wave).collect()
+        };
+        // Merge in authored wave order so GPU draw order and alpha blending remain
+        // deterministic even when CPU equation evaluation completed out of order.
+        for (wave, output) in self
+            .waves
+            .iter()
+            .zip(outputs)
+            .filter_map(|(wave, draw)| draw.map(|draw| (wave, draw)))
+        {
+            if verts.len() >= WAVE_VERT_CAP {
+                break;
+            }
+            let mut draw = output;
+            let remaining = WAVE_VERT_CAP - verts.len();
+            let copy_len = wave.scratch.output.len().min(remaining);
+            draw.start_vert = verts.len() as u32;
+            draw.count = draw.count.min(copy_len as u32);
+            verts.extend_from_slice(&wave.scratch.output[..copy_len]);
+            if draw.count > 0 {
+                draws.push(draw);
             }
         }
     }
 
-    /// Compute the per-vertex warped UV + decay rgb for the warp mesh.
-    /// Runs the per_pixel EEL program per vertex (if present) and composes the
-    /// butterchurn warped sample coordinate. `aspectx`/`aspecty` are the
-    /// NON-inverted geometry aspect (landscape: ax=1, ay=h/w).
-    fn compute_warp_verts(&mut self, t: f32, aspectx: f32, aspecty: f32) -> Vec<WarpVert> {
+    fn warp_gpu_params(
+        &self,
+        t: f32,
+        aspectx: f32,
+        aspecty: f32,
+        use_cpu_mesh: bool,
+    ) -> WarpGpuParams {
         let b = self.base_warp;
-        // Resolve per-FRAME warp params: base, overridden by per-frame EEL writes.
         let getf = |k: &str, def: f32| {
             self.eel_env
                 .get(k)
@@ -4122,19 +6057,38 @@ impl MilkdropRenderer {
                 .map(|v| v as f32)
                 .unwrap_or(def)
         };
-        let fzoom = getf("zoom", b.zoom);
-        let fzoomexp = getf("zoomexp", b.zoomexp);
-        let frot = getf("rot", b.rot);
-        let fwarp = getf("warp", b.warp);
-        let fcx = getf("cx", b.cx);
-        let fcy = getf("cy", b.cy);
-        let fdx = getf("dx", b.dx);
-        let fdy = getf("dy", b.dy);
-        let fsx = getf("sx", b.sx);
-        let fsy = getf("sy", b.sy);
-        let fdecay = getf("decay", b.decay);
-        let wscale = getf("warpscale", b.warpscale).max(1e-6);
-        let wanim = getf("warpanimspeed", b.warpanimspeed);
+        WarpGpuParams {
+            transform0: [
+                getf("zoom", b.zoom),
+                getf("zoomexp", b.zoomexp),
+                getf("rot", b.rot),
+                getf("warp", b.warp),
+            ],
+            transform1: [
+                getf("cx", b.cx),
+                getf("cy", b.cy),
+                getf("dx", b.dx),
+                getf("dy", b.dy),
+            ],
+            transform2: [
+                getf("sx", b.sx),
+                getf("sy", b.sy),
+                getf("decay", b.decay),
+                getf("warpscale", b.warpscale).max(1e-6),
+            ],
+            transform3: [getf("warpanimspeed", b.warpanimspeed), t, aspectx, aspecty],
+            flags: [if use_cpu_mesh { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        }
+    }
+
+    /// Compute the per-vertex warped UV + decay rgb for presets that require a
+    /// CPU flow field. Equation-free presets without motion vectors use the same
+    /// math in the vertex shader and skip this mesh rebuild/upload entirely.
+    fn compute_warp_verts(&mut self, params: &WarpGpuParams) {
+        let [fzoom, fzoomexp, frot, fwarp] = params.transform0;
+        let [fcx, fcy, fdx, fdy] = params.transform1;
+        let [fsx, fsy, fdecay, wscale] = params.transform2;
+        let [wanim, t, aspectx, aspecty] = params.transform3;
 
         let warp_time_v = t * wanim;
         let warp_scale_inv = 1.0_f32 / wscale;
@@ -4159,59 +6113,66 @@ impl MilkdropRenderer {
 
         let has_prog = self.per_pixel_prog.is_some();
 
+        let slots = self.warp_slots;
+
         // Per-pixel equations start from the post-per-frame env. This carries user
-        // vars like `v`, `mx`, q9..q32, etc.; reloading it per vertex also prevents
-        // temporary vars from leaking between mesh vertices.
-        let warp_frame_env: Option<Vec<(String, f64)>> = if has_prog {
-            let mut env = self.eel_env.clone();
-            env.insert("time".into(), t as f64);
-            env.insert("frame".into(), self.frame_idx as f64);
-            env.insert("fps".into(), 60.0);
-            env.insert(
+        // vars like `v`, `mx`, q9..q32, etc. MilkDrop then restores only the ten
+        // authored warp controls for each vertex; user temporaries intentionally
+        // carry between vertices. The cross-env copy/name lookups happen once here.
+        if has_prog {
+            self.warp_env.copy_present_from(&self.eel_env);
+            self.warp_env.insert("time", t as f64);
+            self.warp_env.insert("frame", self.frame_idx as f64);
+            self.warp_env
+                .insert("fps", effective_fps(self.time_per_frame));
+            self.warp_env.insert(
                 "bass".into(),
                 self.eel_env.get("bass").copied().unwrap_or(0.0),
             );
-            env.insert(
+            self.warp_env.insert(
                 "mid".into(),
                 self.eel_env.get("mid").copied().unwrap_or(0.0),
             );
-            env.insert(
+            self.warp_env.insert(
                 "treb".into(),
                 self.eel_env.get("treb").copied().unwrap_or(0.0),
             );
-            env.insert(
+            self.warp_env.insert(
                 "vol".into(),
                 self.eel_env.get("vol").copied().unwrap_or(0.0),
             );
-            env.insert(
+            self.warp_env.insert(
                 "bass_att".into(),
                 self.eel_env.get("bass_att").copied().unwrap_or(0.0),
             );
-            env.insert(
+            self.warp_env.insert(
                 "mid_att".into(),
                 self.eel_env.get("mid_att").copied().unwrap_or(0.0),
             );
-            env.insert(
+            self.warp_env.insert(
                 "treb_att".into(),
                 self.eel_env.get("treb_att").copied().unwrap_or(0.0),
             );
-            env.insert(
+            self.warp_env.insert(
                 "vol_att".into(),
                 self.eel_env.get("vol_att").copied().unwrap_or(0.0),
             );
-            env.insert("aspectx".into(), inv_ax);
-            env.insert("aspecty".into(), inv_ay);
-            Some(env.into_iter().collect())
-        } else {
-            None
-        };
+            self.warp_env.insert("aspectx", inv_ax);
+            self.warp_env.insert("aspecty", inv_ay);
+            let reset_values = [fwarp, fzoom, fzoomexp, fcx, fcy, fsx, fsy, fdx, fdy, frot];
+            for (&slot, value) in slots.reset.iter().zip(reset_values) {
+                self.warp_env.set_slot_value(slot, value as f64);
+            }
+            self.warp_env
+                .capture_slots_into(&slots.reset, &mut self.warp_snapshot);
+        }
 
         let vw = GRID_W + 1;
         let vh = GRID_H + 1;
-        let mut verts = Vec::with_capacity((vw * vh) as usize);
-
-        for j in 0..vh {
-            for i in 0..vw {
+        let eval_vertex =
+            |index: u32, env: &mut Env, state: &mut EelState, prog: Option<&EelProgram>| {
+                let i = index % vw;
+                let j = index / vw;
                 let x = (i as f32 / GRID_W as f32) * 2.0 - 1.0;
                 let y = (j as f32 / GRID_H as f32) * 2.0 - 1.0;
                 let xf = x as f64;
@@ -4224,52 +6185,33 @@ impl MilkdropRenderer {
                     (fcx, fcy, fdx, fdy, fsx, fsy);
                 let (mut dr, mut dg, mut db) = (fdecay, fdecay, fdecay);
 
-                if let Some(prog) = self.per_pixel_prog.as_ref() {
-                    let ang = if j == GRID_H / 2 && i == GRID_W / 2 {
-                        0.0
-                    } else {
-                        (yf * ay).atan2(xf * ax)
-                    };
-                    let env = &mut self.warp_env;
-                    if let Some(base) = warp_frame_env.as_ref() {
-                        env.clear();
-                        for (k, v) in base {
-                            env.insert(k.clone(), *v);
-                        }
-                    }
-                    env.insert("x".into(), xf * 0.5 * ax + 0.5);
-                    env.insert("y".into(), yf * -0.5 * ay + 0.5);
-                    env.insert("rad".into(), rad);
-                    env.insert("ang".into(), ang);
-                    env.insert("zoom".into(), fzoom as f64);
-                    env.insert("zoomexp".into(), fzoomexp as f64);
-                    env.insert("rot".into(), frot as f64);
-                    env.insert("warp".into(), fwarp as f64);
-                    env.insert("cx".into(), fcx as f64);
-                    env.insert("cy".into(), fcy as f64);
-                    env.insert("dx".into(), fdx as f64);
-                    env.insert("dy".into(), fdy as f64);
-                    env.insert("sx".into(), fsx as f64);
-                    env.insert("sy".into(), fsy as f64);
-                    env.insert("decay".into(), fdecay as f64);
-                    env.insert("decay_r".into(), fdecay as f64);
-                    env.insert("decay_g".into(), fdecay as f64);
-                    env.insert("decay_b".into(), fdecay as f64);
-                    prog.run_with(env, &mut self.warp_state);
-                    let g = |k: &str, d: f32| env.get(k).copied().map(|v| v as f32).unwrap_or(d);
-                    zoom = g("zoom", fzoom);
-                    zoomexp = g("zoomexp", fzoomexp);
-                    rot = g("rot", frot);
-                    warp = g("warp", fwarp);
-                    cx = g("cx", fcx);
-                    cy = g("cy", fcy);
-                    dx = g("dx", fdx);
-                    dy = g("dy", fdy);
-                    sx = g("sx", fsx);
-                    sy = g("sy", fsy);
-                    dr = g("decay_r", fdecay);
-                    dg = g("decay_g", fdecay);
-                    db = g("decay_b", fdecay);
+                if let Some(prog) = prog {
+                    let ang = milkdrop_angle(xf, yf, ax, ay);
+                    env.set_slot_value(slots.x, xf * 0.5 * ax + 0.5);
+                    env.set_slot_value(slots.y, yf * -0.5 * ay + 0.5);
+                    env.set_slot_value(slots.rad, rad);
+                    env.set_slot_value(slots.ang, ang);
+                    env.restore_slots(&self.warp_snapshot);
+                    // Preserve OjoDrop's existing per-vertex decay extension while
+                    // keeping it outside the MilkDrop ten-control snapshot.
+                    env.set_slot_value(slots.decay, fdecay as f64);
+                    env.set_slot_value(slots.decay_r, fdecay as f64);
+                    env.set_slot_value(slots.decay_g, fdecay as f64);
+                    env.set_slot_value(slots.decay_b, fdecay as f64);
+                    prog.run_with(env, state);
+                    warp = env.slot_value(slots.reset[0]) as f32;
+                    zoom = env.slot_value(slots.reset[1]) as f32;
+                    zoomexp = env.slot_value(slots.reset[2]) as f32;
+                    cx = env.slot_value(slots.reset[3]) as f32;
+                    cy = env.slot_value(slots.reset[4]) as f32;
+                    sx = env.slot_value(slots.reset[5]) as f32;
+                    sy = env.slot_value(slots.reset[6]) as f32;
+                    dx = env.slot_value(slots.reset[7]) as f32;
+                    dy = env.slot_value(slots.reset[8]) as f32;
+                    rot = env.slot_value(slots.reset[9]) as f32;
+                    dr = env.slot_value(slots.decay_r) as f32;
+                    dg = env.slot_value(slots.decay_g) as f32;
+                    db = env.slot_value(slots.decay_b) as f32;
                 }
 
                 if zoom.abs() < 1e-6 {
@@ -4321,17 +6263,65 @@ impl MilkdropRenderer {
 
                 let px = x;
                 let py = -y; // clip-space: top row (j=0, y=-1) -> py=+1
-                verts.push(WarpVert {
+                WarpVert {
                     pos: [px, py],
                     uv: [u, v],
                     decay: [dr, dg, db, 1.0],
-                });
-            }
+                }
+            };
+
+        let program = self.per_pixel_prog.as_ref();
+        let mut verts = std::mem::take(&mut self.scratch.warp_verts);
+        verts.clear();
+        verts.reserve((vw * vh) as usize);
+        for index in 0..vw * vh {
+            verts.push(eval_vertex(
+                index,
+                &mut self.warp_env,
+                &mut self.warp_state,
+                program,
+            ));
         }
-        verts
+        self.scratch.warp_verts = verts;
+        if has_prog {
+            // MilkDrop publishes reg00..reg99 written by the final per-pixel
+            // invocation back to the preset-wide frame environment. Both slot
+            // arrays were interned once at activation, so this is 100 dense
+            // copies with no per-frame string allocation or hashing.
+            self.eel_env.copy_slot_values_from(
+                &self.eel_reg_slots,
+                &self.warp_env,
+                &self.warp_reg_slots,
+            );
+        }
     }
 
     pub fn render(&mut self, surface_view: &wgpu::TextureView) {
+        self.render_impl(surface_view, None);
+    }
+
+    /// Render one frame while writing timestamps around OjoDrop's GPU command
+    /// stream. The caller owns query resolution so multiple frames can be
+    /// collected without a synchronization point between submissions.
+    pub fn render_profiled(
+        &mut self,
+        surface_view: &wgpu::TextureView,
+        query_set: &wgpu::QuerySet,
+        boundary_marker: &wgpu::Buffer,
+        start_index: u32,
+        end_index: u32,
+    ) {
+        self.render_impl(
+            surface_view,
+            Some((query_set, boundary_marker, start_index, end_index)),
+        );
+    }
+
+    fn render_impl(
+        &mut self,
+        surface_view: &wgpu::TextureView,
+        timestamp_writes: Option<(&wgpu::QuerySet, &wgpu::Buffer, u32, u32)>,
+    ) {
         let t = deterministic_time_seconds(self.frame_idx, self.time_per_frame)
             .unwrap_or_else(|| self.start.elapsed().as_secs_f64());
         let shader_t = shader_time_seconds(t);
@@ -4384,8 +6374,8 @@ impl MilkdropRenderer {
             // accumulator-q presets re-seed from init each frame instead of
             // carrying the previous frame's q's (Butterchurn mdVS reset). User
             // vars and regs are NOT reset (they persist). No-op when no init ran.
-            for (k, v) in &self.q_init {
-                env.insert(k.clone(), *v);
+            for (slot, value) in self.eel_q_slots.iter().zip(&self.q_init) {
+                env.set_slot_value(*slot, *value);
             }
             // Reset built-in WARP motion vars to their header baseVals each frame,
             // matching Butterchurn (mdVSFrame = mdVS baseVals + qInit + USER keys only;
@@ -4407,6 +6397,7 @@ impl MilkdropRenderer {
             env.insert("warpscale".into(), bw.warpscale as f64);
             env.insert("warpanimspeed".into(), bw.warpanimspeed as f64);
             env.insert("decay".into(), bw.decay as f64);
+            env.insert("wrap".into(), if bw.wrap { 1.0 } else { 0.0 });
             // Reset built-in waveform fields from header baseVals each frame, then
             // let per-frame EEL override them. Butterchurn's basic waveform reads
             // these live mdVSFrame values, so fields like wave_x/wave_mystery should
@@ -4444,6 +6435,39 @@ impl MilkdropRenderer {
             env.insert("b2x".into(), self.b2x as f64);
             env.insert("b3n".into(), self.b3n as f64);
             env.insert("b3x".into(), self.b3x as f64);
+            // Reconstruct every remaining built-in from the preset base each
+            // frame. These are not user variables and must not accidentally
+            // accumulate their previous per-frame output.
+            for (name, value) in [
+                ("gamma", self.comp_gamma_adj),
+                ("gammaadj", self.comp_gamma_adj),
+                ("fshader", self.comp_fshader),
+                ("echo_zoom", self.echo_zoom),
+                ("echo_alpha", self.echo_alpha),
+                ("echo_orient", self.echo_orient),
+                ("mv_x", self.mv_x),
+                ("mv_y", self.mv_y),
+                ("mv_dx", self.mv_dx),
+                ("mv_dy", self.mv_dy),
+                ("mv_l", self.mv_l),
+                ("mv_r", self.mv_r),
+                ("mv_g", self.mv_g),
+                ("mv_b", self.mv_b),
+                ("mv_a", self.mv_a),
+                ("ob_size", self.ob_size),
+                ("ob_r", self.ob_r),
+                ("ob_g", self.ob_g),
+                ("ob_b", self.ob_b),
+                ("ob_a", self.ob_a),
+                ("ib_size", self.ib_size),
+                ("ib_r", self.ib_r),
+                ("ib_g", self.ib_g),
+                ("ib_b", self.ib_b),
+                ("ib_a", self.ib_a),
+            ] {
+                env.insert(name, value as f64);
+            }
+            env.insert("darken_center", if self.darken_center { 1.0 } else { 0.0 });
             // Reset comp post-FX flags from baseVals each frame so per-frame EEL
             // can animate them without stale persistence. Butterchurn reads these
             // uniforms from mdVSFrame after frame equations.
@@ -4459,7 +6483,7 @@ impl MilkdropRenderer {
             env.insert("invert".into(), if self.comp_invert { 1.0 } else { 0.0 });
             // Seed read-only inputs before each frame
             env.insert("time".into(), t as f64);
-            env.insert("fps".into(), 60.0);
+            env.insert("fps".into(), effective_fps(self.time_per_frame));
             env.insert("frame".into(), self.frame_idx as f64);
             env.insert("progress".into(), (t % 30.0) as f64 / 30.0);
             env.insert("bass".into(), bass);
@@ -4549,6 +6573,7 @@ impl MilkdropRenderer {
             eqd("ib_b", self.ib_b as f64),
             live_ib_a,
         ];
+        let live_wrap = eqd("wrap", if self.base_warp.wrap { 1.0 } else { 0.0 }) != 0.0;
 
         // ── Blur min/max range remap (butterchurn getBlurValues + getScaleAndBias) ──
         // The blur shader normalizes each level into [0,1] (scale_n,bias_n); the
@@ -4617,8 +6642,10 @@ impl MilkdropRenderer {
             )
         };
 
-        // Build and upload PerFrame UBO
-        let pf = PerFrame {
+        // Build the shared portion of the warp/comp uniforms now. rand_frame is
+        // filled after the corresponding EEL phases so shared RNG consumption
+        // matches Butterchurn's observable lifecycle.
+        let mut pf = PerFrame {
             texsize: [w, h, 1.0 / w, 1.0 / h],
             aspect: [shape_aspectx, shape_aspecty, inv_aspectx, inv_aspecty],
             // Time-based roam oscillators in [0,1] (butterchurn warp.js:838-861 / comp.js).
@@ -4647,12 +6674,8 @@ impl MilkdropRenderer {
                 0.5 + 0.5 * (shader_t * 5.0).sin(),
                 0.5 + 0.5 * (shader_t * 20.0).sin(),
             ],
-            rand_frame: [
-                pseudo_rand(self.frame_idx),
-                pseudo_rand(self.frame_idx.wrapping_add(1)),
-                pseudo_rand(self.frame_idx.wrapping_add(2)),
-                pseudo_rand(self.frame_idx.wrapping_add(3)),
-            ],
+            rand_frame: [0.0; 4],
+            rand_start: self.rand_start,
             rand_preset: self.rand_preset,
             // q1-q32 mapped to _qa.._qh (slots already reserved in the UBO; the
             // q9-q32 #defines live in preprocess.rs milk_fs_preamble).
@@ -4665,7 +6688,7 @@ impl MilkdropRenderer {
             _qg: [eq("q25"), eq("q26"), eq("q27"), eq("q28")],
             _qh: [eq("q29"), eq("q30"), eq("q31"), eq("q32")],
             time: shader_t,
-            fps: 60.0,
+            fps: effective_fps(self.time_per_frame) as f32,
             frame: shader_frame,
             progress,
             bass: bass as f32,
@@ -4706,8 +6729,6 @@ impl MilkdropRenderer {
             invert: eqd("invert", if self.comp_invert { 1.0 } else { 0.0 }),
             ..bytemuck::Zeroable::zeroed()
         };
-        self.queue
-            .write_buffer(&self.perframe_buf, 0, bytemuck::bytes_of(&pf));
 
         // ── Blur range-remap and edge fade: write live b1ed to level 1's vertical
         // edge vector and per-level sb (scale,bias) to the blur UBOs. Butterchurn
@@ -4736,6 +6757,29 @@ impl MilkdropRenderer {
             self.queue.write_buffer(ubo, 32, bytemuck::cast_slice(&sb));
         }
 
+        // Evaluate the warp mesh before custom shapes/waves so reg00..reg99
+        // written by the final per-pixel invocation are visible to those pools in
+        // the same frame, matching MilkDrop's equation-runner lifecycle.
+        let requested_mv_x = live_mv_x.floor() as i32;
+        let requested_mv_y = live_mv_y.floor() as i32;
+        let motion_vectors_requested =
+            self.mv_on && live_mv_a > 0.001 && requested_mv_x > 0 && requested_mv_y > 0;
+        let use_cpu_mesh = self.per_pixel_prog.is_some() || motion_vectors_requested;
+        let warp_params =
+            self.warp_gpu_params(shader_t, shape_aspectx, shape_aspecty, use_cpu_mesh);
+        self.queue
+            .write_buffer(&self.warp_params_buf, 0, bytemuck::bytes_of(&warp_params));
+        if use_cpu_mesh {
+            self.compute_warp_verts(&warp_params);
+            self.queue.write_buffer(
+                &self.warp_vert_buf,
+                0,
+                bytemuck::cast_slice(&self.scratch.warp_verts),
+            );
+        }
+        let warp_rand_frame = std::array::from_fn(|_| self.eel_rng.next_unit() as f32);
+        let regsnap = std::array::from_fn(|i| self.eel_env.slot_value(self.eel_reg_slots[i]));
+
         // ── Build shape + waveform geometry (BEFORE any render pass opens) ────
         // Shapes use aspecty (landscape: h/w) to keep discs round. Custom waves use
         // the inverse-aspect convention (butterchurn invAspectx/invAspecty).
@@ -4743,14 +6787,7 @@ impl MilkdropRenderer {
         // q1..q32 snapshot for shape per-frame programs (MilkDrop/Butterchurn pass the
         // full q1..q32 from mdVSQAfterFrame to custom shapes; capping at q8 left q9..q32
         // = 0 in shape eqs, e.g. idx 7550's `a = floor(rand(floor(q30)))/5` → alpha 0).
-        let mut qsnap = [0.0f64; 32];
-        for i in 0..32 {
-            qsnap[i] = self
-                .eel_env
-                .get(format!("q{}", i + 1).as_str())
-                .copied()
-                .unwrap_or(0.0);
-        }
+        let qsnap = std::array::from_fn(|i| self.eel_env.slot_value(self.eel_q_slots[i]));
 
         let (fill_verts, fill_draws, border_verts, border_draws) = self.build_shape_geometry(
             t,
@@ -4764,13 +6801,22 @@ impl MilkdropRenderer {
             shape_aspectx,
             shape_aspecty,
             &qsnap,
+            &regsnap,
         );
 
-        let (wave_l, wave_r) = self.frame_waveform(shader_t);
+        // Keep the renderer-owned audio rows out of the struct while waveform
+        // geometry is built. This avoids cloning live PCM + FFT vectors per frame;
+        // they are restored unchanged below so their capacity is reused next frame.
+        let live_waveform = !self.wave_l.is_empty() && !self.wave_r.is_empty();
+        let mut wave_l = std::mem::take(&mut self.wave_l);
+        let mut wave_r = std::mem::take(&mut self.wave_r);
+        if !live_waveform {
+            Self::synthesize_waveform(shader_t, &mut wave_l, &mut wave_r);
+        }
         // freqArray for bSpectrum custom waves (mono, 512 bins). Empty in the
         // headless/synthetic path → build_custom_waves falls back to time data.
-        let freq = self.freq_spectrum.clone();
-        let (wave_verts, wave_draws) = self.build_wave_geometry(
+        let freq = std::mem::take(&mut self.freq_spectrum);
+        let (wave_verts, wave_draws, custom_wave_extent) = self.build_wave_geometry(
             t,
             bass,
             mid,
@@ -4786,7 +6832,52 @@ impl MilkdropRenderer {
             &wave_l,
             &wave_r,
             &freq,
+            &regsnap,
         );
+        if !live_waveform {
+            // Preserve the allocated scratch capacity but make the next frame
+            // synthesize fresh time-varying PCM rather than treating it as live.
+            wave_l.clear();
+            wave_r.clear();
+        }
+        self.wave_l = wave_l;
+        self.wave_r = wave_r;
+        self.freq_spectrum = freq;
+
+        // The collector's closure is never called unless explicitly enabled, so
+        // the default renderer does not scan geometry or count enabled pools.
+        // Custom-wave geometry is a prefix because build_wave_geometry appends
+        // the built-in waveform only after all custom wave pools.
+        let diagnostic_frame_index = self.frame_idx;
+        let shapes = &self.shapes;
+        let waves = &self.waves;
+        let geometry_diagnostics = &mut self.geometry_diagnostics;
+        geometry_diagnostics.capture(|| {
+            let extent = custom_wave_extent.unwrap_or_default();
+            summarize_custom_geometry(
+                diagnostic_frame_index,
+                shapes
+                    .iter()
+                    .filter(|shape| shape.base.enabled != 0)
+                    .count(),
+                &fill_verts,
+                &fill_draws,
+                &border_verts,
+                &border_draws,
+                waves.iter().filter(|wave| wave.def.enabled).count(),
+                &wave_verts[..extent.vertices.min(wave_verts.len())],
+                &wave_draws[..extent.draws.min(wave_draws.len())],
+            )
+        });
+
+        let comp_rand_frame = std::array::from_fn(|_| self.eel_rng.next_unit() as f32);
+        pf.rand_frame = warp_rand_frame;
+        self.queue
+            .write_buffer(&self.perframe_buf, 0, bytemuck::bytes_of(&pf));
+        let mut comp_pf = pf;
+        comp_pf.rand_frame = comp_rand_frame;
+        self.queue
+            .write_buffer(&self.comp_perframe_buf, 0, bytemuck::bytes_of(&comp_pf));
 
         // Upload all geometry up-front (no write_buffer inside a render pass).
         if !fill_verts.is_empty() {
@@ -4813,49 +6904,38 @@ impl MilkdropRenderer {
                 bytemuck::cast_slice(&wave_verts[..n]),
             );
         }
-        // ShapeU textured flag: untextured for now (jelly_space is untextured).
-        self.queue.write_buffer(
-            &self.shape_uniform_buf,
-            0,
-            bytemuck::bytes_of(&ShapeU {
-                textured: 0.0,
-                _pad: [0.0; 3],
-            }),
-        );
+        // (The dead ShapeU textured-flag write was removed — P2-VIS-032. The
+        // per-shape textured flag is carried by a negative-UV vertex sentinel.)
 
-        // Thick-offset slots for the waveform dyn-offset UBO. The first four slots
-        // preserve the legacy line offsets; dot waves can use the extra slots for a
-        // fuller 3x3 point stamp.
+        // One texel-size uniform; the vertex shader expands thick lines/dots from
+        // `instance_index`, replacing 4/9 CPU draw calls with one instanced draw.
         let tsx = 2.0 / self.width as f32;
         let tsy = 2.0 / self.height as f32;
-        let offsets = [
-            [0.0f32, 0.0, 0.0, 0.0],
-            [tsx, 0.0, 0.0, 0.0],
-            [0.0, tsy, 0.0, 0.0],
-            [tsx, tsy, 0.0, 0.0],
-            [-tsx, 0.0, 0.0, 0.0],
-            [0.0, -tsy, 0.0, 0.0],
-            [-tsx, -tsy, 0.0, 0.0],
-            [tsx, -tsy, 0.0, 0.0],
-            [-tsx, tsy, 0.0, 0.0],
-        ];
-        let mut off_bytes = vec![0u8; WAVE_THICK_DOT_PASSES * 256];
-        for (k, o) in offsets.iter().enumerate() {
-            off_bytes[k * 256..k * 256 + 16].copy_from_slice(bytemuck::cast_slice(o));
-        }
-        self.queue.write_buffer(&self.wave_off_buf, 0, &off_bytes);
+        self.queue.write_buffer(
+            &self.wave_off_buf,
+            0,
+            bytemuck::cast_slice(&[tsx, tsy, 0.0, 0.0]),
+        );
 
         let border_slots_needed = border_draws.len().saturating_mul(BORDER_THICK_LINE_PASSES);
         let border_slots = border_slots_needed.min(BORDER_UNIFORM_SLOTS);
         if border_slots > 0 {
-            let mut bu_bytes = vec![0u8; border_slots * 256];
+            let border_offsets = [
+                [0.0f32, 0.0, 0.0, 0.0],
+                [tsx, 0.0, 0.0, 0.0],
+                [0.0, tsy, 0.0, 0.0],
+                [tsx, tsy, 0.0, 0.0],
+            ];
+            let bu_bytes = &mut self.scratch.border_uniform_bytes;
+            bu_bytes.clear();
+            bu_bytes.resize(border_slots * 256, 0);
             for (draw_idx, draw) in border_draws.iter().enumerate() {
                 let base_slot = draw_idx * BORDER_THICK_LINE_PASSES;
                 if base_slot >= border_slots {
                     break;
                 }
                 let slots_for_draw = (border_slots - base_slot).min(BORDER_THICK_LINE_PASSES);
-                for (k, o) in offsets.iter().take(slots_for_draw).enumerate() {
+                for (k, o) in border_offsets.iter().take(slots_for_draw).enumerate() {
                     let bu = BorderU {
                         color: draw.color,
                         offset: *o,
@@ -4866,21 +6946,13 @@ impl MilkdropRenderer {
                 }
             }
             self.queue
-                .write_buffer(&self.border_uniform_buf, 0, &bu_bytes);
+                .write_buffer(&self.border_uniform_buf, 0, bu_bytes);
         }
 
-        // --- WARP geometry: compute per-vertex warped UV + decay ONCE (both paths
-        // now use the warped mesh). MUST upload before opening the render pass, and
-        // BEFORE the immutable ping-pong borrows below (compute_warp_verts is &mut). ---
-        let warp_verts = self.compute_warp_verts(shader_t, shape_aspectx, shape_aspecty);
-        self.queue
-            .write_buffer(&self.warp_vert_buf, 0, bytemuck::cast_slice(&warp_verts));
-
         // ── MOTION VECTORS geometry (butterchurn MotionVectors.generateMotionVectors)
-        // Reuses warp_verts as the flow field. Built for BOTH warp paths (compute_warp_verts
-        // produces a UV grid in all cases). Live mv_* read from the per-frame EEL env.
+        // Reuses the CPU warp mesh as the flow field. Live mv_* values come from the
+        // per-frame EEL env; storage is retained in RendererScratch across frames.
         let mv_count: u32 = {
-            let mv_on = self.mv_on;
             let mv_a = live_mv_a;
             let mv_x = live_mv_x;
             let mv_y = live_mv_y;
@@ -4890,9 +6962,9 @@ impl MilkdropRenderer {
             let mv_r = live_mv_r;
             let mv_g = live_mv_g;
             let mv_b = live_mv_b;
-            let mut n_x = mv_x.floor() as i32;
-            let mut n_y = mv_y.floor() as i32;
-            if mv_on && mv_a > 0.001 && n_x > 0 && n_y > 0 {
+            if motion_vectors_requested {
+                let mut n_x = requested_mv_x;
+                let mut n_y = requested_mv_y;
                 let mut dx = mv_x - n_x as f32;
                 let mut dy = mv_y - n_y as f32;
                 if n_x > 64 {
@@ -4913,6 +6985,7 @@ impl MilkdropRenderer {
                 let mw = GRID_W as f32;
                 let mh = GRID_H as f32;
                 let grid_x1 = (GRID_W + 1) as usize;
+                let warp_verts = &self.scratch.warp_verts;
                 let sample = |fx: f32, fy: f32| -> (f32, f32) {
                     let mut x0 = (fx * mw).floor() as i32;
                     let mut y0 = (fy * mh).floor() as i32;
@@ -4951,7 +7024,8 @@ impl MilkdropRenderer {
                     (fx2, 1.0 - fy2)
                 };
 
-                let mut mv_verts: Vec<MVVert> = Vec::with_capacity(MV_VERT_CAP);
+                let mv_verts = &mut self.scratch.motion_verts;
+                mv_verts.clear();
                 for j in 0..n_y {
                     let mut fy = (j as f32 + 0.25) / (n_y as f32 + dy + 0.25 - 1.0);
                     fy -= dy2;
@@ -5007,6 +7081,7 @@ impl MilkdropRenderer {
                 }
                 cnt as u32
             } else {
+                self.scratch.motion_verts.clear();
                 0
             }
         };
@@ -5027,7 +7102,8 @@ impl MilkdropRenderer {
             // TRIANGLE_FAN(6 verts) → 4 triangles, expanded to a triangle list.
             let fan = [center, p1, p2, p3, p4, p5];
             let tris = [(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 5)];
-            let mut dv: Vec<DarkenVert> = Vec::with_capacity(12);
+            let dv = &mut self.scratch.darken_verts;
+            dv.clear();
             for (a, b, c) in tris {
                 for k in [a, b, c] {
                     let (pos, color) = fan[k];
@@ -5035,7 +7111,9 @@ impl MilkdropRenderer {
                 }
             }
             self.queue
-                .write_buffer(&self.darken_vert_buf, 0, bytemuck::cast_slice(&dv));
+                .write_buffer(&self.darken_vert_buf, 0, bytemuck::cast_slice(dv));
+        } else {
+            self.scratch.darken_verts.clear();
         }
 
         // ── FRAME-BORDER geometry (butterchurn Border.generateBorder). Outer ring
@@ -5046,77 +7124,81 @@ impl MilkdropRenderer {
         let ib_a = live_ib_a;
         let outer_color = live_outer_color;
         let inner_color = live_inner_color;
-        // generate_border(border_size, prev_border_size) → 24 NDC verts, or None.
-        let gen_border =
-            |border_size: f32, prev_border_size: f32, alpha: f32| -> Option<Vec<BorderVert>> {
-                if !(border_size > 0.0 && alpha > 0.0) {
-                    return None;
-                }
-                let width = 2.0f32;
-                let height = 2.0f32;
-                let wh = width / 2.0;
-                let hh = height / 2.0;
-                let pbw = prev_border_size / 2.0;
-                let bw = border_size / 2.0 + pbw;
-                let pbww = pbw * width;
-                let pbwh = pbw * height;
-                let bww = bw * width;
-                let bwh = bw * height;
-                let mut v: Vec<BorderVert> = Vec::with_capacity(24);
-                let mut tri = |p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]| {
-                    v.push(BorderVert { pos: p1 });
-                    v.push(BorderVert { pos: p2 });
-                    v.push(BorderVert { pos: p3 });
-                };
-                // 1st side (left)
-                let a1 = [-wh + pbww, -hh + bwh];
-                let a2 = [-wh + pbww, hh - bwh];
-                let a3 = [-wh + bww, hh - bwh];
-                let a4 = [-wh + bww, -hh + bwh];
-                tri(a4, a2, a1);
-                tri(a4, a3, a2);
-                // 2nd side (right)
-                let b1 = [wh - pbww, -hh + bwh];
-                let b2 = [wh - pbww, hh - bwh];
-                let b3 = [wh - bww, hh - bwh];
-                let b4 = [wh - bww, -hh + bwh];
-                tri(b1, b2, b4);
-                tri(b2, b3, b4);
-                // Top
-                let c1 = [-wh + pbww, -hh + pbwh];
-                let c2 = [-wh + pbww, bwh - hh];
-                let c3 = [wh - pbww, bwh - hh];
-                let c4 = [wh - pbww, -hh + pbwh];
-                tri(c4, c2, c1);
-                tri(c4, c3, c2);
-                // Bottom
-                let d1 = [-wh + pbww, hh - pbwh];
-                let d2 = [-wh + pbww, hh - bwh];
-                let d3 = [wh - pbww, hh - bwh];
-                let d4 = [wh - pbww, hh - pbwh];
-                tri(d1, d2, d4);
-                tri(d2, d3, d4);
-                Some(v)
-            };
-        let outer_verts = gen_border(ob_size, 0.0, ob_a);
-        let inner_verts = gen_border(ib_size, ob_size, ib_a);
-        // Pack the two border draws contiguously; record (start_vert, color_slot).
-        let mut border_draws_frame: Vec<(u32, u32)> = Vec::new(); // (start_vert, slot)
-        {
-            let mut all: Vec<BorderVert> = Vec::new();
-            if let Some(ov) = &outer_verts {
-                border_draws_frame.push((all.len() as u32, 0));
-                all.extend_from_slice(ov);
+        // Append generate_border(border_size, prev_border_size)'s 24 NDC verts
+        // directly into persistent storage. Returns whether a draw was emitted.
+        let append_border = |border_size: f32,
+                             prev_border_size: f32,
+                             alpha: f32,
+                             v: &mut Vec<BorderVert>|
+         -> bool {
+            if !(border_size > 0.0 && alpha > 0.0) {
+                return false;
             }
-            if let Some(iv) = &inner_verts {
-                border_draws_frame.push((all.len() as u32, 1));
-                all.extend_from_slice(iv);
+            let width = 2.0f32;
+            let height = 2.0f32;
+            let wh = width / 2.0;
+            let hh = height / 2.0;
+            let pbw = prev_border_size / 2.0;
+            let bw = border_size / 2.0 + pbw;
+            let pbww = pbw * width;
+            let pbwh = pbw * height;
+            let bww = bw * width;
+            let bwh = bw * height;
+            let mut tri = |p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]| {
+                v.push(BorderVert { pos: p1 });
+                v.push(BorderVert { pos: p2 });
+                v.push(BorderVert { pos: p3 });
+            };
+            // 1st side (left)
+            let a1 = [-wh + pbww, -hh + bwh];
+            let a2 = [-wh + pbww, hh - bwh];
+            let a3 = [-wh + bww, hh - bwh];
+            let a4 = [-wh + bww, -hh + bwh];
+            tri(a4, a2, a1);
+            tri(a4, a3, a2);
+            // 2nd side (right)
+            let b1 = [wh - pbww, -hh + bwh];
+            let b2 = [wh - pbww, hh - bwh];
+            let b3 = [wh - bww, hh - bwh];
+            let b4 = [wh - bww, -hh + bwh];
+            tri(b1, b2, b4);
+            tri(b2, b3, b4);
+            // Top
+            let c1 = [-wh + pbww, -hh + pbwh];
+            let c2 = [-wh + pbww, bwh - hh];
+            let c3 = [wh - pbww, bwh - hh];
+            let c4 = [wh - pbww, -hh + pbwh];
+            tri(c4, c2, c1);
+            tri(c4, c3, c2);
+            // Bottom
+            let d1 = [-wh + pbww, hh - pbwh];
+            let d2 = [-wh + pbww, hh - bwh];
+            let d3 = [wh - pbww, hh - bwh];
+            let d4 = [wh - pbww, hh - pbwh];
+            tri(d1, d2, d4);
+            tri(d2, d3, d4);
+            true
+        };
+        {
+            let all = &mut self.scratch.frame_border_verts;
+            let draws = &mut self.scratch.frame_border_draws;
+            all.clear();
+            draws.clear();
+            let outer_start = all.len() as u32;
+            if append_border(ob_size, 0.0, ob_a, all) {
+                draws.push((outer_start, 0));
+            }
+            let inner_start = all.len() as u32;
+            if append_border(ib_size, ob_size, ib_a, all) {
+                draws.push((inner_start, 1));
             }
             if !all.is_empty() {
                 self.queue
-                    .write_buffer(&self.frame_border_vert_buf, 0, bytemuck::cast_slice(&all));
+                    .write_buffer(&self.frame_border_vert_buf, 0, bytemuck::cast_slice(all));
                 // slot 0 = outer color, slot 1 = inner color (dyn-offset 256B each)
-                let mut fb_bytes = vec![0u8; 2 * 256];
+                let fb_bytes = &mut self.scratch.frame_border_uniform_bytes;
+                fb_bytes.clear();
+                fb_bytes.resize(2 * 256, 0);
                 let ou = BorderU {
                     color: outer_color,
                     offset: [0.0; 4],
@@ -5130,44 +7212,41 @@ impl MilkdropRenderer {
                 fb_bytes[256..256 + std::mem::size_of::<BorderU>()]
                     .copy_from_slice(bytemuck::bytes_of(&iu));
                 self.queue
-                    .write_buffer(&self.frame_border_uniform_buf, 0, &fb_bytes);
+                    .write_buffer(&self.frame_border_uniform_buf, 0, fb_bytes);
+            } else {
+                self.scratch.frame_border_uniform_bytes.clear();
             }
         }
+        let border_draws_frame = &self.scratch.frame_border_draws;
 
         // Ping-pong: write_to_a determines current target
-        let (write_view, read_bg, comp_bg) = if self.write_to_a {
-            (&self.view_a, &self.bg_read_b, &self.bg_read_a)
-        } else {
-            (&self.view_b, &self.bg_read_a, &self.bg_read_b)
+        let (write_texture, write_view, read_bg, comp_bg) = match (self.write_to_a, live_wrap) {
+            (true, true) => (&self.tex_a, &self.view_a, &self.bg_read_b, &self.bg_read_a),
+            (false, true) => (&self.tex_b, &self.view_b, &self.bg_read_a, &self.bg_read_b),
+            (true, false) => (
+                &self.tex_a,
+                &self.view_a,
+                &self.bg_read_b_clamp,
+                &self.bg_read_a_clamp,
+            ),
+            (false, false) => (
+                &self.tex_b,
+                &self.view_b,
+                &self.bg_read_a_clamp,
+                &self.bg_read_b_clamp,
+            ),
         };
 
-        // Recreate the blur1 horizontal-pass bind group each frame so it reads from the
-        // CURRENT write target (the warp output, not the previous frame).
-        let blur1_h_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.blur_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(write_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.clamp_samp),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.blur1_ubo.as_entire_binding(),
-                },
-            ],
-        });
-
         let mut enc = self.device.create_command_encoder(&Default::default());
+        if let Some((query_set, boundary_marker, start_index, _)) = timestamp_writes {
+            enc.write_timestamp(query_set, start_index);
+            enc.clear_buffer(boundary_marker, 0, None);
+        }
 
-        // --- WARP pass: read from prev, write to curr (Clear: regenerate frame). ---
+        // --- WARP pass. Blur must observe this surface before overlays. ---
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("warp"),
+                label: Some("feedback-warp"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: write_view,
                     resolve_target: None,
@@ -5187,61 +7266,140 @@ impl MilkdropRenderer {
                 rp.set_pipeline(&self.warp_custom_pipeline);
                 rp.set_bind_group(0, read_bg, &[]); // sampler set (prev frame)
                 rp.set_bind_group(1, &self.perframe_bg, &[]);
+                rp.set_bind_group(2, &self.warp_params_bg, &[]);
             } else {
                 // Default warp mesh: sample prev at warped UV, multiply per-vertex decay.
-                let mesh_bg = if self.write_to_a {
-                    &self.warp_mesh_bg_b
-                } else {
-                    &self.warp_mesh_bg_a
+                let mesh_bg = match (self.write_to_a, live_wrap) {
+                    (true, true) => &self.warp_mesh_bg_b,
+                    (false, true) => &self.warp_mesh_bg_a,
+                    (true, false) => &self.warp_mesh_bg_b_clamp,
+                    (false, false) => &self.warp_mesh_bg_a_clamp,
                 };
                 rp.set_pipeline(&self.warp_mesh_pipeline);
                 rp.set_bind_group(0, mesh_bg, &[]);
+                rp.set_bind_group(1, &self.warp_params_bg, &[]);
             }
             rp.set_vertex_buffer(0, self.warp_vert_buf.slice(..));
             rp.set_index_buffer(self.warp_idx_buf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.warp_idx_count, 0, 0..1);
         }
 
-        // --- MOTION VECTORS pass: drawn into the warped feedback target
-        // (write_view, LoadOp::Load) BEFORE shapes/waves, matching butterchurn order. ---
-        if mv_count > 0 {
-            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("motion-vectors"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: write_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rp.set_pipeline(&self.mv_pipeline);
-            rp.set_bind_group(0, &self.mv_bg, &[]);
-            rp.set_vertex_buffer(0, self.mv_vert_buf.slice(..));
-            rp.draw(0..mv_count, 0..1);
+        if let Some(readback) = self.geometry_stage_readback.as_ref() {
+            encode_stage_texture_copy(
+                &mut enc,
+                write_texture,
+                &readback.post_warp,
+                self.width,
+                self.height,
+                readback.padded_bytes_per_row,
+            );
         }
 
-        // --- SHAPES + WAVES pass: composite over the warped frame ---
-        // Drawn into write_view with Load/Store (NEVER Clear). comp reads write_view,
-        // so shapes/waves appear AND feed back next frame (MilkDrop behavior).
-        let has_shapes = !fill_draws.is_empty() || !border_draws.is_empty();
-        let has_waves = !wave_draws.is_empty();
-        if has_shapes || has_waves {
-            // prev-frame texture for textured shapes = the OTHER ping-pong side.
-            let shape_read_bg = if self.write_to_a {
-                &self.shape_bg_read_b
+        // Butterchurn builds blur from the warped feedback before motion vectors,
+        // shapes, waves, darken-center, or borders are composited. Warp shaders
+        // therefore see the previous frame's blur, while comp sees this frame's
+        // freshly generated warp-only pyramid.
+        let mut blur_pass_count = 0u32;
+        if self.blur_levels >= 1 {
+            let blur1_h_bg = if self.write_to_a {
+                &self.blur1_h_bg_a
             } else {
-                &self.shape_bg_read_a
+                &self.blur1_h_bg_b
             };
+            encode_blur_pass(
+                &mut enc,
+                "blur1-h",
+                &self.blur_h_pipeline,
+                blur1_h_bg,
+                &self.view_btemp1,
+            );
+            generate_mip_chain(
+                &self.device,
+                &self.feedback_mip_blitter,
+                &mut enc,
+                &self.btemp_mips1,
+            );
+            encode_blur_pass(
+                &mut enc,
+                "blur1-v",
+                &self.blur_v_pipeline,
+                &self.blur1_v_bg,
+                &self.view_blur1,
+            );
+            generate_mip_chain(
+                &self.device,
+                &self.feedback_mip_blitter,
+                &mut enc,
+                &self.blur_mips1,
+            );
+            blur_pass_count += 2;
+            if self.blur_levels >= 2 {
+                encode_blur_pass(
+                    &mut enc,
+                    "blur2-h",
+                    &self.blur_h_pipeline,
+                    &self.blur2_h_bg,
+                    &self.view_btemp2,
+                );
+                generate_mip_chain(
+                    &self.device,
+                    &self.feedback_mip_blitter,
+                    &mut enc,
+                    &self.btemp_mips2,
+                );
+                encode_blur_pass(
+                    &mut enc,
+                    "blur2-v",
+                    &self.blur_v_pipeline,
+                    &self.blur2_v_bg,
+                    &self.view_blur2,
+                );
+                generate_mip_chain(
+                    &self.device,
+                    &self.feedback_mip_blitter,
+                    &mut enc,
+                    &self.blur_mips2,
+                );
+                blur_pass_count += 2;
+                if self.blur_levels >= 3 {
+                    encode_blur_pass(
+                        &mut enc,
+                        "blur3-h",
+                        &self.blur_h_pipeline,
+                        &self.blur3_h_bg,
+                        &self.view_btemp3,
+                    );
+                    generate_mip_chain(
+                        &self.device,
+                        &self.feedback_mip_blitter,
+                        &mut enc,
+                        &self.btemp_mips3,
+                    );
+                    encode_blur_pass(
+                        &mut enc,
+                        "blur3-v",
+                        &self.blur_v_pipeline,
+                        &self.blur3_v_bg,
+                        &self.view_blur3,
+                    );
+                    generate_mip_chain(
+                        &self.device,
+                        &self.feedback_mip_blitter,
+                        &mut enc,
+                        &self.blur_mips3,
+                    );
+                    blur_pass_count += 2;
+                }
+            }
+        }
+        self.last_blur_pass_count = blur_pass_count;
 
+        // Overlay pass loads the warp result and preserves MilkDrop's authored
+        // draw order. It is intentionally separate so overlays cannot contaminate
+        // GetBlur1/2/3 for the same frame.
+        {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shapes-waves"),
+                label: Some("feedback-overlays"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: write_view,
                     resolve_target: None,
@@ -5257,18 +7415,31 @@ impl MilkdropRenderer {
                 multiview_mask: None,
             });
 
-            // 1) shape fills
+            // Motion vectors precede authored shapes/waves.
+            if mv_count > 0 {
+                rp.set_pipeline(&self.mv_pipeline);
+                rp.set_bind_group(0, &self.mv_bg, &[]);
+                rp.set_vertex_buffer(0, self.mv_vert_buf.slice(..));
+                rp.draw(0..mv_count, 0..1);
+            }
+
+            // Textured shapes read the previous feedback side.
+            let shape_read_bg = match (self.write_to_a, live_wrap) {
+                (true, true) => &self.shape_bg_read_b,
+                (false, true) => &self.shape_bg_read_a,
+                (true, false) => &self.shape_bg_read_b_clamp,
+                (false, false) => &self.shape_bg_read_a_clamp,
+            };
+
+            // Butterchurn composites each shape instance as fill then border;
+            // batching all fills before all borders changes overlap blending.
             if !fill_draws.is_empty() {
-                rp.set_vertex_buffer(0, self.shape_vert_buf.slice(..));
                 rp.set_index_buffer(self.shape_idx_buf.slice(..), wgpu::IndexFormat::Uint32);
-                rp.set_bind_group(0, shape_read_bg, &[]);
                 for d in &fill_draws {
-                    // Clamp to the uploaded vertex count (truncated to SHAPE_VERT_CAP) so
-                    // an over-cap shape never draws from a stale/zero buffer tail. The fan
-                    // touches verts base_vertex..base_vertex+(sides+2) (center + sides+1 rim).
                     if d.base_vertex as u32 + d.sides + 2 > SHAPE_VERT_CAP as u32 {
                         continue;
                     }
+                    rp.set_vertex_buffer(0, self.shape_vert_buf.slice(..));
                     let pipe = if d.additive {
                         &self.shapes_fill_pipeline_additive
                     } else {
@@ -5277,33 +7448,35 @@ impl MilkdropRenderer {
                     rp.set_pipeline(pipe);
                     rp.set_bind_group(0, shape_read_bg, &[]);
                     rp.draw_indexed(0..(d.sides * 3), d.base_vertex, 0..1);
-                }
-            }
 
-            // 2) shape borders (LineStrip; up-to-4 thick passes via dyn offset slots)
-            if !border_draws.is_empty() {
-                rp.set_pipeline(&self.shapes_border_pipeline);
-                rp.set_vertex_buffer(0, self.border_vert_buf.slice(..));
-                for (draw_idx, d) in border_draws.iter().enumerate() {
-                    if d.start_vert >= BORDER_VERT_CAP as u32 {
-                        continue;
-                    }
-                    let base_slot = draw_idx * BORDER_THICK_LINE_PASSES;
-                    if base_slot >= BORDER_UNIFORM_SLOTS {
-                        continue;
-                    }
-                    let end = (d.start_vert + d.count).min(BORDER_VERT_CAP as u32);
-                    let passes = if d.thick { BORDER_THICK_LINE_PASSES } else { 1 }
+                    if let Some(draw_idx) = d.border_draw_index {
+                        let border = &border_draws[draw_idx];
+                        if border.start_vert >= BORDER_VERT_CAP as u32 {
+                            continue;
+                        }
+                        let base_slot = draw_idx * BORDER_THICK_LINE_PASSES;
+                        if base_slot >= BORDER_UNIFORM_SLOTS {
+                            continue;
+                        }
+                        let end = (border.start_vert + border.count).min(BORDER_VERT_CAP as u32);
+                        let passes = if border.thick {
+                            BORDER_THICK_LINE_PASSES
+                        } else {
+                            1
+                        }
                         .min(BORDER_UNIFORM_SLOTS - base_slot);
-                    for k in 0..passes {
-                        let offset = ((base_slot + k) * 256) as u32;
-                        rp.set_bind_group(0, &self.border_bg, &[offset]);
-                        rp.draw(d.start_vert..end, 0..1);
+                        rp.set_pipeline(&self.shapes_border_pipeline);
+                        rp.set_vertex_buffer(0, self.border_vert_buf.slice(..));
+                        for k in 0..passes {
+                            let offset = ((base_slot + k) * 256) as u32;
+                            rp.set_bind_group(0, &self.border_bg, &[offset]);
+                            rp.draw(border.start_vert..end, 0..1);
+                        }
                     }
                 }
             }
 
-            // 3) waveforms
+            // Built-in and custom waveforms.
             if !wave_draws.is_empty() {
                 rp.set_vertex_buffer(0, self.wave_vert_buf.slice(..));
                 for d in &wave_draws {
@@ -5314,8 +7487,6 @@ impl MilkdropRenderer {
                         (false, false) => &self.wave_pipeline_lines_alpha,
                     };
                     rp.set_pipeline(pipe);
-                    // Clamp to the uploaded vertex count so an over-cap wave never
-                    // draws from a stale/zero buffer tail.
                     if d.start_vert >= WAVE_VERT_CAP as u32 {
                         continue;
                     }
@@ -5329,48 +7500,36 @@ impl MilkdropRenderer {
                     } else {
                         1
                     };
-                    for k in 0..passes {
-                        rp.set_bind_group(0, &self.wave_bg, &[(k * 256) as u32]);
-                        rp.draw(d.start_vert..end, 0..1);
-                    }
+                    rp.set_bind_group(0, &self.wave_bg, &[]);
+                    rp.draw(d.start_vert..end, 0..passes as u32);
                 }
             }
-        }
 
-        // --- DARKEN-CENTER + FRAME-BORDERS pass: into write_view (LoadOp::Load),
-        // AFTER shapes/waves, BEFORE comp (butterchurn draw order). ---
-        if darken_on || !border_draws_frame.is_empty() {
-            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("darken-borders"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: write_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            // 1) darken center (12 verts = 4 fan triangles)
+            // Darken-center and frame borders follow waves.
             if darken_on {
                 rp.set_pipeline(&self.darken_pipeline);
                 rp.set_vertex_buffer(0, self.darken_vert_buf.slice(..));
                 rp.draw(0..12, 0..1);
             }
-            // 2) frame borders (outer then inner), each 24 verts, dyn-offset color slot
             if !border_draws_frame.is_empty() {
                 rp.set_pipeline(&self.frame_border_pipeline);
                 rp.set_vertex_buffer(0, self.frame_border_vert_buf.slice(..));
-                for (start_vert, slot) in &border_draws_frame {
+                for &(start_vert, slot) in border_draws_frame {
                     rp.set_bind_group(0, &self.frame_border_bg, &[(slot * 256) as u32]);
-                    rp.draw(*start_vert..(*start_vert + 24), 0..1);
+                    rp.draw(start_vert..(start_vert + 24), 0..1);
                 }
             }
+        }
+
+        if let Some(readback) = self.geometry_stage_readback.as_ref() {
+            encode_stage_texture_copy(
+                &mut enc,
+                write_texture,
+                &readback.post_overlays,
+                self.width,
+                self.height,
+                readback.padded_bytes_per_row,
+            );
         }
 
         let feedback_mips = if self.write_to_a {
@@ -5384,72 +7543,6 @@ impl MilkdropRenderer {
             &mut enc,
             feedback_mips,
         );
-
-        // --- BLUR passes (separable wide Gaussian, progressive chain) ---
-        // Build GetBlur1/2/3 from the current composited feedback target, after
-        // waves/shapes/borders have seeded it and before custom comp samples blur.
-        {
-            let mut blur_pass = |label: &str,
-                                 pipeline: &wgpu::RenderPipeline,
-                                 bg: &wgpu::BindGroup,
-                                 target: &wgpu::TextureView| {
-                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(label),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                rp.set_pipeline(pipeline);
-                rp.set_bind_group(0, bg, &[]);
-                rp.draw(0..3, 0..1);
-            };
-            blur_pass(
-                "blur1-h",
-                &self.blur_h_pipeline,
-                &blur1_h_bg,
-                &self.view_btemp1,
-            );
-            blur_pass(
-                "blur1-v",
-                &self.blur_v_pipeline,
-                &self.blur1_v_bg,
-                &self.view_blur1,
-            );
-            blur_pass(
-                "blur2-h",
-                &self.blur_h_pipeline,
-                &self.blur2_h_bg,
-                &self.view_btemp2,
-            );
-            blur_pass(
-                "blur2-v",
-                &self.blur_v_pipeline,
-                &self.blur2_v_bg,
-                &self.view_blur2,
-            );
-            blur_pass(
-                "blur3-h",
-                &self.blur_h_pipeline,
-                &self.blur3_h_bg,
-                &self.view_btemp3,
-            );
-            blur_pass(
-                "blur3-v",
-                &self.blur_v_pipeline,
-                &self.blur3_v_bg,
-                &self.view_blur3,
-            );
-        }
 
         // --- COMP pass: read from curr, write to offscreen comp target ---
         {
@@ -5471,8 +7564,19 @@ impl MilkdropRenderer {
             });
             rp.set_pipeline(&self.comp_pipeline);
             rp.set_bind_group(0, comp_bg, &[]);
-            rp.set_bind_group(1, &self.perframe_bg, &[]);
+            rp.set_bind_group(1, &self.comp_perframe_bg, &[]);
             rp.draw(0..3, 0..1);
+        }
+
+        if let Some(readback) = self.geometry_stage_readback.as_ref() {
+            encode_stage_texture_copy(
+                &mut enc,
+                &self.comp_tex,
+                &readback.post_comp,
+                self.width,
+                self.height,
+                readback.padded_bytes_per_row,
+            );
         }
 
         // --- OUTPUT pass: FXAA the offscreen comp result → swapchain ---
@@ -5499,9 +7603,103 @@ impl MilkdropRenderer {
             rp.draw(0..3, 0..1);
         }
 
+        if let Some((query_set, boundary_marker, _, end_index)) = timestamp_writes {
+            enc.clear_buffer(boundary_marker, 0, None);
+            enc.write_timestamp(query_set, end_index);
+        }
         self.queue.submit(std::iter::once(enc.finish()));
+
+        // Return packed geometry storage to the renderer after every CPU/GPU
+        // consumer is finished. The next frame clears and refills these vectors,
+        // retaining capacities reached by large shape/wave presets instead of
+        // repeatedly allocating and growing the same buffers.
+        self.scratch.shape_fill_verts = fill_verts;
+        self.scratch.shape_fill_draws = fill_draws;
+        self.scratch.shape_border_verts = border_verts;
+        self.scratch.shape_border_draws = border_draws;
+        self.scratch.wave_verts = wave_verts;
+        self.scratch.wave_draws = wave_draws;
         self.write_to_a = !self.write_to_a;
         self.frame_idx += 1;
+    }
+}
+
+/// Resample `src` to exactly `target_len` samples by linear interpolation across
+/// the source index range. Returns empty when either input is degenerate. Used to
+/// adapt the FFT (frequency) and PCM (waveform) audio arrays to a custom
+/// waveform's working length INDEPENDENTLY, so a valid FFT is never discarded for
+/// a mere length mismatch (P2-VIS-031).
+pub(crate) fn resample_linear(src: &[f32], target_len: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(target_len);
+    resample_linear_into(src, target_len, &mut out, false);
+    out
+}
+
+/// Resample into caller-owned storage. The live renderer reuses this storage
+/// frame-to-frame, avoiding a short-lived audio allocation for every preview and
+/// program frame. `clamp_waveform` preserves `set_waveform`'s public `[-1, 1]`
+/// and finite-value contract.
+fn resample_linear_into(src: &[f32], target_len: usize, out: &mut Vec<f32>, clamp_waveform: bool) {
+    out.clear();
+    if src.is_empty() || target_len == 0 {
+        return;
+    }
+    out.reserve(target_len.saturating_sub(out.capacity()));
+    let sample = |index: usize| {
+        let value = src[index];
+        if clamp_waveform {
+            finite_clamp(value, -1.0, 1.0, 0.0)
+        } else {
+            value
+        }
+    };
+    if src.len() == 1 {
+        out.resize(target_len, sample(0));
+        return;
+    }
+    let last = (src.len() - 1) as f32;
+    let denom = (target_len - 1).max(1) as f32;
+    for i in 0..target_len {
+        let pos = last * (i as f32) / denom;
+        let i0 = pos.floor() as usize;
+        let i1 = (i0 + 1).min(src.len() - 1);
+        let frac = pos - i0 as f32;
+        out.push(sample(i0) * (1.0 - frac) + sample(i1) * frac);
+    }
+}
+
+/// Copy or resample an audio row directly into a renderer-owned reusable buffer.
+fn replace_audio_samples(
+    destination: &mut Vec<f32>,
+    source: &[f32],
+    target_len: usize,
+    clamp_waveform: bool,
+) {
+    resample_linear_into(source, target_len, destination, clamp_waveform);
+}
+
+/// Per-sample source arrays for one custom waveform, each resampled to
+/// `target_len`. A `spectrum` wave draws from the FFT (`freq`) array; a
+/// time-domain wave draws from the PCM (`time_*`) arrays. The FFT is resampled
+/// INDEPENDENTLY of the PCM length — a valid FFT is used even when its length
+/// differs from the PCM length, rather than silently falling back to time-domain
+/// data on a length mismatch (P2-VIS-031). Time data is used only when there is
+/// no spectrum data available.
+fn custom_wave_sources(
+    spectrum: bool,
+    time_l: &[f32],
+    time_r: &[f32],
+    freq: &[f32],
+    target_len: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    if spectrum && !freq.is_empty() {
+        let f = resample_linear(freq, target_len);
+        (f.clone(), f)
+    } else {
+        (
+            resample_linear(time_l, target_len),
+            resample_linear(time_r, target_len),
+        )
     }
 }
 
@@ -5574,20 +7772,271 @@ fn smooth_wave_and_color(pts: &[[f32; 2]], cols: &[[f32; 4]]) -> (Vec<[f32; 2]>,
     (out_p, out_c)
 }
 
-fn pseudo_rand(seed: u64) -> f32 {
-    let mut x = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^= x >> 31;
-    ((x >> 40) as f32) / ((1u32 << 24) as f32)
+/// WaveUtils smoothing fused directly into the final staging vertex buffer. This
+/// avoids allocating two `2*n-1` temporary vectors for every custom wave/frame.
+fn emit_smoothed_wave_and_color(
+    points: &[[f32; 2]],
+    colors: &[[f32; 4]],
+    out: &mut Vec<WaveVert>,
+) -> u32 {
+    let n = points.len().min(colors.len());
+    if n == 0 {
+        return 0;
+    }
+    if n == 1 {
+        out.push(WaveVert {
+            pos: points[0],
+            color: colors[0],
+        });
+        return 1;
+    }
+    let c1 = -0.15f32;
+    let c2 = 1.15f32;
+    let c3 = 1.15f32;
+    let c4 = -0.15f32;
+    let inv_sum = 1.0 / (c1 + c2 + c3 + c4);
+    let mut below = 0usize;
+    let mut above2 = 1usize;
+    for i in 0..n - 1 {
+        let above = above2;
+        above2 = (i + 2).min(n - 1);
+        out.push(WaveVert {
+            pos: points[i],
+            color: colors[i],
+        });
+        out.push(WaveVert {
+            pos: [
+                (c1 * points[below][0]
+                    + c2 * points[i][0]
+                    + c3 * points[above][0]
+                    + c4 * points[above2][0])
+                    * inv_sum,
+                (c1 * points[below][1]
+                    + c2 * points[i][1]
+                    + c3 * points[above][1]
+                    + c4 * points[above2][1])
+                    * inv_sum,
+            ],
+            color: colors[i],
+        });
+        below = i;
+    }
+    out.push(WaveVert {
+        pos: points[n - 1],
+        color: colors[n - 1],
+    });
+    (n * 2 - 1) as u32
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "app")]
+    use super::MilkdropRenderer;
     use super::{
-        deterministic_time_seconds, shader_frame_index, shader_progress, shader_time_seconds,
-        GPU_FRAME_WRAP, GPU_TIME_WRAP_SECONDS,
+        blur_dimensions, compile_milkdrop_shader_bodies_from_parts, deterministic_time_seconds,
+        downsample_rgba_volume, effective_fps, emit_smoothed_wave_and_color, milkdrop_angle,
+        needed_blur_levels, resample_linear, resample_linear_into, rgba8_rgb_summary,
+        shader_frame_index, shader_progress, shader_time_seconds, smooth_wave_and_color,
+        summarize_custom_geometry, validate_texture_dims, BorderDraw, BorderVert, DimensionError,
+        GeometryDiagnosticCollector, MilkdropGeometryDiagnostics, MilkdropResizeDebouncer,
+        ShapeFillDraw, ShapeVert, WaveDraw, WaveVert, GPU_FRAME_WRAP, GPU_TIME_WRAP_SECONDS,
+        GRID_H, GRID_W, INTERACTIVE_RESIZE_DEBOUNCE,
     };
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn geometry_diagnostics_are_disabled_and_lazy_by_default() {
+        let mut collector = GeometryDiagnosticCollector::default();
+        let called = Cell::new(false);
+        collector.capture(|| {
+            called.set(true);
+            MilkdropGeometryDiagnostics::default()
+        });
+        assert!(
+            !called.get(),
+            "disabled collector must not run summary work"
+        );
+        assert_eq!(collector.latest(), None);
+
+        collector.set_enabled(true);
+        collector.capture(|| {
+            called.set(true);
+            MilkdropGeometryDiagnostics {
+                frame_index: 42,
+                ..MilkdropGeometryDiagnostics::default()
+            }
+        });
+        assert!(called.get());
+        assert_eq!(collector.latest().unwrap().frame_index, 42);
+
+        collector.set_enabled(false);
+        assert_eq!(
+            collector.latest(),
+            None,
+            "disabling drops retained evidence"
+        );
+    }
+
+    #[test]
+    fn geometry_diagnostics_summarize_counts_bounds_alpha_and_rgb() {
+        let fill_verts = [
+            ShapeVert {
+                pos: [-0.75, 0.25],
+                color: [1.0, 0.0, 0.0, 0.2],
+                uv: [-1.0, -1.0],
+            },
+            ShapeVert {
+                pos: [0.5, -0.5],
+                color: [0.0, 1.0, 0.0, 0.6],
+                uv: [-1.0, -1.0],
+            },
+        ];
+        let fill_draws = [ShapeFillDraw {
+            base_vertex: 0,
+            sides: 3,
+            additive: false,
+            border_draw_index: Some(0),
+        }];
+        let border_verts = [BorderVert { pos: [0.5, -0.5] }];
+        let border_draws = [BorderDraw {
+            start_vert: 0,
+            count: 1,
+            color: [1.0, 1.0, 1.0, 0.4],
+            thick: false,
+        }];
+        let wave_verts = [
+            WaveVert {
+                pos: [-1.0, -0.25],
+                color: [0.0, 0.0, 1.0, 0.1],
+            },
+            WaveVert {
+                pos: [0.25, 0.75],
+                color: [1.0, 1.0, 0.0, 0.9],
+            },
+        ];
+        let wave_draws = [WaveDraw {
+            start_vert: 0,
+            count: 2,
+            points: false,
+            additive: false,
+            thick: false,
+        }];
+
+        let summary = summarize_custom_geometry(
+            7,
+            2,
+            &fill_verts,
+            &fill_draws,
+            &border_verts,
+            &border_draws,
+            3,
+            &wave_verts,
+            &wave_draws,
+        );
+        assert_eq!(summary.frame_index, 7);
+        assert_eq!(summary.custom_shapes.enabled_pools, 2);
+        assert_eq!(summary.custom_shapes.fill_draws, 1);
+        assert_eq!(summary.custom_shapes.border_draws, 1);
+        assert_eq!(summary.custom_shapes.fill_vertices, 2);
+        assert_eq!(summary.custom_shapes.border_vertices, 1);
+        assert_eq!(summary.custom_shapes.bounds.unwrap().min, [-0.75, -0.5]);
+        assert_eq!(summary.custom_shapes.bounds.unwrap().max, [0.5, 0.25]);
+        assert!((summary.custom_shapes.fill_alpha.unwrap().mean - 0.4).abs() < 1.0e-6);
+        assert_eq!(summary.custom_shapes.border_alpha.unwrap().mean, 0.4);
+        let fill_rgb = summary.custom_shapes.fill_rgb.unwrap();
+        assert_eq!(fill_rgb.min, [0.0, 0.0, 0.0]);
+        assert_eq!(fill_rgb.mean, [0.5, 0.5, 0.0]);
+        assert_eq!(fill_rgb.max, [1.0, 1.0, 0.0]);
+        assert_eq!(fill_rgb.visible_fraction, 1.0);
+        assert!((fill_rgb.mean_abs_energy - (1.0 / 3.0)).abs() < 1.0e-6);
+        assert_eq!(
+            summary.custom_shapes.border_rgb.unwrap().mean,
+            [1.0, 1.0, 1.0]
+        );
+        assert_eq!(summary.custom_waves.enabled_pools, 3);
+        assert_eq!(summary.custom_waves.draws, 1);
+        assert_eq!(summary.custom_waves.vertices, 2);
+        assert_eq!(summary.custom_waves.bounds.unwrap().min, [-1.0, -0.25]);
+        assert_eq!(summary.custom_waves.bounds.unwrap().max, [0.25, 0.75]);
+        assert!((summary.custom_waves.alpha.unwrap().mean - 0.5).abs() < 1.0e-6);
+        let wave_rgb = summary.custom_waves.rgb.unwrap();
+        assert_eq!(wave_rgb.mean, [0.5, 0.5, 0.5]);
+        assert_eq!(wave_rgb.visible_fraction, 1.0);
+        assert!((wave_rgb.mean_abs_energy - 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn stage_rgb_summary_ignores_copy_row_padding() {
+        let mut bytes = vec![255u8; 512];
+        bytes[0..8].copy_from_slice(&[255, 0, 0, 255, 0, 255, 0, 255]);
+        bytes[256..264].copy_from_slice(&[0, 0, 255, 255, 0, 0, 0, 255]);
+
+        let summary = rgba8_rgb_summary(&bytes, 2, 2, 256).unwrap();
+        assert_eq!(summary.sample_count, 4);
+        assert_eq!(summary.min, [0.0, 0.0, 0.0]);
+        assert_eq!(summary.mean, [0.25, 0.25, 0.25]);
+        assert_eq!(summary.max, [1.0, 1.0, 1.0]);
+        assert_eq!(summary.visible_fraction, 0.75);
+        assert_eq!(summary.mean_abs_energy, 0.25);
+    }
+
+    #[test]
+    fn canonical_mesh_and_blur_geometry_match_butterchurn() {
+        assert_eq!((GRID_W, GRID_H), (48, 36));
+        assert_eq!(
+            blur_dimensions(1280, 720),
+            [
+                (320, 180),
+                (160, 92),
+                (80, 48),
+                (640, 360),
+                (160, 92),
+                (80, 48),
+            ]
+        );
+        assert_eq!(blur_dimensions(1, 1), [(16, 16); 6]);
+    }
+
+    #[test]
+    fn per_pixel_angle_is_normalized_to_zero_through_tau() {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        assert_eq!(milkdrop_angle(0.0, 0.0, 1.0, 1.0), 0.0);
+        assert!((milkdrop_angle(0.0, 1.0, 1.0, 1.0) - FRAC_PI_2).abs() < 1.0e-12);
+        assert!((milkdrop_angle(-1.0, 0.0, 1.0, 1.0) - PI).abs() < 1.0e-12);
+        let lower = milkdrop_angle(0.0, -1.0, 1.0, 1.0);
+        assert!((lower - (TAU - FRAC_PI_2)).abs() < 1.0e-12);
+        assert!((0.0..TAU).contains(&lower));
+    }
+
+    #[test]
+    fn volume_noise_mip_averages_all_eight_source_voxels() {
+        let mut source = Vec::new();
+        for value in 0u8..8 {
+            source.extend_from_slice(&[value, value * 2, value * 3, 255]);
+        }
+        assert_eq!(downsample_rgba_volume(&source, 2), [3, 7, 10, 255]);
+    }
+
+    #[test]
+    fn fused_custom_wave_emission_matches_legacy_smoothing() {
+        let points = [[-1.0, 0.2], [-0.5, -0.3], [0.25, 0.8], [1.0, -0.1]];
+        let colors = [
+            [1.0, 0.0, 0.0, 0.2],
+            [0.0, 1.0, 0.0, 0.4],
+            [0.0, 0.0, 1.0, 0.6],
+            [1.0, 1.0, 1.0, 0.8],
+        ];
+        let (legacy_points, legacy_colors) = smooth_wave_and_color(&points, &colors);
+        let mut fused = Vec::new();
+        let count = emit_smoothed_wave_and_color(&points, &colors, &mut fused);
+        assert_eq!(count as usize, legacy_points.len());
+        assert_eq!(fused.len(), legacy_points.len());
+        for (index, vertex) in fused.iter().enumerate() {
+            assert_eq!(vertex.pos, legacy_points[index]);
+            assert_eq!(vertex.color, legacy_colors[index]);
+        }
+    }
 
     #[test]
     fn deterministic_clock_preserves_sub_frame_steps_past_f32_cliff() {
@@ -5604,11 +8053,633 @@ mod tests {
     }
 
     #[test]
+    fn fixed_timestep_drives_the_exported_fps_value() {
+        assert_eq!(effective_fps(None), 60.0);
+        assert!((effective_fps(Some(1.0 / 30.0)) - 30.0).abs() < 1.0e-10);
+        assert_eq!(effective_fps(Some(0.0)), 60.0);
+        assert_eq!(effective_fps(Some(f64::NAN)), 60.0);
+    }
+
+    #[test]
     fn shader_time_and_frame_are_bounded_for_gpu_precision() {
         let long_time = GPU_TIME_WRAP_SECONDS * 1000.0 + 12.25;
 
         assert_eq!(shader_time_seconds(long_time), 12.25);
         assert_eq!(shader_progress(75.0), 0.5);
         assert_eq!(shader_frame_index(GPU_FRAME_WRAP + 42), 42.0);
+    }
+
+    #[test]
+    fn interactive_resize_debouncer_coalesces_the_latest_size() {
+        let start = Instant::now();
+        let mut debouncer = MilkdropResizeDebouncer::default();
+
+        assert!(debouncer.request(640, 360, start));
+        assert!(debouncer.is_pending());
+        // Repeated platform events for the same size do not starve the resize.
+        assert!(!debouncer.request(640, 360, start + Duration::from_millis(10)));
+        assert_eq!(
+            debouncer.take_ready(start + Duration::from_millis(149)),
+            None,
+            "the full quiet period is required"
+        );
+
+        // A different later event replaces the older one; only the final size
+        // survives a drag stream and only one target rebuild is requested.
+        let final_request = start + Duration::from_millis(40);
+        assert!(debouncer.request(1280, 720, final_request));
+        assert_eq!(
+            debouncer
+                .take_ready(final_request + INTERACTIVE_RESIZE_DEBOUNCE - Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            debouncer.take_ready(final_request + INTERACTIVE_RESIZE_DEBOUNCE),
+            Some((1280, 720))
+        );
+        assert!(!debouncer.is_pending());
+
+        // Defensive normalization keeps a platform's transient zero size from
+        // reaching wgpu if a caller chooses to queue it.
+        assert!(debouncer.request(0, 0, final_request));
+        assert_eq!(
+            debouncer.take_ready(final_request + INTERACTIVE_RESIZE_DEBOUNCE),
+            Some((1, 1))
+        );
+    }
+
+    // ── P2-VIS-016: the dead legacy warp compiler/pipeline is gone ───────────────
+    #[test]
+    fn legacy_warp_compile_is_gone_and_live_warp_path_survives() {
+        let compiled = compile_milkdrop_shader_bodies_from_parts(
+            false,
+            Some("ret = GetMain(uv) * 0.99;"),
+            None,
+        )
+        .expect("live warp/comp paths must still compile");
+        // Before P2-VIS-016 this held compiled legacy fullscreen-warp WGSL, and a
+        // legacy-only compile failure could reject an otherwise-renderable preset.
+        // The legacy path is removed, so no legacy WGSL is produced.
+        assert!(
+            compiled.warp_wgsl.is_empty(),
+            "legacy warp WGSL must no longer be produced"
+        );
+        // The live warp (mesh-VS) + comp paths still compile.
+        assert!(!compiled.warp_custom_wgsl.is_empty());
+        assert!(!compiled.comp_wgsl.is_empty());
+    }
+
+    // ── P2-VIS-017: only sampled blur levels are needed ─────────────────────────
+    #[test]
+    fn needed_blur_levels_tracks_highest_sampled_level() {
+        assert_eq!(needed_blur_levels(None, None), 0);
+        assert_eq!(needed_blur_levels(Some("ret = GetMain(uv);"), None), 0);
+        assert_eq!(needed_blur_levels(None, Some("ret = GetBlur1(uv);")), 1);
+        assert_eq!(needed_blur_levels(None, Some("ret = GetBlur2(uv);")), 2);
+        assert_eq!(needed_blur_levels(Some("ret = GetBlur3(uv);"), None), 3);
+        // Direct sampler reference + case-insensitivity are both recognized.
+        assert_eq!(
+            needed_blur_levels(None, Some("ret = tex2D(SAMPLER_BLUR2, uv).xyz;")),
+            2
+        );
+        // The highest level across warp AND comp wins (progressive chain).
+        assert_eq!(
+            needed_blur_levels(Some("ret = GetBlur1(uv);"), Some("ret = GetBlur3(uv);")),
+            3
+        );
+    }
+
+    // ── P2-VIS-017 hardening: mode-prefixed blur samplers must be detected ───────
+    //
+    // The preprocessor collapses `sampler_{fw,fc,pw,pc}_blurN` → `sampler_blurN`
+    // before compile, so a body sampling e.g. `sampler_pw_blur2` DOES read blur2 at
+    // runtime. Before running the detector through that same normalization, this
+    // under-detected (returned 0) and the sampled level was never generated →
+    // stale/black blur texture. Each mode prefix is exercised below.
+    #[test]
+    fn needed_blur_levels_detects_mode_prefixed_samplers() {
+        // pw-prefixed blur2 in a comp body → level 2 (regression: was 0).
+        assert_eq!(
+            needed_blur_levels(None, Some("ret = tex2D(sampler_pw_blur2, uv).xyz;")),
+            2
+        );
+        // The other three mode prefixes the normalizer collapses are all detected.
+        assert_eq!(
+            needed_blur_levels(Some("ret = tex2D(sampler_fw_blur1, uv).xyz;"), None),
+            1
+        );
+        assert_eq!(
+            needed_blur_levels(None, Some("ret = tex2D(sampler_fc_blur3, uv).xyz;")),
+            3
+        );
+        assert_eq!(
+            needed_blur_levels(Some("ret = tex2D(sampler_pc_blur2, uv).xyz;"), None),
+            2
+        );
+        // Source-case variant of a prefixed sampler is still caught.
+        assert_eq!(
+            needed_blur_levels(None, Some("ret = tex2D(SAMPLER_PW_BLUR2, uv).xyz;")),
+            2
+        );
+        // Plain `getblurN` (unaffected by sampler normalization) still resolves.
+        assert_eq!(needed_blur_levels(Some("ret = GetBlur3(uv);"), None), 3);
+    }
+
+    // ── P2-VIS-019: external dimensions are validated with checked arithmetic ────
+    #[test]
+    fn validate_texture_dims_accepts_reasonable_and_rejects_extremes() {
+        // Ordinary and exactly-at-max dimensions are accepted.
+        assert!(validate_texture_dims(16384, 1920, 1080).is_ok());
+        assert!(validate_texture_dims(16384, 16384, 16384).is_ok());
+        // Zero is rejected.
+        assert_eq!(
+            validate_texture_dims(16384, 0, 720),
+            Err(DimensionError::Zero)
+        );
+        // Over the device max_texture_dimension_2d → typed rejection, no allocation.
+        assert!(matches!(
+            validate_texture_dims(8192, 100_000, 100_000),
+            Err(DimensionError::ExceedsMaxTextureDimension { .. })
+        ));
+        // Within a permissive max but the total footprint is absurd.
+        assert!(matches!(
+            validate_texture_dims(u32::MAX, 300_000, 300_000),
+            Err(DimensionError::ExceedsMemoryBudget { .. })
+        ));
+        // The byte arithmetic itself overflows u64 → caught, not wrapped.
+        assert!(matches!(
+            validate_texture_dims(u32::MAX, u32::MAX, u32::MAX),
+            Err(DimensionError::ArithmeticOverflow)
+        ));
+    }
+
+    // ── GPU-backed regressions (need a real adapter; skipped if none) ───────────
+    #[cfg(feature = "app")]
+    fn gpu_device() -> Option<(std::sync::Arc<wgpu::Device>, std::sync::Arc<wgpu::Queue>)> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("milk-test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+            experimental_features: Default::default(),
+        }))
+        .ok()?;
+        Some((std::sync::Arc::new(device), std::sync::Arc::new(queue)))
+    }
+
+    #[cfg(feature = "app")]
+    fn offscreen_target(
+        device: &wgpu::Device,
+        w: u32,
+        h: u32,
+        fmt: wgpu::TextureFormat,
+    ) -> wgpu::TextureView {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("test-target"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: fmt,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn init_lifecycle_threads_q_regs_and_distinct_random_vectors() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let preset = crate::parse_milk::parse(
+            "per_frame_init_1=q1=2;reg00=3;\n\
+             per_frame_1=q1=q1+1;reg00=reg00+1;\n\
+             wavecode_0_enabled=1\n\
+             wave_0_per_frame_init_1=t1=q1;reg01=reg00+10;\n\
+             wave_0_per_frame_1=t1=t1+1;\n\
+             shapecode_0_enabled=1\n\
+             shape_0_per_frame_init_1=t1=q1;reg02=reg01+20;\n\
+             shape_0_per_frame_1=t1=t1+1;\n",
+        );
+        let target = offscreen_target(&device, 64, 64, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = MilkdropRenderer::new(
+            device,
+            queue,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &preset,
+        )
+        .expect("renderer with threaded init state");
+
+        assert_eq!(renderer.waves[0].env.get("t1").copied(), Some(3.0));
+        assert_eq!(renderer.shapes[0].env.get("t1").copied(), Some(3.0));
+        assert_eq!(renderer.eel_env.get("reg00").copied(), Some(4.0));
+        assert_eq!(renderer.eel_env.get("reg01").copied(), Some(14.0));
+        assert_eq!(renderer.eel_env.get("reg02").copied(), Some(34.0));
+        assert_ne!(renderer.rand_start, renderer.rand_preset);
+        for _ in 0..2 {
+            renderer.render(&target);
+            assert_eq!(renderer.eel_env.get("q1").copied(), Some(3.0));
+            assert_eq!(renderer.waves[0].env.get("t1").copied(), Some(4.0));
+            assert_eq!(renderer.shapes[0].env.get("t1").copied(), Some(4.0));
+        }
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn every_builtin_is_reset_to_its_preset_base_before_frame_equations() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let preset = crate::parse_milk::parse(
+            "fVideoEchoAlpha=0.2\n\
+             fShader=0.6\n\
+             ob_size=0.05\n\
+             per_frame_1=echo_alpha=echo_alpha+1;ob_size=ob_size+0.1;fshader=fshader+1;\n",
+        );
+        let target = offscreen_target(&device, 64, 64, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = MilkdropRenderer::new(
+            device,
+            queue,
+            64,
+            64,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &preset,
+        )
+        .expect("renderer with self-updating built-ins");
+
+        for _ in 0..2 {
+            renderer.render(&target);
+            let echo = renderer.eel_env.get("echo_alpha").copied().unwrap();
+            let border = renderer.eel_env.get("ob_size").copied().unwrap();
+            let fshader = renderer.eel_env.get("fshader").copied().unwrap();
+            assert!((echo - 1.2).abs() < 1.0e-6, "echo accumulated: {echo}");
+            assert!(
+                (border - 0.15).abs() < 1.0e-6,
+                "border accumulated: {border}"
+            );
+            assert!(
+                (fshader - 1.6).abs() < 1.0e-6,
+                "fshader accumulated or lost its preset base: {fshader}"
+            );
+        }
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn named_texture_atlas_binds_and_renders_through_the_real_pipeline() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let mut shaders = crate::parse_milk::parse("");
+        shaders.comp = Some("ret = tex2D(sampler_fw_worms, uv).rgb;".to_string());
+        let mut renderer = MilkdropRenderer::new(device.clone(), queue, 64, 64, fmt, &shaders)
+            .expect("named-texture renderer");
+        renderer.render(&offscreen_target(&device, 64, 64, fmt));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll");
+    }
+
+    // ── P2-VIS-017: blur draws scale with the sampled levels ────────────────────
+    #[cfg(feature = "app")]
+    #[test]
+    fn blur_passes_scale_with_sampled_levels() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let (w, h) = (64u32, 64u32);
+        let target = offscreen_target(&device, w, h, fmt);
+
+        // A default preset samples no blur → zero blur draws (was 6 before the fix).
+        let plain = crate::parse_milk::parse("");
+        let mut r0 = MilkdropRenderer::new(device.clone(), queue.clone(), w, h, fmt, &plain)
+            .expect("plain renderer");
+        assert_eq!(r0.blur_levels(), 0);
+        r0.render(&target);
+        assert_eq!(r0.last_blur_pass_count(), 0);
+
+        // A comp shader that samples blur2 needs blur1 + blur2 → four blur draws.
+        let mut sh = crate::parse_milk::parse("");
+        sh.comp = Some("ret = GetBlur2(uv);".to_string());
+        let mut r2 = MilkdropRenderer::new(device.clone(), queue.clone(), w, h, fmt, &sh)
+            .expect("blur2 renderer");
+        assert_eq!(r2.blur_levels(), 2);
+        r2.render(&target);
+        assert_eq!(r2.last_blur_pass_count(), 4);
+    }
+
+    // ── P2-VIS-032: shapes render with no ShapeU uniform/binding ────────────────
+    #[cfg(feature = "app")]
+    #[test]
+    fn shapes_render_without_shapeu_binding() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let (w, h) = (64u32, 64u32);
+        let target = offscreen_target(&device, w, h, fmt);
+
+        let shaders = crate::parse_milk::parse(
+            "shapecode_0_enabled=1\nshapecode_0_sides=4\nshapecode_0_rad=0.4\nshapecode_0_a=1\n",
+        );
+        assert!(!shaders.shapes.is_empty(), "preset must have a shape");
+
+        // Any bind-group/layout inconsistency from removing the ShapeU binding
+        // (binding 2) would surface here as a wgpu validation error.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut r = MilkdropRenderer::new(device.clone(), queue.clone(), w, h, fmt, &shaders)
+            .expect("renderer with a shape");
+        r.render(&target);
+        let err = pollster::block_on(scope.pop());
+        assert!(
+            err.is_none(),
+            "shape rendering raised a validation error: {err:?}"
+        );
+    }
+
+    // ── P2-VIS-019: over-limit dimensions are rejected before allocation ────────
+    #[cfg(feature = "app")]
+    #[test]
+    fn renderer_rejects_oversized_dimensions_without_allocating() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let plain = crate::parse_milk::parse("");
+        let max_dim = device.limits().max_texture_dimension_2d;
+        let huge = max_dim.saturating_add(1).max(100_000);
+
+        // Construction rejects the over-limit size with a typed error mapped to a
+        // String — no panic, no giant texture/CPU-seed allocation. (MilkdropRenderer
+        // isn't Debug, so unwrap the error via `.err()` rather than `expect_err`.)
+        let err = MilkdropRenderer::new(device.clone(), queue.clone(), huge, huge, fmt, &plain)
+            .err()
+            .expect("oversized target must be rejected");
+        assert!(
+            err.contains("max_texture_dimension_2d"),
+            "unexpected error: {err}"
+        );
+
+        // A valid renderer declines an oversized try_resize with a typed error and
+        // stays usable at a subsequent valid size.
+        let mut r = MilkdropRenderer::new(device.clone(), queue.clone(), 64, 64, fmt, &plain)
+            .expect("small renderer");
+        let e = r
+            .try_resize(huge, huge)
+            .expect_err("oversized resize must be rejected");
+        assert!(matches!(
+            e,
+            DimensionError::ExceedsMaxTextureDimension { .. }
+        ));
+        r.try_resize(128, 128)
+            .expect("valid resize must still work");
+    }
+
+    // ── P2-VIS-031: FFT + waveform resample INDEPENDENTLY (no length fallback) ───
+    #[test]
+    fn resample_linear_adapts_length_without_collapsing() {
+        // Identity when lengths already match.
+        assert_eq!(resample_linear(&[0.0, 1.0, 2.0], 3), vec![0.0, 1.0, 2.0]);
+        // Empty / degenerate inputs stay empty.
+        assert!(resample_linear(&[], 8).is_empty());
+        assert!(resample_linear(&[1.0, 2.0], 0).is_empty());
+        // A single-sample source broadcasts.
+        assert_eq!(resample_linear(&[0.7], 4), vec![0.7, 0.7, 0.7, 0.7]);
+        // A constant array stays constant at any target length (the FFT case in the
+        // regression below): all-ones @512 → all-ones @480, NOT a time fallback.
+        let ones = vec![1.0f32; 512];
+        let rs = resample_linear(&ones, 480);
+        assert_eq!(rs.len(), 480);
+        assert!(rs.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        // Endpoints are preserved; interior is monotone for a ramp.
+        let ramp: Vec<f32> = (0..5).map(|i| i as f32).collect();
+        let up = resample_linear(&ramp, 9);
+        assert_eq!(up.len(), 9);
+        assert!((up[0] - 0.0).abs() < 1e-6);
+        assert!((up[8] - 4.0).abs() < 1e-6);
+        assert!(up.windows(2).all(|w| w[1] >= w[0] - 1e-6));
+    }
+
+    #[test]
+    fn resample_linear_into_reuses_audio_scratch_and_clamps_pcm() {
+        let source = [f32::NAN, -2.0, 2.0];
+        let mut scratch = Vec::<f32>::with_capacity(512);
+        let initial_ptr = scratch.as_ptr();
+        resample_linear_into(&source, 512, &mut scratch, true);
+
+        assert_eq!(scratch.len(), 512);
+        assert_eq!(scratch.as_ptr(), initial_ptr, "must reuse audio scratch");
+        assert!(scratch
+            .iter()
+            .all(|value| value.is_finite() && (-1.0..=1.0).contains(value)));
+
+        // Replacing a full row must keep the same backing allocation too.
+        let full = [0.25f32; 512];
+        resample_linear_into(&full, 512, &mut scratch, true);
+        assert_eq!(scratch.as_ptr(), initial_ptr, "must not allocate per frame");
+        assert!(scratch.iter().all(|value| (*value - 0.25).abs() < 1e-6));
+    }
+
+    // ── P2-VIS-031: a spectrum custom wave uses the FFT even when its length
+    //    differs from the PCM length (was a silent time-domain fallback) ─────────
+    #[cfg(feature = "app")]
+    #[test]
+    fn spectrum_wave_uses_fft_independent_of_pcm_length() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        // One enabled spectrum custom wave (reads freqArray, not the PCM time data).
+        let shaders = crate::parse_milk::parse(
+            "wavecode_0_enabled=1\nwavecode_0_bSpectrum=1\nwavecode_0_samples=256\nwavecode_0_a=1\n",
+        );
+        let mut r = MilkdropRenderer::new(device, queue, 64, 64, fmt, &shaders)
+            .expect("renderer with a spectrum wave");
+
+        // Silent PCM (all 0) at ONE valid length; a hot FFT (all 1) at a DIFFERENT
+        // valid length. Pre-fix, `freq.len() != max_samples` forced a time fallback,
+        // collapsing every point to value1 = 0 (x == 0). The fix resamples the FFT
+        // to the working length independently, so the wave reflects the FFT.
+        let time_l = vec![0.0f32; 480];
+        let time_r = vec![0.0f32; 480];
+        let freq = vec![1.0f32; 512];
+        let regs = [0.0f64; 100];
+
+        let mut verts: Vec<super::WaveVert> = Vec::new();
+        let mut draws: Vec<super::WaveDraw> = Vec::new();
+        r.build_custom_waves(
+            0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, &time_l, &time_r, &freq, &regs,
+            &mut verts, &mut draws,
+        );
+        assert!(!draws.is_empty(), "spectrum wave must emit geometry");
+        // With a hot FFT the point positions spread away from centre; a time-domain
+        // fallback on silent PCM would leave every x pinned at 0.
+        let max_abs_x = verts.iter().map(|v| v.pos[0].abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_abs_x > 1e-3,
+            "spectrum wave ignored the FFT (fell back to time data): max|x| = {max_abs_x}"
+        );
+    }
+
+    // ── P2-VIS-018: absurd instance/segment counts are bounded to the caps ──────
+    #[cfg(feature = "app")]
+    #[test]
+    fn absurd_shape_instance_count_is_bounded_to_the_vertex_cap() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        // A preset demanding a million 100-gon instances. Pre-fix this ran the full
+        // clamped 1024 instances × 102 verts ≈ 104k CPU verts — past the 65_536
+        // vertex-buffer cap — every frame. The bound stops before overflowing.
+        let shaders = crate::parse_milk::parse(
+            "shapecode_0_enabled=1\nshapecode_0_num_inst=1000000\nshapecode_0_sides=100\nshapecode_0_a=1\nshapecode_0_border_a=1\n",
+        );
+        let mut r = MilkdropRenderer::new(device, queue, 64, 64, fmt, &shaders)
+            .expect("renderer with an over-instanced shape");
+        let q = [0.0f64; 32];
+        let regs = [0.0f64; 100];
+        let (fill_verts, fill_draws, border_verts, _border_draws) =
+            r.build_shape_geometry(0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, &q, &regs);
+
+        // CPU geometry never exceeds the fixed vertex-buffer capacities.
+        assert!(
+            fill_verts.len() <= super::SHAPE_VERT_CAP,
+            "fill verts {} exceeded SHAPE_VERT_CAP {}",
+            fill_verts.len(),
+            super::SHAPE_VERT_CAP
+        );
+        assert!(
+            border_verts.len() <= super::BORDER_VERT_CAP,
+            "border verts {} exceeded BORDER_VERT_CAP {}",
+            border_verts.len(),
+            super::BORDER_VERT_CAP
+        );
+        // The cap actually engaged: fewer than the 1024-instance clamp were emitted
+        // (each 100-gon instance needs 102 verts, so ≤ ~642 fit), yet a healthy
+        // batch still rendered.
+        assert!(
+            fill_draws.len() < super::MAX_SHAPE_INSTANCES,
+            "cap must drop over-capacity instances (emitted {})",
+            fill_draws.len()
+        );
+        assert!(
+            fill_draws.len() > 100,
+            "expected a healthy batch of instances to fit (got {})",
+            fill_draws.len()
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn packed_shape_and_wave_geometry_storage_is_reused_between_frames() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let shaders = crate::parse_milk::parse(
+            "shapecode_0_enabled=1\nshapecode_0_num_inst=32\nshapecode_0_sides=20\nshapecode_0_a=1\nwavecode_0_enabled=1\nwavecode_0_samples=512\nwavecode_0_bUseDots=1\nwavecode_0_a=1\n",
+        );
+        let mut renderer = MilkdropRenderer::new(device, queue, 64, 64, fmt, &shaders)
+            .expect("renderer with packed geometry");
+        renderer.set_waveform(&[0.25; 512], &[-0.25; 512]);
+        let target = offscreen_target(&renderer.device, 64, 64, fmt);
+
+        renderer.render(&target);
+        assert!(!renderer.scratch.shape_fill_verts.is_empty());
+        assert!(!renderer.scratch.wave_verts.is_empty());
+        assert!(!renderer.waves[0].scratch.output.is_empty());
+        let shape_ptr = renderer.scratch.shape_fill_verts.as_ptr();
+        let shape_capacity = renderer.scratch.shape_fill_verts.capacity();
+        let wave_ptr = renderer.scratch.wave_verts.as_ptr();
+        let wave_capacity = renderer.scratch.wave_verts.capacity();
+        let custom_wave_ptr = renderer.waves[0].scratch.output.as_ptr();
+        let custom_wave_capacity = renderer.waves[0].scratch.output.capacity();
+
+        renderer.render(&target);
+        assert_eq!(renderer.scratch.shape_fill_verts.as_ptr(), shape_ptr);
+        assert_eq!(renderer.scratch.shape_fill_verts.capacity(), shape_capacity);
+        assert_eq!(renderer.scratch.wave_verts.as_ptr(), wave_ptr);
+        assert_eq!(renderer.scratch.wave_verts.capacity(), wave_capacity);
+        assert_eq!(renderer.waves[0].scratch.output.as_ptr(), custom_wave_ptr);
+        assert_eq!(
+            renderer.waves[0].scratch.output.capacity(),
+            custom_wave_capacity
+        );
+    }
+
+    // ── Feedback starts black; resize preserves runtime without seeding noise ─────
+    #[cfg(feature = "app")]
+    #[test]
+    fn resize_preserves_runtime_without_feedback_noise() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let plain = crate::parse_milk::parse("");
+        let mut r = MilkdropRenderer::new(device, queue, 64, 64, fmt, &plain).expect("renderer");
+        assert_eq!(
+            r.noise_regen_count(),
+            0,
+            "black feedback initialization must not generate seed noise"
+        );
+
+        // An in-place resize must not reset the live preset runtime. Rendering
+        // advances the frame counter; resize preserves it, then the next render
+        // continues at the following frame while using the new target dimensions.
+        let first_target = offscreen_target(&r.device, 64, 64, fmt);
+        r.render(&first_target);
+        let frame_before_resize = r.frame_idx;
+        assert!(frame_before_resize > 0);
+        r.try_resize(96, 64).expect("valid state-preserving resize");
+        assert_eq!(
+            r.frame_idx, frame_before_resize,
+            "resize must not restart time"
+        );
+        assert_eq!((r.width, r.height), (96, 64));
+        let resized_target = offscreen_target(&r.device, 96, 64, fmt);
+        r.render(&resized_target);
+        assert_eq!(
+            r.frame_idx,
+            frame_before_resize + 1,
+            "the same renderer must continue after its target resize"
+        );
+
+        // An interactive resize storm — grow, shrink, grow — must not inject
+        // feedback noise. Newly exposed texels remain black until authored draws.
+        for &(w, h) in &[
+            (96, 96),
+            (48, 48),
+            (200, 120),
+            (72, 72),
+            (256, 144),
+            (64, 64),
+        ] {
+            r.resize(w, h);
+        }
+        assert_eq!(
+            r.noise_regen_count(),
+            0,
+            "resizes must preserve black feedback initialization"
+        );
     }
 }

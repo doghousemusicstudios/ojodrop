@@ -37,20 +37,25 @@ mod hpss_bus;
 mod linkwitz_riley;
 mod onset;
 mod predictive_drop;
+mod resample;
 mod smoothing;
 mod spectrogram;
 mod structure;
 mod tempo;
 mod tonal;
+#[cfg(feature = "capture")]
 mod triple_buffer;
 
 pub use butterchurn::{
     AudioLevels as ButterchurnAudioLevels, ButterchurnLevels, DEFAULT_SAMPLE_RATE,
 };
 #[cfg(feature = "capture")]
-pub use capture::{CaptureConfig, CaptureSource};
+pub use capture::{native_loopback_available, CaptureConfig, CaptureSource};
 pub use dsp::Analyzer;
+pub use hpss::HpssHistory;
 pub use hpss_bus::{HpssBus, HpssLevels};
+#[cfg(feature = "capture")]
+pub use spectrogram::{SpectrogramPublisher, SpectrogramReader};
 pub use spectrogram::{
     SpectrogramSnapshot, SpectrogramTrail, DEFAULT_BINS as SPECTROGRAM_DEFAULT_BINS,
     DEFAULT_FRAMES as SPECTROGRAM_DEFAULT_FRAMES, SPECTROGRAM_HI_HZ, SPECTROGRAM_LO_HZ,
@@ -63,8 +68,11 @@ pub const FFT_LEN: usize = dsp::FFT_LEN;
 /// STFT hop in samples (frames advance every `HOP / sample_rate` seconds).
 pub const HOP: usize = dsp::HOP;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "capture")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "capture")]
+use std::sync::Arc;
+#[cfg(feature = "capture")]
 use std::thread::JoinHandle;
 
 /// PCM samples published with every analysis snapshot for GPU audio-texture consumers.
@@ -225,9 +233,10 @@ pub struct Features {
     /// Butterchurn-shaped FFT magnitude array (`freqArray`), 512 bins, for
     /// `bSpectrum` custom waveforms. Mono.
     pub freq_spectrum: [f32; FREQ_SPECTRUM_BINS],
-    /// Full-resolution per-sample waveform (512 samples, ~[-1,1]) at Butterchurn's
-    /// native resolution so MilkDrop waveform modes have enough samples. Mono
-    /// sources duplicate L/R.
+    /// The most recent 512 raw PCM samples (~[-1,1]) from the analysis window, in
+    /// stream order (oldest → newest), at Butterchurn's native resolution so
+    /// MilkDrop waveform modes have enough samples. This is the verbatim recent
+    /// waveform — not a peak-decimated summary. Mono sources duplicate L/R.
     pub waveform_left_full: [f32; WAVEFORM_SAMPLES_FULL],
     pub waveform_right_full: [f32; WAVEFORM_SAMPLES_FULL],
 }
@@ -330,6 +339,15 @@ pub enum AudioError {
     Config(String),
     /// The capture stream could not be built or started.
     Stream(String),
+    /// The device's sample format is not PCM and cannot be converted to f32
+    /// (e.g. DSD). The offending format is named rather than the valid device
+    /// being silently dropped (P2-AUD-016).
+    UnsupportedSampleFormat(String),
+    /// Native system-loopback capture is not available on this platform/build.
+    /// Not fatal on its own — the caller falls back to the mic and reports the
+    /// source honestly as a mic fallback (P2-AUD-022). The reason is preserved for
+    /// logging.
+    LoopbackUnavailable(String),
 }
 
 impl std::fmt::Display for AudioError {
@@ -338,30 +356,52 @@ impl std::fmt::Display for AudioError {
             AudioError::NoInputDevice => write!(f, "no default audio input device available"),
             AudioError::Config(e) => write!(f, "audio device config error: {e}"),
             AudioError::Stream(e) => write!(f, "audio stream error: {e}"),
+            AudioError::UnsupportedSampleFormat(fmt) => {
+                write!(f, "unsupported (non-PCM) sample format: {fmt}")
+            }
+            AudioError::LoopbackUnavailable(reason) => {
+                write!(f, "native system loopback unavailable: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for AudioError {}
 
-/// Ring capacity in samples. ~1 s at 48 kHz mono — generous headroom so a brief
-/// DSP-thread stall never overflows the realtime capture callback.
+/// RAII guard that clears a liveness flag when dropped — including during a panic
+/// unwind.
+///
+/// Wrapping the DSP worker body in this guarantees [`AudioEngine::is_running`] can
+/// never stay stuck `true` after the worker returns or panics (P2-AUD-010): before
+/// this, a worker that broke out of its loop (ring abandoned) or panicked left
+/// `running` set, freezing [`AudioEngine::latest`] on a stale snapshot forever.
 #[cfg(feature = "capture")]
-const RING_CAPACITY: usize = 48_000;
+struct LivenessGuard(Arc<AtomicBool>);
+
+#[cfg(feature = "capture")]
+impl Drop for LivenessGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Real-time audio analysis engine.
 ///
 /// [`AudioEngine::new`] starts capture + DSP immediately on background threads.
 /// Dropping the engine stops capture and joins the worker.
+///
+/// The analyzed-feature snapshot has exactly one consumer, normally the render
+/// thread. Consequently `AudioEngine` is deliberately not [`Sync`]: keep it on
+/// one owning thread and call [`AudioEngine::latest`] there. `latest` still takes
+/// `&self`, so repeated reads remain ergonomic inside a render loop.
 #[cfg(feature = "capture")]
 pub struct AudioEngine {
     reader: triple_buffer::Reader<Features>,
-    /// Scrolling-spectrogram trail snapshot, published by the DSP worker once per
-    /// hop and read by the render thread for GPU upload. Separate from the
-    /// lock-free `Features` triple buffer because the ring (frames × bins floats)
-    /// is far too large to copy into the per-frame `Copy` snapshot; the critical
-    /// section here is a single memcpy of a preallocated buffer.
-    spectrogram: Arc<Mutex<SpectrogramSnapshot>>,
+    /// Scrolling-spectrogram trail reader. The DSP worker publishes an immutable
+    /// `frames × bins` page once per hop by swapping an `Arc`; the render thread
+    /// reads the latest page with a single `Arc` bump (no full-ring copy under the
+    /// lock, no per-hop allocation — see [`SpectrogramPublisher`]).
+    spectrogram: SpectrogramReader,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     // Capture stream must stay alive for capture to continue (cpal stops on drop).
@@ -369,6 +409,10 @@ pub struct AudioEngine {
     device_name: String,
     sample_rate: u32,
     source: CaptureSource,
+    /// Shared count of capture-ring overruns (dropped frames = discontinuities).
+    /// Bumped by the realtime callback, surfaced via [`AudioEngine::capture_overruns`]
+    /// (P2-AUD-008).
+    overruns: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "capture")]
@@ -381,18 +425,23 @@ impl AudioEngine {
     /// Start capture + DSP with explicit capture preferences and onset sensitivity.
     /// `sensitivity` ~`0.1..3`; higher = onsets fire more readily.
     pub fn with_config(cfg: CaptureConfig, sensitivity: f32) -> Result<Self, AudioError> {
-        let (producer, consumer) = rtrb::RingBuffer::<CaptureFrame>::new(RING_CAPACITY);
         let running = Arc::new(AtomicBool::new(true));
 
         // Start capture first so we know the actual device sample rate (spec §2).
-        let cap = capture::start(producer, cfg, running.clone())?;
+        // The SPSC ring is created *inside* `start`, sized to the device's real
+        // rate (P2-AUD-008); the consumer + shared overrun counter come back here.
+        let (cap, consumer) = capture::start(cfg, running.clone())?;
         let sample_rate = cap.sample_rate;
+        // Reject a pathological device rate before the worker allocates its
+        // seconds-derived histories (dropping `cap` here stops the stream).
+        resample::validate_native_rate(sample_rate)?;
         let device_name = cap.device_name.clone();
         let source = cap.source;
+        let overruns = cap.overruns.clone();
 
         // Clear, single startup line stating which path reactivity is driven by,
         // e.g. "audio: system loopback via 'BlackHole 2ch' @ 48000 Hz" vs
-        // "audio: mic 'MacBook Pro Microphone' @ 44100 Hz".
+        // "audio: mic (loopback unavailable) via 'MacBook Pro Microphone' @ 44100 Hz".
         log::info!(
             "audio: {} via '{}' @ {} Hz",
             source.label(),
@@ -401,21 +450,34 @@ impl AudioEngine {
         );
 
         let (writer, reader) = triple_buffer::triple_buffer(Features::default());
-        // Shared spectrogram-trail snapshot. Sized to the worker's STFT so the
-        // render thread always reads a fully-formed (frames × bins) ring.
-        let spectrogram = Arc::new(Mutex::new(
-            SpectrogramTrail::new(FFT_LEN, sample_rate as f32).snapshot(),
-        ));
+        // Spectrogram-trail publisher/reader, sized to the worker's STFT so the
+        // render thread always reads a fully-formed (frames × bins) ring. The
+        // worker publishes immutable pages by Arc swap; the reader clones the Arc.
+        let (spectrogram_publisher, spectrogram) =
+            SpectrogramTrail::new(FFT_LEN, sample_rate as f32).publisher();
         let worker = {
-            let running = running.clone();
-            let spectrogram = spectrogram.clone();
+            let worker_running = running.clone();
+            let guard_running = running.clone();
+            let worker_overruns = overruns.clone();
             let params = dsp::DspParams {
                 sample_rate,
                 sensitivity,
             };
             std::thread::Builder::new()
                 .name("particle-audio-dsp".to_string())
-                .spawn(move || dsp::run(consumer, writer, spectrogram, params, running))
+                .spawn(move || {
+                    // Clear liveness on ANY exit — normal return OR panic unwind —
+                    // so is_running() can never lie about a dead worker (P2-AUD-010).
+                    let _liveness = LivenessGuard(guard_running);
+                    dsp::run(
+                        consumer,
+                        writer,
+                        spectrogram_publisher,
+                        params,
+                        worker_running,
+                        worker_overruns,
+                    );
+                })
                 .map_err(|e| AudioError::Stream(format!("failed to spawn DSP thread: {e}")))?
         };
 
@@ -428,27 +490,27 @@ impl AudioEngine {
             device_name,
             sample_rate,
             source,
+            overruns,
         })
     }
 
     /// Latest analyzed features (lock-free snapshot). Never blocks the caller.
+    /// Call from the engine's single owning/consumer thread.
     pub fn latest(&self) -> Features {
         self.reader.read()
     }
 
-    /// Clone the most recent scrolling-spectrogram trail snapshot for GPU upload.
+    /// The most recent scrolling-spectrogram trail page for GPU upload.
     ///
-    /// The DSP worker publishes the trail's `frames × bins` ring once per hop; the
-    /// render thread calls this once per frame and uploads
-    /// [`SpectrogramSnapshot::raw_ring`] as an audio texture (unwrap the ring on
-    /// the GPU using the returned write cursor). The lock is held only for the
-    /// clone of a preallocated buffer, so the audio thread is never blocked for
-    /// more than a memcpy. Returns the last good snapshot if the lock is poisoned.
-    pub fn spectrogram(&self) -> SpectrogramSnapshot {
-        match self.spectrogram.lock() {
-            Ok(snap) => snap.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+    /// The DSP worker publishes the trail's `frames × bins` ring once per hop as an
+    /// immutable [`Arc`] page; the render thread calls this once per frame and
+    /// uploads [`SpectrogramSnapshot::raw_ring`] as an audio texture (unwrap the
+    /// ring on the GPU using the returned write cursor). This is a zero-copy `Arc`
+    /// bump under a brief lock — the full ring is never copied on the read path,
+    /// and the worker never copies a full ring under the lock or allocates per hop.
+    /// Returns the last good page if the lock is poisoned.
+    pub fn spectrogram(&self) -> Arc<SpectrogramSnapshot> {
+        self.spectrogram.latest()
     }
 
     /// Human-readable name of the capture device in use.
@@ -475,8 +537,21 @@ impl AudioEngine {
     }
 
     /// Whether the engine is still running (capture + DSP active).
+    ///
+    /// Honest even after the worker exits or panics: the worker clears the
+    /// liveness flag on any exit via a drop guard, so a frozen (dead-worker)
+    /// engine reports `false` rather than staying stuck `true` (P2-AUD-010).
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    /// Number of realtime capture frames dropped on a full ring since start.
+    ///
+    /// Each dropped frame is a **discontinuity**: the audio the DSP received
+    /// before and after the drop is non-adjacent (P2-AUD-008). A steadily climbing
+    /// count means the DSP worker is not keeping up with capture.
+    pub fn capture_overruns(&self) -> u64 {
+        self.overruns.load(Ordering::Relaxed)
     }
 }
 
@@ -489,5 +564,60 @@ impl Drop for AudioEngine {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(all(test, feature = "capture"))]
+mod liveness_tests {
+    //! P2-AUD-010: a DSP worker that returns or panics must always clear the
+    //! liveness flag (never leave `is_running` stuck `true` on a dead worker), and
+    //! the worker must join predictably.
+    use super::LivenessGuard;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn liveness_guard_clears_flag_on_normal_drop() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _g = LivenessGuard(flag.clone());
+            assert!(flag.load(Ordering::Relaxed), "still live inside the scope");
+        }
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "guard must clear liveness when dropped"
+        );
+    }
+
+    #[test]
+    fn worker_panic_clears_liveness_and_join_is_predictable() {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+        let handle = std::thread::spawn(move || {
+            // The guard drops during unwind, clearing liveness even on panic.
+            let _liveness = LivenessGuard(r);
+            panic!("simulated DSP worker panic");
+        });
+        // Join returns Err on panic — predictable, not a hang or a lost thread.
+        assert!(handle.join().is_err());
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "is_running must be false after a worker panic, not stuck true"
+        );
+    }
+
+    #[test]
+    fn worker_normal_return_clears_liveness() {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+        let handle = std::thread::spawn(move || {
+            let _liveness = LivenessGuard(r);
+            // Worker body returns normally (e.g. ring abandoned / stop requested).
+        });
+        handle.join().expect("worker joins cleanly");
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "is_running must be false after the worker returns"
+        );
     }
 }

@@ -115,6 +115,16 @@ impl FilterBank {
 /// empty.
 fn triangular_band(lo: f32, hi: f32, bin_hz: f32, n_bins: usize) -> Band {
     let center = 0.5 * (lo + hi);
+    // A band whose center sits above Nyquist has no valid spectral support at this
+    // sample rate — return an empty band so `apply` reports it as zero/unavailable
+    // instead of smearing onto the top bin.
+    let nyquist_hz = bin_hz * n_bins.saturating_sub(1) as f32;
+    if !bin_hz.is_finite() || bin_hz <= 0.0 || center >= nyquist_hz {
+        return Band {
+            start_bin: 0,
+            weights: Vec::new(),
+        };
+    }
     let lo_bin = (lo / bin_hz).floor().max(0.0) as usize;
     let mut hi_bin = (hi / bin_hz).ceil() as usize;
     if hi_bin <= lo_bin {
@@ -149,6 +159,14 @@ fn log_triangular_band(lo: f32, center: f32, hi: f32, bin_hz: f32, n_bins: usize
     let lo = lo.max(1.0);
     let center = center.max(lo + f32::EPSILON);
     let hi = hi.max(center + f32::EPSILON);
+    // Above-Nyquist bands have no valid support — report them as zero/unavailable.
+    let nyquist_hz = bin_hz * n_bins.saturating_sub(1) as f32;
+    if !bin_hz.is_finite() || bin_hz <= 0.0 || center >= nyquist_hz {
+        return Band {
+            start_bin: 0,
+            weights: Vec::new(),
+        };
+    }
     let lo_bin = (lo / bin_hz).floor().max(0.0) as usize;
     let mut hi_bin = (hi / bin_hz).ceil() as usize;
     if hi_bin <= lo_bin {
@@ -431,6 +449,30 @@ mod tests {
             44_100.0,
         );
         assert_eq!(bank.len(), SPECTRUM_BANDS);
+    }
+
+    #[test]
+    fn filterbank_zeroes_bands_above_nyquist() {
+        // 2048-pt FFT @ 8 kHz → Nyquist 4 kHz. The presence (2-6 kHz, center 4 kHz)
+        // and air (6-20 kHz) macro bands sit at/above Nyquist and must read zero,
+        // while the sub band still resolves. Pre-fix these smeared onto the top bin.
+        let fft_len = 2048;
+        let sr = 8_000.0;
+        let n_bins = fft_len / 2 + 1;
+        let mag = vec![1.0f32; n_bins]; // full-scale energy in every bin
+        let bank = FilterBank::from_edges(&MACRO_BANDS_HZ, fft_len, sr);
+        let mut out = vec![0.0f32; bank.len()];
+        bank.apply(&mag, &mut out);
+        // MACRO_BANDS_HZ order: sub, bass, low_mid, mid, presence, air.
+        assert!(
+            out[0] > 0.0,
+            "sub band below Nyquist should resolve: {out:?}"
+        );
+        assert_eq!(
+            out[4], 0.0,
+            "presence band at/above Nyquist must be zero: {out:?}"
+        );
+        assert_eq!(out[5], 0.0, "air band above Nyquist must be zero: {out:?}");
     }
 
     #[test]

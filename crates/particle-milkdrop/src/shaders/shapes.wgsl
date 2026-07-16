@@ -12,12 +12,11 @@ struct VSOut {
     @location(1)       uv:    vec2<f32>,
 };
 
-// group(0): prev-frame texture (for textured shapes) + sampler + ShapeU uniform.
-// Keep this 16 bytes (matches Rust ShapeU) — avoid vec3 which would pad to 32.
-struct ShapeU { textured: f32, _p0: f32, _p1: f32, _p2: f32 };
+// group(0): prev-frame texture (for textured shapes) + sampler. The per-shape
+// textured flag is baked into a negative-UV vertex sentinel (see fs_shape), so no
+// uniform is needed here — the former ShapeU binding was removed (P2-VIS-032).
 @group(0) @binding(0) var prev_tex: texture_2d<f32>;
 @group(0) @binding(1) var prev_samp: sampler;
-@group(0) @binding(2) var<uniform> su: ShapeU;
 
 @vertex
 fn vs_shape(in: VSIn) -> VSOut {

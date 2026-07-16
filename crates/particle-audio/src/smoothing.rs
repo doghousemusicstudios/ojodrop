@@ -22,6 +22,25 @@ fn finite_or_zero(value: f32) -> f32 {
     }
 }
 
+/// Squash denormal (subnormal) magnitudes to exactly `0.0`.
+///
+/// Recursive filter/follower state that decays toward zero passes through the
+/// float subnormal range (`|x| < ~1.18e-38`), where arithmetic can cost ~100× on
+/// many CPUs. Any value this tiny is ~-600 dB — inaudible — so we flush it to a
+/// hard zero, which also prevents the state from lingering as a denormal forever.
+/// Non-finite inputs are already handled by [`finite_or_zero`] at each call site.
+#[inline]
+pub(crate) fn flush_denormal(value: f32) -> f32 {
+    // Threshold sits above the subnormal ceiling yet far below any meaningful
+    // audio state, so normal values are untouched and equivalence is preserved.
+    const DENORMAL_FLOOR: f32 = 1e-30;
+    if value.abs() < DENORMAL_FLOOR {
+        0.0
+    } else {
+        value
+    }
+}
+
 /// First-order one-pole low-pass filter. `coeff` in `0..1`: higher = smoother
 /// (more inertia). `y[n] = y[n-1] + (1-coeff) * (x[n] - y[n-1])`.
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +68,8 @@ impl OnePole {
         if !self.state.is_finite() {
             self.state = 0.0;
         }
+        // Flush a state decaying into the denormal range to a hard zero.
+        self.state = flush_denormal(self.state);
         self.state
     }
 
@@ -170,6 +191,8 @@ impl AsymEnv {
         if !self.state.is_finite() {
             self.state = 0.0;
         }
+        // Flush a state decaying into the denormal range to a hard zero.
+        self.state = flush_denormal(self.state);
         self.state
     }
 }
@@ -231,12 +254,14 @@ impl ReactiveLevel {
         }
 
         // Short rolling average: rises fast (0.2 retention), falls slower (0.5).
+        // Flush the follower to zero if it decays into the denormal range under a
+        // long run of silence (imm = 0), so it never lingers as a subnormal.
         let rate = adjust(if imm > self.avg { 0.2 } else { 0.5 });
-        self.avg = self.avg * rate + imm * (1.0 - rate);
+        self.avg = flush_denormal(self.avg * rate + imm * (1.0 - rate));
 
         // Long rolling average: very slow once warmed up.
         let rate = adjust(if self.frame < 50 { 0.9 } else { 0.992 });
-        self.long_avg = self.long_avg * rate + imm * (1.0 - rate);
+        self.long_avg = flush_denormal(self.long_avg * rate + imm * (1.0 - rate));
 
         self.frame += 1;
 
@@ -272,6 +297,56 @@ mod tests {
             lp.process(1.0);
         }
         assert!((lp.value() - 1.0).abs() < 1e-3);
+    }
+
+    /// P2-AUD-024: a one-pole decaying toward zero must flush to a hard `0.0`
+    /// without its returned state ever passing through the (CPU-expensive) f32
+    /// subnormal range. Pre-fix the state underflowed through ~20 subnormal steps.
+    #[test]
+    fn one_pole_flushes_denormals_to_zero() {
+        let mut lp = OnePole::new(0.5);
+        lp.process(1.0); // charge it
+        let mut reached_zero = false;
+        for _ in 0..400 {
+            let s = lp.process(0.0);
+            assert!(
+                !s.is_subnormal(),
+                "one-pole state entered the denormal range: {s:e}"
+            );
+            if s == 0.0 {
+                reached_zero = true;
+                break;
+            }
+        }
+        assert!(
+            reached_zero,
+            "decaying one-pole state should flush to exactly 0"
+        );
+    }
+
+    /// P2-AUD-024: the asymmetric envelope likewise flushes its decaying state to a
+    /// hard zero rather than lingering as a denormal.
+    #[test]
+    fn asym_env_flushes_denormals_to_zero() {
+        let dt = 256.0 / 48_000.0;
+        let mut env = AsymEnv::new(8.0, 60.0, dt);
+        env.process(1.0); // charge it
+        let mut reached_zero = false;
+        for _ in 0..2000 {
+            let s = env.process(0.0);
+            assert!(
+                !s.is_subnormal(),
+                "asym-env state entered the denormal range: {s:e}"
+            );
+            if s == 0.0 {
+                reached_zero = true;
+                break;
+            }
+        }
+        assert!(
+            reached_zero,
+            "decaying asym-env state should flush to exactly 0"
+        );
     }
 
     #[test]

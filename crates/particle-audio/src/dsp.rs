@@ -6,12 +6,15 @@
 //! warns about): the FFT plan, its scratch + spectrum buffers, the Hann window,
 //! and both filterbanks.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "capture")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+#[cfg(feature = "capture")]
 use std::time::Duration;
 
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
+#[cfg(feature = "capture")]
 use rtrb::Consumer;
 
 use crate::analysis::{
@@ -19,16 +22,19 @@ use crate::analysis::{
 };
 use crate::butterchurn::{self, ButterchurnLevels};
 use crate::complex_onset::ComplexOnsetDetector;
-use crate::hpss::HpssSeparator;
+use crate::hpss::{HpssHistory, HpssSeparator};
 use crate::hpss_bus::HpssBus;
 use crate::linkwitz_riley::LinkwitzRileyBank;
 use crate::onset::OnsetDetector;
 use crate::predictive_drop::DropPredictor;
-use crate::smoothing::{Agc, AsymEnv, OnePole, ReactiveLevel, SilenceGate};
-use crate::spectrogram::{SpectrogramSnapshot, SpectrogramTrail};
+use crate::smoothing::{flush_denormal, Agc, AsymEnv, OnePole, ReactiveLevel, SilenceGate};
+#[cfg(feature = "capture")]
+use crate::spectrogram::SpectrogramPublisher;
+use crate::spectrogram::SpectrogramTrail;
 use crate::structure::StructureTracker;
 use crate::tempo::TempoTracker;
 use crate::tonal;
+#[cfg(feature = "capture")]
 use crate::triple_buffer::Writer;
 use crate::{
     CaptureFrame, Features, CHROMA_BINS, FREQ_SPECTRUM_BINS, WAVEFORM_SAMPLES,
@@ -44,6 +50,15 @@ pub const HOP: usize = 512;
 /// mid 320-2800, treb 2800-11025. Deliberately wider than the 6 macro bands.
 const REACT_BAND_EDGES_HZ: [(f32, f32); 3] = [(20.0, 320.0), (320.0, 2800.0), (2800.0, 11025.0)];
 
+/// The three FFT macro bands actually consumed downstream: `sub_bass` (index 0),
+/// `low_mid` (index 2), and `presence` (index 4) from [`MACRO_BANDS_HZ`]. The
+/// `bass`/`mid`/`air` lanes (1/3/5) were computed and normalized every hop but
+/// their outputs were discarded — those `Features` fields carry the
+/// Butterchurn-normalized rails instead — so we build and normalize only these
+/// three (P2-AUD-025).
+const USED_MACRO_BANDS_HZ: [(f32, f32); 3] =
+    [MACRO_BANDS_HZ[0], MACRO_BANDS_HZ[2], MACRO_BANDS_HZ[4]];
+
 #[inline]
 fn finite_or_zero(value: f32) -> f32 {
     if value.is_finite() {
@@ -53,7 +68,13 @@ fn finite_or_zero(value: f32) -> f32 {
     }
 }
 
+#[inline]
+fn sanitize_pcm_sample(value: f32) -> f32 {
+    finite_or_zero(value).clamp(-1.0, 1.0)
+}
+
 /// Parameters the worker needs that come from the live capture device.
+#[cfg(feature = "capture")]
 pub struct DspParams {
     pub sample_rate: u32,
     /// User detection sensitivity (~0.1..3). 1.0 = neutral.
@@ -62,17 +83,24 @@ pub struct DspParams {
 
 /// Run the DSP loop until `running` is cleared (or the producer is abandoned —
 /// i.e. the capture stream/engine was dropped).
+#[cfg(feature = "capture")]
 pub fn run(
     mut consumer: Consumer<CaptureFrame>,
     mut writer: Writer<Features>,
-    spectrogram: Arc<Mutex<SpectrogramSnapshot>>,
+    mut spectrogram: SpectrogramPublisher,
     params: DspParams,
     running: Arc<AtomicBool>,
+    overruns: Arc<AtomicU64>,
 ) {
-    let sample_rate = params.sample_rate as f32;
-    let hop_dt = HOP as f32 / sample_rate;
+    // Anti-alias + decimate the native stream down to a canonical analysis rate so
+    // the fixed FFT/hop geometry and every seconds-derived history stay rate-stable
+    // (see `crate::resample`). At 44.1/48 kHz the factor is 1 (passthrough).
+    let native_rate = params.sample_rate as f32;
+    let analysis_rate = crate::resample::effective_rate(native_rate);
+    let hop_dt = HOP as f32 / analysis_rate;
+    let mut decimator = crate::resample::FrameDecimator::new(native_rate);
 
-    let mut state = DspState::new(sample_rate, hop_dt, params.sensitivity);
+    let mut state = DspState::new(analysis_rate, hop_dt, params.sensitivity);
 
     // Sliding windows: mono feeds the existing FFT/onsets; left/right are kept for
     // sampled PCM scope/audio-texture consumers.
@@ -81,9 +109,18 @@ pub fn run(
     let mut window_right = vec![0.0f32; FFT_LEN];
     // Staging area for newly drained samples before they enter the window.
     let mut pending: Vec<CaptureFrame> = Vec::with_capacity(HOP * 4);
+    // Scratch for the frames drained this pass, held separately from `pending` so
+    // `drain_pass` can fold in a capture discontinuity BEFORE they enter the window
+    // (P2-AUD-008). Reused every pass; `clear` keeps the allocation.
+    let mut incoming: Vec<CaptureFrame> = Vec::with_capacity(HOP * 4);
 
     // ~hop cadence; if the ring under-runs we simply wait and retry.
     let poll = Duration::from_micros((hop_dt * 1e6 * 0.5) as u64).max(Duration::from_micros(500));
+
+    // Capture-ring overrun watermark. When the realtime callback drops frames on a
+    // full ring it bumps this counter; an increase means the next samples to arrive
+    // are non-adjacent to what we already drained (P2-AUD-008).
+    let mut last_overruns = overruns.load(Ordering::Relaxed);
 
     while running.load(Ordering::Relaxed) {
         if consumer.is_abandoned() && consumer.slots() == 0 {
@@ -91,43 +128,51 @@ pub fn run(
             break;
         }
 
-        // Drain everything currently available (cheap; pop is lock-free).
+        // Drain everything currently available (cheap; pop is lock-free), feeding
+        // each frame through the anti-alias decimator on the way in. Staged into
+        // `incoming` (not straight into `pending`) so `drain_pass` can honor a
+        // capture discontinuity BEFORE these frames enter the sliding window.
+        incoming.clear();
         while let Ok(s) = consumer.pop() {
-            pending.push(s);
-            // Guard against unbounded growth if the worker ever falls behind.
-            if pending.len() > FFT_LEN * 8 {
-                let drop_to = pending.len() - FFT_LEN * 4;
-                pending.drain(0..drop_to);
+            if let Some(frame) = decimator.push(s) {
+                incoming.push(frame);
             }
         }
 
-        // Process as many whole hops as we have buffered.
-        while pending.len() >= HOP {
-            // Shift window left by HOP, append the next HOP samples.
-            window.copy_within(HOP.., 0);
-            window_left.copy_within(HOP.., 0);
-            window_right.copy_within(HOP.., 0);
-            let tail = FFT_LEN - HOP;
-            let mut hop_mono = [0.0f32; HOP];
-            for (i, frame) in pending.iter().take(HOP).enumerate() {
-                let mono = finite_or_zero(frame.mono);
-                window[tail + i] = mono;
-                window_left[tail + i] = finite_or_zero(frame.left);
-                window_right[tail + i] = finite_or_zero(frame.right);
-                hop_mono[i] = mono;
-            }
+        // Fold this pass into the window one whole hop at a time. `drain_pass`
+        // first honors any capture-ring discontinuity (P2-AUD-008): if the realtime
+        // callback dropped frames since the last pass it clears the stale pre-gap
+        // leftover BEFORE `incoming` is staged, so no hop can straddle the gap. It
+        // then emits every whole hop through the closure below.
+        last_overruns = drain_pass(
+            &mut pending,
+            &incoming,
+            last_overruns,
+            overruns.load(Ordering::Relaxed),
+            |hop| {
+                // Shift window left by HOP, append the next HOP samples.
+                window.copy_within(HOP.., 0);
+                window_left.copy_within(HOP.., 0);
+                window_right.copy_within(HOP.., 0);
+                let tail = FFT_LEN - HOP;
+                let mut hop_mono = [0.0f32; HOP];
+                for (i, frame) in hop.iter().enumerate() {
+                    let mono = sanitize_pcm_sample(frame.mono);
+                    window[tail + i] = mono;
+                    window_left[tail + i] = sanitize_pcm_sample(frame.left);
+                    window_right[tail + i] = sanitize_pcm_sample(frame.right);
+                    hop_mono[i] = mono;
+                }
 
-            let features = state.analyze_hop(&window, &hop_mono, &window_left, &window_right);
-            writer.write(features);
-            // Publish the scrolling-spectrogram trail for the render thread. The
-            // trail was advanced inside `analyze_hop`; copy its ring into the
-            // shared snapshot under a brief lock (a single memcpy of preallocated
-            // storage — no allocation on the audio thread).
-            if let Ok(mut snap) = spectrogram.lock() {
-                state.spectrogram.fill_snapshot(&mut snap);
-            }
-            pending.drain(0..HOP);
-        }
+                let features = state.analyze_hop(&window, &hop_mono, &window_left, &window_right);
+                writer.write(features);
+                // Publish the scrolling-spectrogram trail for the render thread. The
+                // trail was advanced inside `analyze_hop`; the publisher fills a
+                // recycled immutable page off-lock and swaps it in with a single Arc
+                // store — no full-ring copy under the lock, no per-hop allocation.
+                spectrogram.publish(&state.spectrogram);
+            },
+        );
 
         if pending.len() < HOP {
             std::thread::sleep(poll);
@@ -135,6 +180,56 @@ pub fn run(
     }
 
     log::info!("particle-audio: DSP worker exiting");
+}
+
+/// Fold one worker pass of freshly drained `incoming` frames into `pending` and
+/// emit every whole hop through `on_hop`, honoring capture-ring discontinuities
+/// (P2-AUD-008).
+///
+/// The discontinuity check runs FIRST, before `incoming` is staged: if the
+/// realtime capture callback dropped frames since the previous pass
+/// (`now_overruns` advanced past `last_overruns`), the sub-hop leftover already in
+/// `pending` is a stale PRE-gap tail — non-adjacent to the post-gap frames about
+/// to arrive — so it is dropped here. Clearing it before the append (rather than
+/// after the hop split, as the old code did) is what guarantees a pre-gap tail and
+/// a post-gap head can never be spliced into one false-continuous hop: with the
+/// old post-drain ordering, a post-gap head pushed during the same drain that
+/// consumed the pre-gap tail would already have been analyzed as one straddling
+/// hop before the flush ran. Only the sub-hop `pending` leftover is cleared; the
+/// caller's sliding FFT window ages the pre-gap samples out on its own, so it is
+/// left untouched (hard-zeroing it would inject a click).
+///
+/// With no discontinuity (`now_overruns == last_overruns`) the leftover is
+/// retained and combined with `incoming` exactly as before — the steady-state path
+/// is byte-identical. Returns the watermark to carry into the next pass.
+#[cfg(any(feature = "capture", test))]
+fn drain_pass(
+    pending: &mut Vec<CaptureFrame>,
+    incoming: &[CaptureFrame],
+    last_overruns: u64,
+    now_overruns: u64,
+    mut on_hop: impl FnMut(&[CaptureFrame]),
+) -> u64 {
+    if now_overruns != last_overruns {
+        // Capture discontinuity: drop the stale pre-gap leftover before the
+        // non-adjacent post-gap frames are staged behind it.
+        pending.clear();
+    }
+    pending.extend_from_slice(incoming);
+
+    // Guard against unbounded growth / stale backlog if the worker fell behind:
+    // shed the oldest staged frames so we analyze recent audio. Never fires on the
+    // steady-state path (pending stays a few hops deep).
+    if pending.len() > FFT_LEN * 8 {
+        let drop_to = pending.len() - FFT_LEN * 4;
+        pending.drain(0..drop_to);
+    }
+
+    while pending.len() >= HOP {
+        on_hop(&pending[..HOP]);
+        pending.drain(0..HOP);
+    }
+    now_overruns
 }
 
 /// Synchronous, thread-free, cpal-free analyzer: push raw stereo PCM per frame
@@ -148,6 +243,11 @@ pub fn run(
 /// recreating it per frame throws away all warm-up and beat tracking.
 pub struct Analyzer {
     state: DspState,
+    /// Anti-aliasing decimator bringing high native rates down to a canonical
+    /// analysis rate before windowing (see [`crate::resample`]).
+    decimator: crate::resample::FrameDecimator,
+    /// Effective analysis rate after decimation (Hz).
+    analysis_rate: f32,
     // Sliding windows: `window` (mono) feeds the FFT/onset chain; left/right are
     // kept for the sampled PCM scope / audio-texture fields.
     window: Vec<f32>,
@@ -156,22 +256,52 @@ pub struct Analyzer {
     // Staging for pushed samples awaiting a whole hop.
     pending: Vec<CaptureFrame>,
     latest: Features,
+    /// Total whole hops analyzed over this analyzer's lifetime. Monotonic; used to
+    /// verify large blocks are fully drained rather than trimmed (P2-AUD-004).
+    hops_processed: u64,
 }
 
 impl Analyzer {
     /// Create an analyzer for a fixed PCM `sample_rate` (Hz). `sensitivity`
     /// matches [`DspParams::sensitivity`] (~0.1..3, 1.0 = neutral).
+    ///
+    /// Infallible: a pathological rate is clamped into the supported band so
+    /// construction never allocates unbounded history buffers. Prefer
+    /// [`Analyzer::try_new`] to reject a bad rate explicitly.
     pub fn new(sample_rate: u32, sensitivity: f32) -> Self {
-        let sr = sample_rate as f32;
-        let hop_dt = HOP as f32 / sr;
+        Self::build(crate::resample::clamp_native_rate(sample_rate), sensitivity)
+    }
+
+    /// Fallibly create an analyzer, rejecting `0` / out-of-range sample rates
+    /// rather than building histories for a pathological rate.
+    pub fn try_new(sample_rate: u32, sensitivity: f32) -> Result<Self, crate::AudioError> {
+        crate::resample::validate_native_rate(sample_rate)?;
+        Ok(Self::build(sample_rate as f32, sensitivity))
+    }
+
+    /// Build an analyzer for an already-validated native `sample_rate` (Hz). The
+    /// DSP runs at the decimated analysis rate so the FFT geometry / hop cadence
+    /// stay rate-stable.
+    fn build(sample_rate: f32, sensitivity: f32) -> Self {
+        let analysis_rate = crate::resample::effective_rate(sample_rate);
+        let hop_dt = HOP as f32 / analysis_rate;
         Self {
-            state: DspState::new(sr, hop_dt, sensitivity),
+            state: DspState::new(analysis_rate, hop_dt, sensitivity),
+            decimator: crate::resample::FrameDecimator::new(sample_rate),
+            analysis_rate,
             window: vec![0.0f32; FFT_LEN],
             window_left: vec![0.0f32; FFT_LEN],
             window_right: vec![0.0f32; FFT_LEN],
             pending: Vec::with_capacity(HOP * 4),
             latest: Features::default(),
+            hops_processed: 0,
         }
+    }
+
+    /// Effective analysis sample rate in Hz. Equals the native rate at 44.1/48 kHz
+    /// and a decimated ~44.1/48 kHz for higher native rates.
+    pub fn analysis_sample_rate(&self) -> f32 {
+        self.analysis_rate
     }
 
     /// Push a block of PLANAR stereo samples (equal-length `left`/`right`). Runs
@@ -181,19 +311,60 @@ impl Analyzer {
     pub fn push_planar(&mut self, left: &[f32], right: &[f32]) -> &Features {
         let n = left.len().min(right.len());
         for i in 0..n {
-            let l = finite_or_zero(left[i]);
-            let r = finite_or_zero(right[i]);
+            let l = sanitize_pcm_sample(left[i]);
+            let r = sanitize_pcm_sample(right[i]);
             // Same downmix as the cpal callback (channel mean; see `capture.rs`).
             let mono = 0.5 * (l + r);
-            self.pending.push(CaptureFrame {
+            // Anti-alias + decimate to the canonical analysis rate before staging.
+            if let Some(frame) = self.decimator.push(CaptureFrame {
                 mono,
                 left: l,
                 right: r,
-            });
-            // Guard against unbounded growth if pushed faster than analyzed.
-            if self.pending.len() > FFT_LEN * 8 {
-                let drop_to = self.pending.len() - FFT_LEN * 4;
-                self.pending.drain(0..drop_to);
+            }) {
+                self.pending.push(frame);
+                // Bound the staging buffer on very large blocks by draining the
+                // whole hops accumulated so far — never discard valid samples
+                // ahead of the hop loop (P2-AUD-004). `drain_hops` leaves < HOP
+                // frames pending, so this caps memory without dropping audio.
+                if self.pending.len() >= FFT_LEN * 4 {
+                    self.drain_hops();
+                }
+            }
+        }
+        self.drain_hops();
+        &self.latest
+    }
+
+    /// Push INTERLEAVED PCM with `channels` channels. The first two channels are
+    /// preserved for stereo scope fields, matching media PCM analysis; mono
+    /// sources duplicate left to right. Samples are repaired to finite clipped
+    /// PCM before entering the analyzer.
+    pub fn push_interleaved(&mut self, samples: &[f32], channels: usize) -> &Features {
+        if channels == 0 {
+            return &self.latest;
+        }
+        for frame in samples.chunks_exact(channels) {
+            let l = sanitize_pcm_sample(frame[0]);
+            let r = if channels > 1 {
+                sanitize_pcm_sample(frame[1])
+            } else {
+                l
+            };
+            let mono = 0.5 * (l + r);
+            // Anti-alias + decimate to the canonical analysis rate before staging.
+            if let Some(frame) = self.decimator.push(CaptureFrame {
+                mono,
+                left: l,
+                right: r,
+            }) {
+                self.pending.push(frame);
+                // Bound the staging buffer on very large blocks by draining the
+                // whole hops accumulated so far — never discard valid samples
+                // ahead of the hop loop (P2-AUD-004). `drain_hops` leaves < HOP
+                // frames pending, so this caps memory without dropping audio.
+                if self.pending.len() >= FFT_LEN * 4 {
+                    self.drain_hops();
+                }
             }
         }
         self.drain_hops();
@@ -221,6 +392,7 @@ impl Analyzer {
                 &self.window_left,
                 &self.window_right,
             );
+            self.hops_processed += 1;
             self.pending.drain(0..HOP);
         }
     }
@@ -249,6 +421,10 @@ struct DspState {
 
     macro_bank: FilterBank,
     spectrum_bank: FilterBank,
+    /// Shared rolling magnitude history + time-axis (harmonic) median. Advanced
+    /// once per hop and consumed by both `hpss` and `hpss_bus`, so the median-
+    /// filtered history is stored/sorted a single time (P2-AUD-003).
+    hpss_history: HpssHistory,
     hpss: HpssSeparator,
     /// Public median-filtering harmonic/percussive dual-bus separator (scalar +
     /// ratio rails). Reuses the worker's STFT magnitude frame — no second FFT.
@@ -268,12 +444,16 @@ struct DspState {
     /// Effective frame rate of the hop cadence, fed to the Butterchurn follower.
     bc_fps: f32,
 
-    // Smoothing / normalization.
-    band_lp: [OnePole; 6],
-    band_agc: [Agc; 6],
+    // Smoothing / normalization for the three consumed macro bands
+    // (sub_bass / low_mid / presence — see `USED_MACRO_BANDS_HZ`).
+    band_lp: [OnePole; 3],
+    band_agc: [Agc; 3],
     spectrum_rails: SpectrumRailBank,
     chroma_lp: [OnePole; CHROMA_BINS],
     key_smoother: tonal::KeySmoother,
+    /// FFT-autocorrelation monophonic pitch detector (bounded per-hop work,
+    /// P2-AUD-002). Owns its FFT plan + scratch; reused every hop.
+    pitch: tonal::NsdfPitchDetector,
     rms_agc: Agc,
     rms_lp: OnePole,
     brightness_lp: OnePole,
@@ -314,8 +494,6 @@ struct DspState {
     /// Precomputed [start, stop) bin ranges over the 512-bin freq_spectrum for the
     /// three Butterchurn bands, using bucketHz = sample_rate / 1024.
     react_bins: [(usize, usize); 3],
-    /// Butterchurn equalize curve `-0.02*ln((512-i)/512)`, applied per freq bin.
-    equalize: [f32; FREQ_SPECTRUM_BINS],
     /// Seconds per hop, needed by the reactivity FPS adjustment.
     hop_dt: f32,
 }
@@ -331,7 +509,8 @@ impl DspState {
 
         let bin_hz = sample_rate / FFT_LEN as f32;
 
-        let macro_bank = FilterBank::from_edges(&MACRO_BANDS_HZ, FFT_LEN, sample_rate);
+        // Only the three consumed macro bands are built (P2-AUD-025).
+        let macro_bank = FilterBank::from_edges(&USED_MACRO_BANDS_HZ, FFT_LEN, sample_rate);
         let spectrum_bank = FilterBank::log_spaced(
             SPECTRUM_BANDS,
             SPECTRUM_LO_HZ,
@@ -353,7 +532,9 @@ impl DspState {
         let snare = OnsetDetector::new(med, 1.7, 1e-4, 60.0, 6.0, 200.0, hop_dt);
         let hat = OnsetDetector::new(med, 1.8, 1e-4, 50.0, 4.0, 120.0, hop_dt);
 
-        // Per-band smoothing: light LP + AGC with slow decay & a small floor.
+        // Per-band smoothing for the three consumed macro bands: light LP + AGC
+        // with slow decay & a small floor (identical per-lane construction, so the
+        // used-lane outputs are unchanged by dropping the discarded lanes).
         let band_lp = std::array::from_fn(|_| OnePole::new(0.4));
         let band_agc = std::array::from_fn(|_| Agc::new(0.9995, 1e-3));
         let spectrum_rails = SpectrumRailBank::new(SPECTRUM_BANDS, hop_dt);
@@ -371,10 +552,6 @@ impl DspState {
             let (lo, hi) = REACT_BAND_EDGES_HZ[i];
             (react_bin(lo), react_bin(hi))
         });
-        // Butterchurn equalize: eq[i] = -0.02 * ln((numSamps - i) / numSamps).
-        let inv_n = 1.0 / FREQ_SPECTRUM_BINS as f32;
-        let equalize: [f32; FREQ_SPECTRUM_BINS] =
-            std::array::from_fn(|i| -0.02 * (((FREQ_SPECTRUM_BINS - i) as f32) * inv_n).ln());
 
         Self {
             sample_rate,
@@ -394,10 +571,12 @@ impl DspState {
             bc_fps: 1.0 / hop_dt,
             macro_bank,
             spectrum_bank,
+            hpss_history: HpssHistory::new(n_bins, hop_dt),
             hpss: HpssSeparator::new(n_bins, sample_rate, bin_hz, hop_dt),
-            // Sized to the worker's STFT: `n_bins = FFT_LEN/2 + 1`, hop period in
-            // seconds. Both reuse `self.mag` each hop — no extra FFT.
-            hpss_bus: HpssBus::new(n_bins, hop_dt),
+            // Sized to the worker's STFT: `n_bins = FFT_LEN/2 + 1`. Both reuse
+            // `self.mag` and the shared `hpss_history` each hop — no extra FFT and
+            // no duplicate time-median sort.
+            hpss_bus: HpssBus::new(n_bins),
             spectrogram: SpectrogramTrail::new(FFT_LEN, sample_rate),
             structure: StructureTracker::new(),
             band_lp,
@@ -405,6 +584,7 @@ impl DspState {
             spectrum_rails,
             chroma_lp,
             key_smoother: tonal::KeySmoother::new(),
+            pitch: tonal::NsdfPitchDetector::new(FFT_LEN),
             rms_agc: Agc::new(0.9998, 1e-3),
             rms_lp: OnePole::new(0.5),
             brightness_lp: OnePole::new(0.5),
@@ -434,7 +614,6 @@ impl DspState {
             drop_predictor: DropPredictor::new(hop_dt),
             react: std::array::from_fn(|_| ReactiveLevel::new()),
             react_bins,
-            equalize,
             hop_dt,
         }
     }
@@ -478,15 +657,29 @@ impl DspState {
             }
         }
 
-        // --- Butterchurn freq_spectrum + volume-independent band reactivity ---
-        // Derive Butterchurn's 512-bin freqArray from our 2048-pt FFT: its bin j at
-        // bucketHz = sr/1024 = 2j*(sr/2048), i.e. our self.mag[2j]. Apply its
-        // equalize curve so the highs read at the same relative level as Butterchurn.
-        let mut freq_spectrum = [0.0f32; FREQ_SPECTRUM_BINS];
-        for j in 0..FREQ_SPECTRUM_BINS {
-            let m = self.mag.get(2 * j).copied().unwrap_or(0.0);
-            freq_spectrum[j] = self.equalize[j] * m;
+        // --- Butterchurn-parity bass/mid/treb + `_att`, freq_spectrum, reactivity ---
+        // Feed the most-recent FFT_SIZE mono samples (scaled to Butterchurn's signed
+        // -128..127 domain) into the faithful Butterchurn levels follower. Its FFT is
+        // FFT_SIZE-point, so feeding only NUM_SAMPS would zero the second transform
+        // half — feed the full window. `bc` hovers around ~1.0 because each band is
+        // divided by its long-term running average, matching the reference renderer.
+        let mut bc_time = [0.0f32; butterchurn::FFT_SIZE];
+        let tail = window.len().saturating_sub(butterchurn::FFT_SIZE);
+        for (dst, &s) in bc_time.iter_mut().zip(window[tail..].iter()) {
+            *dst = (s * 128.0).clamp(-128.0, 127.0);
         }
+        // Silence forces the MilkDrop convention val=att=1.0 (longAvg floor); the
+        // gate flag is published separately so consumers can still react.
+        let bc = self
+            .butterchurn
+            .update_signed(&bc_time, self.bc_fps, self.bc_frame);
+        self.bc_frame = self.bc_frame.saturating_add(1);
+
+        // Publish the reference-compatible Butterchurn freqArray to `bSpectrum`
+        // custom waves verbatim — the exact array Butterchurn produces (no window,
+        // signed -128..127 scaling, `equalize` curve), not a realfft approximation.
+        let mut freq_spectrum = [0.0f32; FREQ_SPECTRUM_BINS];
+        freq_spectrum.copy_from_slice(self.butterchurn.freq_array());
         // imm[i] = raw SUM of equalized bins over the band (not a mean). On silence
         // feed imm=0 so the ratios drift toward 1.0 (matches Butterchurn idle).
         let mut react_val = [1.0f32; 3];
@@ -507,42 +700,37 @@ impl DspState {
         let vol_react = (react_val[0] + react_val[1] + react_val[2]) / 3.0;
         let vol_react_att = (react_att[0] + react_att[1] + react_att[2]) / 3.0;
 
-        let hpss = self.hpss.analyze(&self.mag, is_silent, self.sensitivity);
+        // Advance the shared magnitude history once, then route both HPSS
+        // consumers through its per-bin harmonic reference so the time-axis median
+        // is stored and sorted a single time (P2-AUD-003).
+        self.hpss_history.advance(&self.mag);
+        let hpss = self.hpss.analyze(
+            &self.mag,
+            self.hpss_history.harm_ref(),
+            is_silent,
+            self.sensitivity,
+        );
 
         // Public median-filtering HPSS dual-bus rails + scrolling spectrogram.
         // Both consume the same STFT magnitude frame computed above (no second
         // FFT) and own their smoothing/normalization internally.
-        let hpss_bus = self.hpss_bus.process(&self.mag, is_silent);
+        let hpss_bus = self
+            .hpss_bus
+            .process(&self.mag, self.hpss_history.harm_ref(), is_silent);
         self.spectrogram.push(&self.mag, is_silent);
 
-        // --- macro bands → dB → AGC → LP ---
-        let mut raw_bands = [0.0f32; 6];
+        // --- macro bands → dB → AGC → LP (only the 3 consumed lanes: sub_bass,
+        //     low_mid, presence; P2-AUD-025) ---
+        let mut raw_bands = [0.0f32; 3];
         self.macro_bank.apply(&self.mag, &mut raw_bands);
-        let mut bands = [0.0f32; 6];
-        for i in 0..6 {
+        let mut bands = [0.0f32; 3];
+        for i in 0..3 {
             let db = lin_to_db_norm(raw_bands[i]);
             let agc = self.band_agc[i].process(db);
             bands[i] = self.band_lp[i].process(agc);
         }
-
-        // --- Butterchurn-parity bass/mid/treb + `_att` ---
-        // Feed the most-recent FFT_SIZE mono samples (scaled to Butterchurn's
-        // signed -128..127 domain) into the FPS-aware levels follower. Butterchurn's
-        // FFT is FFT_SIZE-point, so feeding only NUM_SAMPS would zero the second
-        // transform half — feed the full window. The result hovers around ~1.0
-        // because each band is divided by its long-term running average, matching
-        // the reference renderer's normalization.
-        let mut bc_time = [0.0f32; butterchurn::FFT_SIZE];
-        let tail = window.len().saturating_sub(butterchurn::FFT_SIZE);
-        for (dst, &s) in bc_time.iter_mut().zip(window[tail..].iter()) {
-            *dst = (s * 128.0).clamp(-128.0, 127.0);
-        }
-        // Silence forces the MilkDrop convention val=att=1.0 (longAvg floor); the
-        // gate flag is published separately so consumers can still react.
-        let bc = self
-            .butterchurn
-            .update_signed(&bc_time, self.bc_fps, self.bc_frame);
-        self.bc_frame = self.bc_frame.saturating_add(1);
+        // Named views onto the three consumed macro-band rails.
+        let (macro_sub_bass, macro_low_mid, macro_presence) = (bands[0], bands[1], bands[2]);
 
         // --- 32-band coarse spectrum ---
         let mut spectrum = [0.0f32; 32];
@@ -576,7 +764,7 @@ impl DspState {
         let raw_pitch = if is_silent {
             tonal::PitchEstimate::default()
         } else {
-            tonal::estimate_mono_pitch(window, self.sample_rate, 45.0, 1600.0)
+            self.pitch.estimate(window, self.sample_rate, 45.0, 1600.0)
         };
         let pitch_gate = if is_silent {
             0.0
@@ -690,11 +878,21 @@ impl DspState {
         let lr = self.lr_bank.process(hop_samples, is_silent);
 
         // --- predictive drop / build-up anticipation ---
-        // Energy = RMS-level rail; centroid = brightness; high = presence band;
-        // sub = sub-bass band; flux drives the activity term.
-        let drop_anticipation = self
-            .drop_predictor
-            .process(rms_norm, flux, brightness, bands[4], bands[0], is_silent);
+        // Energy must PRESERVE loudness dynamics: `rms_norm` is peak-AGC'd and sits
+        // near 1.0 during any sustained section, so its window slope collapses and
+        // the predictor sees no build-up. Feed the absolute dB-normalized loudness
+        // instead (non-saturating over the -80 dB floor), so a quiet→loud build
+        // actually ramps the prediction (P2-AUD-019). centroid = brightness;
+        // high = presence band; sub = sub-bass band; flux drives the activity term.
+        let drop_energy = lin_to_db_norm(rms);
+        let drop_anticipation = self.drop_predictor.process(
+            drop_energy,
+            flux,
+            brightness,
+            macro_presence,
+            macro_sub_bass,
+            is_silent,
+        );
         let structure = self.structure.process(
             &spectrum,
             &chroma,
@@ -710,14 +908,14 @@ impl DspState {
         self.prev_mag.copy_from_slice(&self.mag);
 
         Features {
-            sub_bass: bands[0],
+            sub_bass: macro_sub_bass,
             // `bass`/`mid`/`air` carry the Butterchurn-normalized rails (~1.0
             // baseline) that the MilkDrop drop path reads as `bass`/`mid`/`treb`.
             // `sub_bass`/`low_mid`/`presence` keep the 0..1 AGC macro bands.
             bass: bc.bass,
-            low_mid: bands[2],
+            low_mid: macro_low_mid,
             mid: bc.mid,
-            presence: bands[4],
+            presence: macro_presence,
             air: bc.treb,
             // Real Butterchurn attenuated (slow-follower) envelopes carried
             // straight through to the MilkDrop `*_att` rails (`air` maps treb).
@@ -794,33 +992,26 @@ impl DspState {
             vol_react,
             vol_react_att,
             freq_spectrum,
-            // 512-sample waveform from the 2048-sample sliding window (peak-decimated,
-            // same scheme as the 32-sample fields). The window is long enough that
-            // 512 samples is fully available — no truncation.
-            waveform_left_full: downsample_waveform_full(left),
-            waveform_right_full: downsample_waveform_full(right),
+            // The most recent WAVEFORM_SAMPLES_FULL raw samples from the sliding
+            // window — the verbatim recent waveform the field documents, at
+            // Butterchurn's native resolution (not a peak-decimated summary of the
+            // whole window; P2-AUD-007). The window is longer than the field, so
+            // this is the newest slice with no truncation.
+            waveform_left_full: recent_waveform_full(left),
+            waveform_right_full: recent_waveform_full(right),
         }
     }
 }
 
-fn downsample_waveform_full(samples: &[f32]) -> [f32; WAVEFORM_SAMPLES_FULL] {
+/// Copy the most recent [`WAVEFORM_SAMPLES_FULL`] raw PCM samples from the
+/// analysis window, in stream order (oldest → newest). This is the recent raw
+/// waveform the `waveform_*_full` fields promise — unlike the coarse 32-sample
+/// scope fields it is *not* peak-decimated. Inputs shorter than the field are
+/// right-aligned (newest at the end) and zero-padded at the front.
+fn recent_waveform_full(samples: &[f32]) -> [f32; WAVEFORM_SAMPLES_FULL] {
     let mut out = [0.0f32; WAVEFORM_SAMPLES_FULL];
-    if samples.is_empty() {
-        return out;
-    }
-    for (i, dst) in out.iter_mut().enumerate() {
-        let start = i * samples.len() / WAVEFORM_SAMPLES_FULL;
-        let end = ((i + 1) * samples.len() / WAVEFORM_SAMPLES_FULL)
-            .max(start + 1)
-            .min(samples.len());
-        let mut peak = 0.0f32;
-        for &sample in &samples[start..end] {
-            if sample.abs() > peak.abs() {
-                peak = sample;
-            }
-        }
-        *dst = peak.clamp(-1.0, 1.0);
-    }
+    let n = samples.len().min(WAVEFORM_SAMPLES_FULL);
+    out[WAVEFORM_SAMPLES_FULL - n..].copy_from_slice(&samples[samples.len() - n..]);
     out
 }
 
@@ -952,8 +1143,11 @@ impl Biquad {
             self.z2 = 0.0;
         }
         let y = self.b0 * x + self.z1;
-        self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
+        // Flush the recursive state into a hard zero once it decays into the
+        // denormal range so the filter never pays the subnormal CPU penalty
+        // (P2-AUD-024). NaN/Inf still fall through to the finite guard below.
+        self.z1 = flush_denormal(self.b1 * x - self.a1 * y + self.z2);
+        self.z2 = flush_denormal(self.b2 * x - self.a2 * y);
         if y.is_finite() && self.z1.is_finite() && self.z2.is_finite() {
             y
         } else {
@@ -987,6 +1181,9 @@ struct LoudnessTracker {
     range_lufs: Vec<f32>,
     range_write: usize,
     range_filled: usize,
+    /// Preallocated scratch reused by [`LoudnessTracker::loudness_range_lu`] so the
+    /// per-hop loudness-range estimate never allocates or fully sorts (P2-AUD-012).
+    range_scratch: Vec<f32>,
     build_env: AsymEnv,
 }
 
@@ -1003,6 +1200,7 @@ impl LoudnessTracker {
             range_lufs: vec![-100.0; range_len],
             range_write: 0,
             range_filled: 0,
+            range_scratch: Vec::with_capacity(range_len),
             build_env: AsymEnv::new(20.0, 650.0, hop_dt),
         }
     }
@@ -1087,37 +1285,41 @@ impl LoudnessTracker {
         }
     }
 
-    fn loudness_range_lu(&self) -> f32 {
+    fn loudness_range_lu(&mut self) -> f32 {
         let count = self.range_filled;
         if count < 2 {
             return 0.0;
         }
 
-        let mut values = Vec::with_capacity(count);
+        // Gather gated short-term LUFS into the reused scratch (no per-hop
+        // allocation): `clear` keeps the capacity, so this never reallocates.
+        self.range_scratch.clear();
         let mut energy_sum = 0.0f32;
+        let ring = self.range_lufs.len();
         for offset in 0..count {
-            let idx =
-                (self.range_write + self.range_lufs.len() - 1 - offset) % self.range_lufs.len();
+            let idx = (self.range_write + ring - 1 - offset) % ring;
             let lufs = self.range_lufs[idx];
             if lufs > ABS_GATE_LUFS {
                 energy_sum += lufs_to_energy(lufs);
-                values.push(lufs);
+                self.range_scratch.push(lufs);
             }
         }
-        if values.len() < 2 {
+        if self.range_scratch.len() < 2 {
             return 0.0;
         }
 
-        let preliminary_lufs = energy_to_lufs(energy_sum / values.len() as f32);
+        let preliminary_lufs = energy_to_lufs(energy_sum / self.range_scratch.len() as f32);
         let threshold = (preliminary_lufs - LRA_REL_GATE_LU).max(ABS_GATE_LUFS);
-        values.retain(|&v| v >= threshold);
-        if values.len() < 2 {
+        self.range_scratch.retain(|&v| v >= threshold);
+        if self.range_scratch.len() < 2 {
             return 0.0;
         }
 
-        values.sort_by(|a, b| a.total_cmp(b));
-        let p10 = percentile_sorted(&values, 0.10);
-        let p95 = percentile_sorted(&values, 0.95);
+        // Bounded order statistics via partial selection instead of a full sort.
+        // Both percentiles use the same linear interpolation as the old sorted
+        // path, so the result is identical to within float rounding.
+        let p10 = percentile_select(&mut self.range_scratch, 0.10);
+        let p95 = percentile_select(&mut self.range_scratch, 0.95);
         (p95 - p10).max(0.0)
     }
 }
@@ -1145,6 +1347,7 @@ fn lufs_energy_to_norm(energy: f32) -> f32 {
     lufs_to_norm(energy_to_lufs(energy))
 }
 
+#[cfg(test)]
 fn percentile_sorted(values: &[f32], p: f32) -> f32 {
     debug_assert!(!values.is_empty());
     if values.len() == 1 {
@@ -1159,6 +1362,33 @@ fn percentile_sorted(values: &[f32], p: f32) -> f32 {
         let frac = pos - lo as f32;
         values[lo] * (1.0 - frac) + values[hi] * frac
     }
+}
+
+/// Linear-interpolation percentile over an *unsorted* slice, using partial
+/// selection instead of a full sort. Reorders `values` in place but never
+/// allocates. Returns exactly the same value as [`percentile_sorted`] applied to
+/// the sorted slice (same bracketing order statistics, same interpolation).
+fn percentile_select(values: &mut [f32], p: f32) -> f32 {
+    debug_assert!(!values.is_empty());
+    let n = values.len();
+    if n == 1 {
+        return values[0];
+    }
+    let pos = p.clamp(0.0, 1.0) * (n - 1) as f32;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    // `select_nth_unstable_by` places the lo-th smallest element at index `lo`
+    // and returns the strictly-greater partition (buf[lo+1..]).
+    let (_, lo_elem, greater) = values.select_nth_unstable_by(lo, |a, b| a.total_cmp(b));
+    let lo_val = *lo_elem;
+    if hi == lo {
+        return lo_val;
+    }
+    // ceil - floor is at most 1, so the hi-th order statistic is the minimum of
+    // the greater partition.
+    let hi_val = greater.iter().copied().fold(f32::INFINITY, f32::min);
+    let frac = pos - lo as f32;
+    lo_val * (1.0 - frac) + hi_val * frac
 }
 
 /// Stateful post-processing for the 32 log spectrum bands.
@@ -1266,6 +1496,112 @@ mod tests {
             out[0] < audible * 0.2,
             "silence should drain the rail envelope: audible={audible}, silent={}",
             out[0]
+        );
+    }
+
+    #[test]
+    fn analyzer_push_interleaved_sanitizes_and_clips_samples() {
+        let mut analyzer = Analyzer::new(48_000, 1.0);
+
+        analyzer.push_interleaved(&[2.0, f32::NAN, -3.0, 0.25], 2);
+
+        assert_eq!(analyzer.pending.len(), 2);
+        assert_eq!(analyzer.pending[0].left, 1.0);
+        assert_eq!(analyzer.pending[0].right, 0.0);
+        assert_eq!(analyzer.pending[0].mono, 0.5);
+        assert_eq!(analyzer.pending[1].left, -1.0);
+        assert_eq!(analyzer.pending[1].right, 0.25);
+        assert_eq!(analyzer.pending[1].mono, -0.375);
+    }
+
+    /// A `CaptureFrame` tagged uniformly so a hop's provenance (pre-gap vs
+    /// post-gap) is visible from any single sample.
+    fn tagged_frame(tag: f32) -> CaptureFrame {
+        CaptureFrame {
+            mono: tag,
+            left: tag,
+            right: tag,
+        }
+    }
+
+    #[test]
+    fn drain_pass_no_overrun_keeps_leftover_and_stays_continuous() {
+        // A sub-hop leftover (tag -1.0) carried from the previous pass is genuinely
+        // adjacent to this pass's frames (tag +1.0): with no discontinuity it must
+        // be retained and spliced into the next hop — the unchanged steady-state
+        // path. Also proves the flush is gated strictly on the overrun watermark
+        // rather than fired unconditionally.
+        let leftover = HOP - 64;
+        let mut pending: Vec<CaptureFrame> = (0..leftover).map(|_| tagged_frame(-1.0)).collect();
+        let incoming: Vec<CaptureFrame> = (0..HOP * 2).map(|_| tagged_frame(1.0)).collect();
+        let watermark = 9u64;
+
+        let mut hops = 0usize;
+        let mut first_hop_carries_leftover = false;
+        let now = drain_pass(&mut pending, &incoming, watermark, watermark, |hop| {
+            if hops == 0 {
+                first_hop_carries_leftover = hop.iter().any(|f| f.mono == -1.0);
+            }
+            hops += 1;
+        });
+
+        assert_eq!(now, watermark, "no overrun leaves the watermark unchanged");
+        assert!(
+            first_hop_carries_leftover,
+            "no-overrun path must carry the sub-hop leftover into the next hop"
+        );
+        // (HOP-64) + 2*HOP → 2 whole hops, HOP-64 remainder still staged.
+        assert_eq!(hops, 2);
+        assert_eq!(pending.len(), leftover);
+    }
+
+    #[test]
+    fn drain_pass_discontinuity_flushes_leftover_without_splicing() {
+        // Reproduce one worker pass across a capture-ring gap. The pre-gap leftover
+        // (tag -1.0) is shorter than a hop, so on the continuous path it would
+        // splice with the post-gap head (tag +1.0) into a single straddling hop.
+        let leftover = HOP - 64;
+        let mut pending: Vec<CaptureFrame> = (0..leftover).map(|_| tagged_frame(-1.0)).collect();
+        let incoming: Vec<CaptureFrame> = (0..HOP * 3).map(|_| tagged_frame(1.0)).collect();
+        let last = 3u64;
+
+        let mut straddled = false;
+        let mut all_post_gap = true;
+        let mut hops = 0usize;
+        // Watermark advanced by one → the callback dropped frames since last pass.
+        let now = drain_pass(&mut pending, &incoming, last, last + 1, |hop| {
+            let first = hop[0].mono;
+            if hop.iter().any(|f| f.mono != first) {
+                straddled = true;
+            }
+            if first != 1.0 {
+                all_post_gap = false;
+            }
+            hops += 1;
+        });
+
+        assert_eq!(now, last + 1, "watermark carried forward");
+        assert!(
+            !straddled,
+            "no hop may splice pre-gap and post-gap samples across a capture gap"
+        );
+        assert!(
+            all_post_gap,
+            "after the discontinuity flush only post-gap audio is analyzed"
+        );
+        // Pre-gap leftover flushed → exactly the 3 whole post-gap hops remain.
+        assert_eq!(hops, 3);
+        assert!(pending.is_empty());
+
+        // The flush is load-bearing: had the leftover NOT been dropped (the old
+        // post-drain ordering), the first hop WOULD straddle the gap. Prove that
+        // counterfactual so a regression that removes/reorders the flush is caught.
+        let mut spliced: Vec<CaptureFrame> = (0..leftover).map(|_| tagged_frame(-1.0)).collect();
+        spliced.extend((0..HOP * 3).map(|_| tagged_frame(1.0)));
+        let first_hop = &spliced[..HOP];
+        assert!(
+            first_hop.iter().any(|f| f.mono == -1.0) && first_hop.iter().any(|f| f.mono == 1.0),
+            "sanity: without the flush the first hop splices pre/post-gap audio"
         );
     }
 
@@ -1507,6 +1843,112 @@ mod tests {
         );
     }
 
+    /// P2-AUD-025: only the three consumed macro lanes (sub_bass / low_mid /
+    /// presence) are built and normalized — the discarded bass/mid/air FFT lanes
+    /// and their per-lane state are gone.
+    #[test]
+    fn macro_bank_builds_only_used_lanes() {
+        let state = analysis_state();
+        assert_eq!(
+            state.band_agc.len(),
+            3,
+            "only the 3 consumed macro lanes should carry AGC state"
+        );
+        assert_eq!(
+            state.band_lp.len(),
+            3,
+            "only the 3 consumed macro lanes should carry LP state"
+        );
+        assert_eq!(
+            state.macro_bank.len(),
+            3,
+            "the macro filterbank should build only the 3 consumed bands"
+        );
+    }
+
+    /// P2-AUD-025: dropping the unused bass/mid/air macro lanes leaves the three
+    /// consumed lanes bit-for-bit unchanged. Golden values were captured from the
+    /// pre-fix 6-lane path on this exact deterministic signal.
+    #[test]
+    fn used_macro_lanes_match_prefix_golden() {
+        let mut state = analysis_state();
+        let mut window = vec![0.0f32; FFT_LEN];
+        let mut clock = 0usize;
+        let sr = 48_000.0f32;
+        let gen = |n: usize| {
+            let t = n as f32 / sr;
+            0.45 * (std::f32::consts::TAU * 40.0 * t).sin()
+                + 0.30 * (std::f32::consts::TAU * 300.0 * t).sin()
+                + 0.20 * (std::f32::consts::TAU * 3000.0 * t).sin()
+        };
+        // Asymmetric tail: keep 40 Hz loud, drop 300 Hz / 3 kHz so `presence` falls
+        // off its AGC peak to a discriminating sub-1.0 value.
+        let tail = |n: usize| {
+            let t = n as f32 / sr;
+            0.45 * (std::f32::consts::TAU * 40.0 * t).sin()
+                + 0.03
+                    * (0.30 * (std::f32::consts::TAU * 300.0 * t).sin()
+                        + 0.20 * (std::f32::consts::TAU * 3000.0 * t).sin())
+        };
+        let mut out = Features::default();
+        for _ in 0..260 {
+            out = drive_hop(&mut state, &mut window, &mut clock, gen);
+        }
+        for _ in 0..40 {
+            out = drive_hop(&mut state, &mut window, &mut clock, tail);
+        }
+        assert_eq!(out.sub_bass, 1.0, "sub_bass lane changed vs pre-fix golden");
+        assert_eq!(out.low_mid, 1.0, "low_mid lane changed vs pre-fix golden");
+        assert!(
+            (out.presence - 0.651_565_85).abs() < 1e-5,
+            "presence lane changed vs pre-fix golden 0.65156585, got {}",
+            out.presence
+        );
+    }
+
+    /// P2-AUD-019: the drop predictor must see real loudness dynamics. A
+    /// quiet→loud build should drive `drop_anticipation` up meaningfully; pre-fix
+    /// the energy fed in was the peak-AGC'd `rms_norm` (stuck near 1.0), so the
+    /// build produced no rising slope and the rail stayed near zero.
+    #[test]
+    fn drop_anticipation_rises_on_energy_build() {
+        let mut state = analysis_state();
+        let mut window = vec![0.0f32; FFT_LEN];
+        let mut clock = 0usize;
+        let sr = 48_000.0f32;
+        let osc = |n: usize, amp: f32| amp * (std::f32::consts::TAU * 200.0 * n as f32 / sr).sin();
+
+        // Quiet steady section (audible, not gated) — establishes a low baseline.
+        let mut quiet_max = 0.0f32;
+        for _ in 0..70 {
+            let out = drive_hop(&mut state, &mut window, &mut clock, |n| osc(n, 0.03));
+            quiet_max = quiet_max.max(out.drop_anticipation);
+        }
+        // Sustained build: amplitude ramps up over ~1 s.
+        let build_hops = 100usize;
+        let mut build_peak = 0.0f32;
+        for i in 0..build_hops {
+            let amp = 0.03 + 0.75 * (i as f32 / build_hops as f32);
+            let out = drive_hop(&mut state, &mut window, &mut clock, move |n| osc(n, amp));
+            build_peak = build_peak.max(out.drop_anticipation);
+        }
+
+        assert!(
+            quiet_max < 0.15,
+            "a quiet steady section should not read as a build: {quiet_max}"
+        );
+        assert!(
+            build_peak > 0.25,
+            "drop_anticipation should rise meaningfully during an energy build \
+             (pre-fix it stayed stuck near zero): build_peak={build_peak}, quiet={quiet_max}"
+        );
+        assert!(
+            build_peak > quiet_max + 0.2,
+            "the build must lift the rail well above the quiet baseline: \
+             build={build_peak}, quiet={quiet_max}"
+        );
+    }
+
     #[test]
     fn loudness_range_tracks_contrasting_sections() {
         let hop_dt = HOP as f32 / 48_000.0;
@@ -1528,6 +1970,280 @@ mod tests {
         assert!(
             max_range > 0.35,
             "contrasting sections should produce a visible LRA rail, got {max_range}"
+        );
+    }
+
+    /// P2-AUD-012: the bounded online loudness-range estimator returns exactly the
+    /// same value as the previous allocate-and-full-sort path across a long,
+    /// varied loudness stream, and never reallocates its scratch (no per-hop
+    /// allocation).
+    #[test]
+    fn loudness_range_matches_full_sort_without_reallocating() {
+        // Reference: the pre-fix gather + full-sort + interpolated percentiles.
+        fn reference_lra(t: &LoudnessTracker) -> f32 {
+            let count = t.range_filled;
+            if count < 2 {
+                return 0.0;
+            }
+            let ring = t.range_lufs.len();
+            let mut values = Vec::new();
+            let mut energy_sum = 0.0f32;
+            for offset in 0..count {
+                let idx = (t.range_write + ring - 1 - offset) % ring;
+                let lufs = t.range_lufs[idx];
+                if lufs > ABS_GATE_LUFS {
+                    energy_sum += lufs_to_energy(lufs);
+                    values.push(lufs);
+                }
+            }
+            if values.len() < 2 {
+                return 0.0;
+            }
+            let preliminary = energy_to_lufs(energy_sum / values.len() as f32);
+            let threshold = (preliminary - LRA_REL_GATE_LU).max(ABS_GATE_LUFS);
+            values.retain(|&v| v >= threshold);
+            if values.len() < 2 {
+                return 0.0;
+            }
+            values.sort_by(|a, b| a.total_cmp(b));
+            let p10 = percentile_sorted(&values, 0.10);
+            let p95 = percentile_sorted(&values, 0.95);
+            (p95 - p10).max(0.0)
+        }
+
+        let hop_dt = HOP as f32 / 48_000.0;
+        let mut loudness = LoudnessTracker::new(hop_dt);
+
+        // A long, non-trivial loudness stream so the gated percentile path (retain
+        // + interpolation) is actually exercised, not just the < 2 early return.
+        let lufs_at = |i: usize| -18.0 - 22.0 * ((i % 11) as f32 / 10.0);
+
+        // Warm past the range ring so the scratch is at full working size, then
+        // freeze the capacity we expect to hold.
+        for i in 0..2500 {
+            loudness.process(lufs_to_energy(lufs_at(i)), false);
+        }
+        let warm_capacity = loudness.range_scratch.capacity();
+
+        let mut exercised_nonzero = false;
+        for i in 2500..5000 {
+            loudness.process(lufs_to_energy(lufs_at(i)), false);
+            let got = loudness.loudness_range_lu();
+            let want = reference_lra(&loudness);
+            assert_eq!(
+                got, want,
+                "online LRA diverged from the full-sort reference at hop {i}: {got} vs {want}"
+            );
+            exercised_nonzero |= got > 0.0;
+            assert_eq!(
+                loudness.range_scratch.capacity(),
+                warm_capacity,
+                "range scratch reallocated at hop {i} — per-hop allocation regressed"
+            );
+        }
+        assert!(
+            exercised_nonzero,
+            "test signal never produced a non-zero LRA; percentile path not exercised"
+        );
+    }
+
+    /// P2-AUD-001: at a high native rate the stream is decimated to a canonical
+    /// analysis rate, so the fixed FFT/hop geometry keeps enough low-frequency
+    /// resolution to detect a bass-register pitch. Pre-fix, a 2048-sample window
+    /// at 192 kHz spanned only ~10 ms — less than one period of 55 Hz — so the
+    /// autocorrelation could not resolve the fundamental (pitch_hz stayed 0).
+    #[test]
+    fn high_native_rate_resolves_low_pitch() {
+        let native = 192_000u32;
+        let mut analyzer = Analyzer::new(native, 1.0);
+        // Decimation brings the analysis rate into the canonical band.
+        let eff = analyzer.analysis_sample_rate();
+        assert!(
+            (eff - 48_000.0).abs() < 1.0,
+            "192 kHz should decimate to ~48 kHz, got {eff}"
+        );
+
+        // ~1.4 s of a strong 55 Hz sine at the native rate.
+        let freq = 55.0f32;
+        let n = (native as f32 * 1.4) as usize;
+        let mut ch = vec![0.0f32; n];
+        for (i, s) in ch.iter_mut().enumerate() {
+            *s = 0.5 * (std::f32::consts::TAU * freq * i as f32 / native as f32).sin();
+        }
+        let out = *analyzer.push_planar(&ch, &ch);
+
+        assert_eq!(out.is_silent, 0.0, "a loud tone must not gate as silent");
+        assert!(
+            (40.0..75.0).contains(&out.pitch_hz),
+            "55 Hz fundamental should be detected after decimation, got {} Hz",
+            out.pitch_hz
+        );
+    }
+
+    /// P2-AUD-004: a large valid block must be fully drained into hops, not trimmed
+    /// down to a handful of samples before the hop loop runs. A 65,536-frame block
+    /// at a passthrough (48 kHz) rate is exactly 128 whole hops.
+    #[test]
+    fn large_block_drains_every_hop_without_trimming() {
+        let mut analyzer = Analyzer::new(48_000u32, 1.0);
+        let block = FFT_LEN * 32; // 65,536 frames
+        let ch = vec![0.05f32; block]; // any finite audio; count is what matters
+        analyzer.push_planar(&ch, &ch);
+
+        let expected = (block / HOP) as u64; // 128
+        assert_eq!(
+            analyzer.hops_processed, expected,
+            "a {block}-frame block should drain into {expected} hops, got {} (samples were trimmed)",
+            analyzer.hops_processed
+        );
+        // Staging must be left below one hop — nothing buffered, nothing dropped.
+        assert!(
+            analyzer.pending.len() < HOP,
+            "pending should hold < HOP frames after draining, got {}",
+            analyzer.pending.len()
+        );
+    }
+
+    /// P2-AUD-004 (companion): the eager mid-block drain is numerically transparent —
+    /// pushing one giant block yields the same final features and hop count as
+    /// pushing the identical signal in many small chunks.
+    #[test]
+    fn eager_drain_matches_chunked_push() {
+        let gen = |i: usize| 0.6 * (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin();
+        let total = FFT_LEN * 20;
+        let signal: Vec<f32> = (0..total).map(gen).collect();
+
+        let mut whole = Analyzer::new(48_000u32, 1.0);
+        let whole_out = *whole.push_planar(&signal, &signal);
+
+        let mut chunked = Analyzer::new(48_000u32, 1.0);
+        for chunk in signal.chunks(333) {
+            chunked.push_planar(chunk, chunk);
+        }
+        let chunked_out = *chunked.latest();
+
+        assert_eq!(
+            whole.hops_processed, chunked.hops_processed,
+            "hop counts must match regardless of push granularity"
+        );
+        assert_eq!(
+            whole_out.pitch_hz, chunked_out.pitch_hz,
+            "final features must be identical regardless of push granularity"
+        );
+        assert_eq!(whole_out.rms_level, chunked_out.rms_level);
+        assert_eq!(whole_out.harmonic_ratio, chunked_out.harmonic_ratio);
+    }
+
+    /// P2-AUD-007: `waveform_*_full` must be the verbatim most-recent raw waveform
+    /// (the newest WAVEFORM_SAMPLES_FULL samples), not signed peak buckets decimated
+    /// over the whole analysis window.
+    #[test]
+    fn waveform_full_is_recent_raw_samples_not_peak_buckets() {
+        let sample_rate = 48_000u32; // passthrough decimator — bit-identical staging
+        let mut analyzer = Analyzer::new(sample_rate, 1.0);
+
+        // A deterministic, non-monotonic signal so raw samples differ clearly from
+        // any peak-bucket decimation of the surrounding window.
+        let total = FFT_LEN * 2; // whole hops, window fully primed
+        let gen = |i: usize| 0.9 * (std::f32::consts::TAU * 300.0 * i as f32 / 48_000.0).sin();
+        let ch: Vec<f32> = (0..total).map(gen).collect();
+        let out = *analyzer.push_planar(&ch, &ch);
+
+        // The published full waveform is exactly the last WAVEFORM_SAMPLES_FULL
+        // samples of the stream, in order.
+        for (j, &got) in out.waveform_left_full.iter().enumerate() {
+            let want = gen(total - WAVEFORM_SAMPLES_FULL + j);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "waveform_left_full[{j}] = {got}, expected recent raw sample {want}"
+            );
+        }
+        assert_eq!(
+            out.waveform_right_full, out.waveform_left_full,
+            "mono-duplicated channels should match"
+        );
+
+        // Guard against a regression back to peak buckets: a 4:1 peak-decimation of
+        // the 2048-sample window would not reproduce the raw tail sample-for-sample.
+        let mut peak_buckets = [0.0f32; WAVEFORM_SAMPLES_FULL];
+        let window: Vec<f32> = (total - FFT_LEN..total).map(gen).collect();
+        for (i, dst) in peak_buckets.iter_mut().enumerate() {
+            let start = i * FFT_LEN / WAVEFORM_SAMPLES_FULL;
+            let end = ((i + 1) * FFT_LEN / WAVEFORM_SAMPLES_FULL).max(start + 1);
+            let mut peak = 0.0f32;
+            for &s in &window[start..end] {
+                if s.abs() > peak.abs() {
+                    peak = s;
+                }
+            }
+            *dst = peak;
+        }
+        assert!(
+            out.waveform_left_full != peak_buckets,
+            "waveform_full must not equal the old peak-bucket decimation"
+        );
+    }
+
+    /// P2-AUD-005: the spectrum published to `bSpectrum` custom waves must be the
+    /// exact Butterchurn `freqArray` (no window, signed -128..127 scaling, equalize
+    /// curve) — i.e. a verbatim copy of the faithful port's output, not a
+    /// Hann-windowed realfft approximation on a [-1,1] scale.
+    #[test]
+    fn freq_spectrum_is_reference_butterchurn_freq_array() {
+        let mut state = analysis_state();
+        let mut window = vec![0.0f32; FFT_LEN];
+        let mut clock = 0usize;
+        let sr = 48_000.0f32;
+        let tone = |n: usize| 0.4 * (std::f32::consts::TAU * 220.0 * n as f32 / sr).sin();
+
+        let mut out = Features::default();
+        for _ in 0..8 {
+            out = drive_hop(&mut state, &mut window, &mut clock, tone);
+        }
+
+        let reference = state.butterchurn.freq_array();
+        assert_eq!(
+            out.freq_spectrum.len(),
+            reference.len(),
+            "freq_spectrum must be the full Butterchurn freqArray"
+        );
+        for (i, (&got, &want)) in out.freq_spectrum.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(got, want, "freq_spectrum[{i}] must equal the freqArray bin");
+        }
+        assert!(
+            out.freq_spectrum.iter().any(|&v| v > 0.0),
+            "a sustained tone should populate the published freqArray"
+        );
+    }
+
+    /// P2-AUD-006: analyzer construction validates the sample rate and fails for
+    /// pathological rates instead of allocating (unbounded) histories, while the
+    /// infallible constructor clamps into the supported band.
+    #[test]
+    fn analyzer_construction_rejects_pathological_rates() {
+        // Fallible path rejects zero and out-of-range rates.
+        assert!(
+            Analyzer::try_new(0, 1.0).is_err(),
+            "zero rate must be rejected"
+        );
+        assert!(
+            Analyzer::try_new(2_000, 1.0).is_err(),
+            "sub-audio rate must be rejected"
+        );
+        assert!(
+            Analyzer::try_new(2_000_000, 1.0).is_err(),
+            "absurdly high rate must be rejected"
+        );
+        assert!(
+            Analyzer::try_new(48_000, 1.0).is_ok(),
+            "48 kHz must be accepted"
+        );
+
+        // Infallible path clamps a pathological rate into a bounded analysis rate.
+        let clamped = Analyzer::new(0, 1.0).analysis_sample_rate();
+        assert!(
+            clamped.is_finite() && clamped >= 4_000.0,
+            "new() must clamp a bad rate to a bounded analysis rate, got {clamped}"
         );
     }
 }

@@ -7,6 +7,10 @@
 //! major/minor tracker so one-frame chroma glitches do not whip the palette.
 
 use std::f32::consts::PI;
+use std::sync::Arc;
+
+use realfft::num_complex::Complex;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 pub const CHROMA_BINS: usize = 12;
 
@@ -109,14 +113,246 @@ impl KeySmoother {
     }
 }
 
-/// Clean-room mono pitch estimate using normalized autocorrelation.
+/// Clean-room mono pitch detector using FFT-based normalized autocorrelation.
 ///
-/// This is McLeod/YIN-shaped without pulling a dependency into the realtime DSP:
-/// scan lag candidates in the requested f0 range, score them with NSDF, prefer
-/// the first strong local maximum to avoid octave/subharmonic jumps, and refine
-/// the selected lag with a parabolic fit. Polyphonic/percussive rejection happens
-/// in the caller by gating this confidence with harmonic HPSS rails.
-pub fn estimate_mono_pitch(
+/// This is McLeod/YIN-shaped without pulling a GPL dependency into the realtime
+/// DSP: it computes the NSDF over the requested f0 range, prefers the first strong
+/// local maximum to avoid octave/subharmonic jumps, and refines the selected lag
+/// with a parabolic fit. Unlike the naive lag-scan (which is O(N²) per hop — the
+/// audited hot path, P2-AUD-002), the autocorrelation numerator is computed once
+/// per hop with a zero-padded real FFT (Wiener-Khinchin), so work is
+/// O(N log N) and bounded by a fixed window cap while the pitch — including the
+/// bass register — is preserved bit-for-bit within FFT rounding.
+///
+/// STATEFUL only for buffer reuse (FFT plan + scratch): the estimate itself is a
+/// pure function of the current window. Polyphonic/percussive rejection still
+/// happens in the caller by gating this confidence with the harmonic HPSS rails.
+pub struct NsdfPitchDetector {
+    /// Analysis window cap (samples). Longer inputs use the most recent
+    /// `max_window` samples so per-hop work stays bounded.
+    max_window: usize,
+    /// FFT length: the smallest power of two ≥ `2 * max_window`, so the circular
+    /// autocorrelation from the FFT equals the linear autocorrelation for every
+    /// lag the detector inspects (`tau ≤ n/2`).
+    fft_len: usize,
+    fft: Arc<dyn RealToComplex<f32>>,
+    ifft: Arc<dyn ComplexToReal<f32>>,
+    /// Mean-subtracted, zero-padded window (also consumed as FFT scratch).
+    time: Vec<f32>,
+    /// Forward FFT output, reused as the power spectrum / inverse FFT input.
+    freq: Vec<Complex<f32>>,
+    /// Shared FFT scratch (sized for both directions).
+    scratch: Vec<Complex<f32>>,
+    /// Inverse FFT output — the (unnormalized) autocorrelation.
+    acf: Vec<f32>,
+    /// Cumulative sum of squares of the mean-subtracted window (`n + 1` entries)
+    /// for the NSDF denominator in O(1) per lag.
+    cumsq: Vec<f32>,
+    /// NSDF values for lags `0..=max_tau`, reused each hop.
+    nsdf: Vec<f32>,
+}
+
+impl NsdfPitchDetector {
+    /// Build a detector for windows up to `max_window` samples.
+    pub fn new(max_window: usize) -> Self {
+        let max_window = max_window.max(32);
+        let fft_len = (2 * max_window).next_power_of_two();
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(fft_len);
+        let ifft = planner.plan_fft_inverse(fft_len);
+        let scratch_len = fft.get_scratch_len().max(ifft.get_scratch_len());
+        Self {
+            max_window,
+            fft_len,
+            time: vec![0.0; fft_len],
+            freq: vec![Complex::new(0.0, 0.0); fft_len / 2 + 1],
+            scratch: vec![Complex::new(0.0, 0.0); scratch_len],
+            acf: vec![0.0; fft_len],
+            cumsq: vec![0.0; max_window + 1],
+            nsdf: vec![0.0; max_window / 2 + 1],
+            fft,
+            ifft,
+        }
+    }
+
+    /// The analysis window cap in samples (per-hop work is bounded by this).
+    #[cfg(test)]
+    pub(crate) fn max_window(&self) -> usize {
+        self.max_window
+    }
+
+    /// Estimate the monophonic fundamental over `samples` (the most recent
+    /// `max_window` are used). Mirrors the reference NSDF estimator but computes
+    /// the autocorrelation with one FFT instead of an O(N²) lag scan.
+    pub fn estimate(
+        &mut self,
+        samples: &[f32],
+        sample_rate: f32,
+        lo_hz: f32,
+        hi_hz: f32,
+    ) -> PitchEstimate {
+        if sample_rate <= 0.0 || hi_hz <= lo_hz {
+            return PitchEstimate::default();
+        }
+        // Bound the analysis window (P2-AUD-002): never inspect more than the cap.
+        let n = samples.len().min(self.max_window);
+        if n < 32 {
+            return PitchEstimate::default();
+        }
+        let samples = &samples[samples.len() - n..];
+
+        let min_tau = (sample_rate / hi_hz.max(1.0)).round().max(2.0) as usize;
+        let max_tau = (sample_rate / lo_hz.max(1.0)).round().min((n / 2) as f32) as usize;
+        if min_tau + 2 >= max_tau {
+            return PitchEstimate::default();
+        }
+
+        let mean = samples.iter().copied().sum::<f32>() / n as f32;
+
+        // Mean-subtract into the zero-padded FFT input and accumulate the
+        // cumulative sum of squares in the same pass (used for the NSDF
+        // denominator and the RMS gate) — done BEFORE the FFT consumes `time`.
+        for (dst, &s) in self.time[..n].iter_mut().zip(samples) {
+            *dst = s - mean;
+        }
+        for slot in self.time[n..].iter_mut() {
+            *slot = 0.0;
+        }
+        let mut sumsq = 0.0f32;
+        self.cumsq[0] = 0.0;
+        for i in 0..n {
+            let y = self.time[i];
+            sumsq += y * y;
+            self.cumsq[i + 1] = sumsq;
+        }
+        let rms = (sumsq / n as f32).sqrt();
+        if rms < 1e-4 {
+            return PitchEstimate::default();
+        }
+
+        // Autocorrelation via FFT (Wiener-Khinchin): r(tau) = IFFT(|FFT(y)|²) /
+        // fft_len. The zero-padding to ≥ 2n makes the circular result equal the
+        // linear autocorrelation for all lags we inspect.
+        self.fft
+            .process_with_scratch(&mut self.time, &mut self.freq, &mut self.scratch)
+            .expect("pitch forward FFT length invariant");
+        for c in self.freq.iter_mut() {
+            let power = c.re * c.re + c.im * c.im;
+            c.re = power;
+            c.im = 0.0;
+        }
+        self.ifft
+            .process_with_scratch(&mut self.freq, &mut self.acf, &mut self.scratch)
+            .expect("pitch inverse FFT length invariant");
+
+        let inv_fft = 1.0 / self.fft_len as f32;
+        let total = self.cumsq[n];
+        for tau in 0..=max_tau {
+            let r = self.acf[tau] * inv_fft;
+            // energy(tau) = Σ y[i]² + Σ y[i+tau]² over the overlap i∈[0, n-tau).
+            let energy = self.cumsq[n - tau] + total - self.cumsq[tau];
+            self.nsdf[tau] = if energy <= 1e-12 {
+                0.0
+            } else {
+                (2.0 * r / energy).clamp(-1.0, 1.0)
+            };
+        }
+
+        nsdf_peak_pick(
+            &self.nsdf[..=max_tau],
+            min_tau,
+            max_tau,
+            rms,
+            sample_rate,
+            lo_hz,
+            hi_hz,
+        )
+    }
+}
+
+/// Pick the pitch from a precomputed NSDF curve (`nsdf[tau]` for `tau` in
+/// `0..=max_tau`). Shared by the FFT detector and the reference lag-scan so both
+/// resolve the fundamental identically; only the NSDF *source* differs.
+fn nsdf_peak_pick(
+    nsdf: &[f32],
+    min_tau: usize,
+    max_tau: usize,
+    rms: f32,
+    sample_rate: f32,
+    lo_hz: f32,
+    hi_hz: f32,
+) -> PitchEstimate {
+    let mut prev_prev = nsdf[min_tau - 1];
+    let mut prev = nsdf[min_tau];
+    let mut best_tau = 0usize;
+    let mut best_peak = 0.0f32;
+    let mut first_strong_tau = 0usize;
+    let mut first_strong_peak = 0.0f32;
+
+    for tau in (min_tau + 1)..=max_tau {
+        let curr = nsdf[tau];
+        let peak_tau = tau - 1;
+        if prev > prev_prev && prev >= curr && prev > 0.0 {
+            if prev > best_peak {
+                best_peak = prev;
+                best_tau = peak_tau;
+            }
+            if first_strong_tau == 0 && prev >= 0.72 {
+                first_strong_tau = peak_tau;
+                first_strong_peak = prev;
+            }
+        }
+        prev_prev = prev;
+        prev = curr;
+    }
+
+    if best_tau == 0 || best_peak < 0.45 {
+        return PitchEstimate::default();
+    }
+
+    let chosen_tau = if first_strong_tau != 0 && first_strong_peak >= best_peak * 0.88 {
+        first_strong_tau
+    } else {
+        best_tau
+    };
+
+    let left = nsdf[chosen_tau.saturating_sub(1)];
+    let center = nsdf[chosen_tau];
+    let right = nsdf[(chosen_tau + 1).min(max_tau)];
+    let denom = left - 2.0 * center + right;
+    let offset = if denom.abs() > 1e-6 {
+        (0.5 * (left - right) / denom).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    let tau = (chosen_tau as f32 + offset).max(1.0);
+    let hz = sample_rate / tau;
+    if !hz.is_finite() || hz < lo_hz * 0.8 || hz > hi_hz * 1.2 {
+        return PitchEstimate::default();
+    }
+
+    let confidence = (((center.max(best_peak) - 0.45) / 0.5).clamp(0.0, 1.0)
+        * (rms / 0.01).clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
+    PitchEstimate {
+        hz,
+        normalized: pitch_norm_from_hz(hz),
+        confidence,
+    }
+}
+
+pub fn pitch_norm_from_hz(hz: f32) -> f32 {
+    if hz <= 0.0 || !hz.is_finite() {
+        return 0.0;
+    }
+    ((hz / PITCH_NORM_LO_HZ).log2() / (PITCH_NORM_HI_HZ / PITCH_NORM_LO_HZ).log2()).clamp(0.0, 1.0)
+}
+
+/// Reference lag-scan NSDF estimator (the pre-P2-AUD-002 O(N²) implementation),
+/// retained as the correctness oracle for [`NsdfPitchDetector`]. Compiled only in
+/// test builds — the realtime path uses the FFT detector.
+#[cfg(test)]
+pub(crate) fn estimate_mono_pitch(
     samples: &[f32],
     sample_rate: f32,
     lo_hz: f32,
@@ -147,72 +383,15 @@ pub fn estimate_mono_pitch(
         return PitchEstimate::default();
     }
 
-    let mut prev_prev = nsdf_at(samples, mean, min_tau - 1);
-    let mut prev = nsdf_at(samples, mean, min_tau);
-    let mut best_tau = 0usize;
-    let mut best_peak = 0.0f32;
-    let mut first_strong_tau = 0usize;
-    let mut first_strong_peak = 0.0f32;
-
-    for tau in (min_tau + 1)..=max_tau {
-        let curr = nsdf_at(samples, mean, tau);
-        let peak_tau = tau - 1;
-        if prev > prev_prev && prev >= curr && prev > 0.0 {
-            if prev > best_peak {
-                best_peak = prev;
-                best_tau = peak_tau;
-            }
-            if first_strong_tau == 0 && prev >= 0.72 {
-                first_strong_tau = peak_tau;
-                first_strong_peak = prev;
-            }
-        }
-        prev_prev = prev;
-        prev = curr;
+    // Build the NSDF curve with the direct lag scan, then share the peak picker.
+    let mut nsdf = vec![0.0f32; max_tau + 1];
+    for (tau, slot) in nsdf.iter_mut().enumerate() {
+        *slot = nsdf_at(samples, mean, tau);
     }
-
-    if best_tau == 0 || best_peak < 0.45 {
-        return PitchEstimate::default();
-    }
-
-    let chosen_tau = if first_strong_tau != 0 && first_strong_peak >= best_peak * 0.88 {
-        first_strong_tau
-    } else {
-        best_tau
-    };
-
-    let left = nsdf_at(samples, mean, chosen_tau.saturating_sub(1));
-    let center = nsdf_at(samples, mean, chosen_tau);
-    let right = nsdf_at(samples, mean, (chosen_tau + 1).min(max_tau));
-    let denom = left - 2.0 * center + right;
-    let offset = if denom.abs() > 1e-6 {
-        (0.5 * (left - right) / denom).clamp(-0.5, 0.5)
-    } else {
-        0.0
-    };
-    let tau = (chosen_tau as f32 + offset).max(1.0);
-    let hz = sample_rate / tau;
-    if !hz.is_finite() || hz < lo_hz * 0.8 || hz > hi_hz * 1.2 {
-        return PitchEstimate::default();
-    }
-
-    let confidence = (((center.max(best_peak) - 0.45) / 0.5).clamp(0.0, 1.0)
-        * (rms / 0.01).clamp(0.0, 1.0))
-    .clamp(0.0, 1.0);
-    PitchEstimate {
-        hz,
-        normalized: pitch_norm_from_hz(hz),
-        confidence,
-    }
+    nsdf_peak_pick(&nsdf, min_tau, max_tau, rms, sample_rate, lo_hz, hi_hz)
 }
 
-pub fn pitch_norm_from_hz(hz: f32) -> f32 {
-    if hz <= 0.0 || !hz.is_finite() {
-        return 0.0;
-    }
-    ((hz / PITCH_NORM_LO_HZ).log2() / (PITCH_NORM_HI_HZ / PITCH_NORM_LO_HZ).log2()).clamp(0.0, 1.0)
-}
-
+#[cfg(test)]
 fn nsdf_at(samples: &[f32], mean: f32, tau: usize) -> f32 {
     if tau == 0 || tau >= samples.len() {
         return 0.0;
@@ -438,6 +617,52 @@ mod tests {
         (0..n)
             .map(|i| (2.0 * PI * hz * i as f32 / sample_rate).sin() * 0.75)
             .collect()
+    }
+
+    /// P2-AUD-002: the FFT-autocorrelation detector resolves the same pitch as the
+    /// reference O(N²) lag scan (within FFT rounding) across the whole range,
+    /// including the bass register, and caps its analysis window so per-hop work is
+    /// bounded regardless of input length.
+    #[test]
+    fn fft_detector_matches_reference_across_range_with_bounded_window() {
+        let sample_rate = 48_000.0;
+        let mut det = NsdfPitchDetector::new(2048);
+        assert_eq!(det.max_window(), 2048, "analysis window must be capped");
+
+        // Bass through upper-mid — the bass tones exercise the low-f0 range the
+        // audit requires the detector to keep resolving.
+        for &hz in &[55.0f32, 82.5, 110.0, 220.0, 440.0, 660.0] {
+            let sig = sine(hz, sample_rate, 2048);
+            let reference = estimate_mono_pitch(&sig, sample_rate, 45.0, 1600.0);
+            let got = det.estimate(&sig, sample_rate, 45.0, 1600.0);
+            assert!(
+                (got.hz - reference.hz).abs() < 0.5,
+                "FFT pitch {} Hz diverged from reference {} Hz at {hz} Hz",
+                got.hz,
+                reference.hz
+            );
+            assert!(
+                (got.confidence - reference.confidence).abs() < 0.02,
+                "confidence diverged at {hz} Hz: {} vs {}",
+                got.confidence,
+                reference.confidence
+            );
+            assert!(
+                (got.hz - hz).abs() < (hz * 0.01).max(1.0),
+                "detected pitch {} strayed from true {hz} Hz",
+                got.hz
+            );
+        }
+
+        // A window longer than the cap is accepted (recent samples only) — work
+        // stays bounded by max_window, and the estimate still tracks the tone.
+        let long = sine(220.0, sample_rate, 8192);
+        let got = det.estimate(&long, sample_rate, 45.0, 1600.0);
+        assert!(
+            (got.hz - 220.0).abs() < 2.0,
+            "capped-window estimate should still resolve 220 Hz, got {}",
+            got.hz
+        );
     }
 
     #[test]

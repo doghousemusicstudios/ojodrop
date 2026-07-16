@@ -9,35 +9,40 @@
 //! `Info.plist` `NSAudioCaptureUsageDescription`, and the user must approve the
 //! one-time system prompt).
 //!
-//! Status: **structured stub.** The full process-tap dance (create a
-//! system-output process tap, wrap it in a private aggregate device, install an
-//! `AudioDeviceIOProc`, and bridge its render callback into the `rtrb` ring) is a
-//! large, permission-gated chunk of `objc2-core-audio` FFI that cannot be
-//! exercised in CI (no audio device, no TCC grant). Rather than ship an untested
-//! native callback path, [`try_open_process_tap`] declines (returns the producer
-//! unchanged) after a clear log line, so the caller's fallback chain proceeds to
-//! the default input. Everything here is `#[cfg(target_os = "macos")]`-gated and
-//! the TODO below marks exactly where the native callback slots in.
+//! Status: **structured stub (BLOCKED under CI-011).** The full process-tap dance
+//! (create a system-output process tap, wrap it in a private aggregate device,
+//! install an `AudioDeviceIOProc`, and bridge its render callback into an `rtrb`
+//! ring) is a large, permission-gated chunk of `objc2-core-audio` FFI that cannot
+//! be exercised in CI (no audio device, no TCC grant). Rather than ship an
+//! untested native callback path, [`try_open_process_tap`] declines — returning
+//! [`TapOutcome::Declined`] with an honest reason — so the caller reports loopback
+//! UNAVAILABLE and falls back to the mic *labeled as a mic fallback*, never
+//! mislabeling it as loopback (P2-AUD-022). Everything here is
+//! `#[cfg(target_os = "macos")]`-gated and the TODO below marks exactly where the
+//! native callback slots in.
 //!
 //! Why this is safe to gate this way: cpal 0.18 already pulls in the entire
 //! `objc2-core-audio` / `objc2-core-audio-types` / `objc2-foundation` stack
 //! transitively (all MIT/Apache), so wiring the real tap later needs **no new
 //! GPL/proprietary deps** — just the FFI calls listed in the TODO.
 
-use rtrb::Producer;
+use rtrb::Consumer;
 
 use crate::CaptureFrame;
 
 /// A live CoreAudio process-tap capture (aggregate device + IOProc).
 ///
 /// When the native tap is implemented this owns the aggregate device's
-/// `AudioDeviceIOProcID` + `AudioObjectID` so capture is torn down on `Drop`,
-/// mirroring how cpal's `Stream` keeps capture alive. Empty for the stub.
+/// `AudioDeviceIOProcID` + `AudioObjectID` (torn down on `Drop`, mirroring how
+/// cpal's `Stream` keeps capture alive) plus the ring [`Consumer`] the caller
+/// hands to the DSP worker. Empty for the stub.
 #[allow(dead_code)]
 pub struct ProcessTapCapture {
     pub sample_rate: u32,
     pub channels: u16,
     pub device_name: String,
+    /// Ring consumer the caller bridges to the DSP worker once the tap is live.
+    pub consumer: Consumer<CaptureFrame>,
 }
 
 /// Outcome of attempting the process-tap path.
@@ -47,19 +52,19 @@ pub struct ProcessTapCapture {
 /// `dead_code` is expected here until the tap is wired.
 #[allow(dead_code)]
 pub enum TapOutcome {
-    /// A live tap was opened; capture is running into the ring.
+    /// A live tap was opened; capture is running into the ring the capture owns.
     Opened(ProcessTapCapture),
-    /// Tap unavailable / unimplemented — caller should fall back. The producer is
-    /// handed back unchanged so the next rung can reuse the same ring.
-    Declined(Producer<CaptureFrame>),
+    /// Tap unavailable / unimplemented — caller should fall back. Carries an honest
+    /// reason string so the caller can preserve the diagnostic while proceeding to
+    /// the mic (P2-AUD-022/023).
+    Declined(String),
 }
 
-/// Try to open the system-output process-tap loopback and stream raw frames into
-/// `producer`.
+/// Try to open the system-output process-tap loopback.
 ///
-/// On decline the producer is returned via [`TapOutcome::Declined`] so the caller
-/// can open the default input with the same ring (no rebuild needed).
-pub fn try_open_process_tap(producer: Producer<CaptureFrame>) -> TapOutcome {
+/// On decline, returns [`TapOutcome::Declined`] with the reason so the caller can
+/// continue its fallback chain and report the source honestly.
+pub fn try_open_process_tap() -> TapOutcome {
     // TODO(macos-tap): implement the AudioCap-style process tap. The shape is:
     //   1. Build a CATapDescription for the system output (stereo, mixdown) and
     //      call `AudioHardwareCreateProcessTap` → tap AudioObjectID.
@@ -68,20 +73,24 @@ pub fn try_open_process_tap(producer: Producer<CaptureFrame>) -> TapOutcome {
     //      `kAudioAggregateDeviceIsPrivateKey = 1` and
     //      `kAudioAggregateDeviceTapListKey = [ <tap UID> ]`.
     //   3. Read the aggregate device's actual nominal sample rate + channel count
-    //      (BlackHole/aggregate rates vary: 44.1k/48k/96k — never assume 48k).
+    //      (BlackHole/aggregate rates vary: 44.1k/48k/96k — never assume 48k) and
+    //      create the `rtrb` ring sized by seconds*rate (see `capture::ring_capacity`).
     //   4. `AudioDeviceCreateIOProcID` + `AudioDeviceStart`; in the IOProc,
-    //      preserve L/R, downmix to mono, and `producer.push(CaptureFrame { .. })`
-    //      with NO alloc / NO locks (same realtime discipline as capture.rs).
+    //      downmix to the front-L/R triple and push into the ring with NO alloc /
+    //      NO locks, bumping a shared overrun counter on a full ring (same realtime
+    //      discipline + discontinuity marking as capture.rs).
     //   5. Keep the IOProcID + aggregate AudioObjectID in `ProcessTapCapture` and
     //      tear them down in `Drop` (`AudioDeviceStop`, destroy proc id, destroy
-    //      aggregate, destroy tap).
+    //      aggregate, destroy tap); return `TapOutcome::Opened`.
     // All FFI is available via objc2-core-audio (already a transitive dep). Until
     // it is implemented and testable on a real 14.6+ machine with the TCC grant,
     // we decline cleanly so the fallback path takes over.
     log::info!(
         "particle-audio: macOS CoreAudio process-tap loopback not yet wired \
          (needs TCC audio-capture + Info.plist NSAudioCaptureUsageDescription); \
-         falling back to default-input selection"
+         reporting loopback unavailable and falling back to default-input selection"
     );
-    TapOutcome::Declined(producer)
+    TapOutcome::Declined(
+        "macOS CoreAudio process-tap not wired (needs TCC audio-capture grant)".to_string(),
+    )
 }

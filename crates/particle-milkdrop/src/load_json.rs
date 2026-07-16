@@ -108,6 +108,7 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
 
         decay: f("decay", 0.98),
         gamma_adj: f("gammaadj", 2.0),
+        fshader: f("fshader", 0.0),
 
         echo_zoom: f("echo_zoom", 2.0),
         echo_alpha: f("echo_alpha", 0.0),
@@ -452,6 +453,19 @@ mod tests {
     }
 
     #[test]
+    fn json_custom_wave_sep_120_survives_load() {
+        // P2-VIS-011: a numeric custom-wave sep of 120 must survive the JSON
+        // importer as 120, not collapse to a boolean 1.
+        let json = r#"{"waves":[{"baseVals":{"enabled":1,"sep":120}}]}"#;
+        let s = load(json).expect("load json");
+        assert_eq!(s.waves.len(), 1);
+        assert_eq!(
+            s.waves[0].sep, 120,
+            "numeric sep was coerced (expected 120)"
+        );
+    }
+
+    #[test]
     fn loads_sherwin_basevals() {
         let json = include_str!("test_data/sherwin_maxawow.json");
         let s = load(json).expect("load sherwin_maxawow.json");
@@ -470,6 +484,7 @@ mod tests {
         assert!((s.zoomexp - 0.1584).abs() < 1e-4);
         // warp scalar 0.01, fshader 1, mv_x 64, mv_y 48, ib_a 1, ob_a 1.
         assert!((s.warp_amount - 0.01).abs() < 1e-4);
+        assert!((s.fshader - 1.0).abs() < 1e-4);
         assert!((s.mv_x - 64.0).abs() < 1e-4);
         assert!((s.mv_y - 48.0).abs() < 1e-4);
         // darken is 1 → true; wave_thick 1 → true.

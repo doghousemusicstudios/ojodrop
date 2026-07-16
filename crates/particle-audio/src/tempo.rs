@@ -242,24 +242,11 @@ impl TempoTracker {
         let min_lag = min_lag.max(1);
         let max_lag = max_lag.min(n / 2).max(min_lag + 1);
 
-        // Energy at lag 0 for normalization.
-        let energy: f32 = sig.iter().map(|s| s * s).sum::<f32>().max(1e-9);
-
-        let mut best_lag = 0usize;
-        let mut best_score = 0.0f32;
-        let mut scores = vec![0.0f32; max_lag + 1];
-        for lag in min_lag..=max_lag {
-            let mut acc = 0.0f32;
-            for i in lag..n {
-                acc += sig[i] * sig[i - lag];
-            }
-            let score = acc / energy;
-            scores[lag] = score;
-            if score > best_score {
-                best_score = score;
-                best_lag = lag;
-            }
-        }
+        // Overlap-normalized autocorrelation: each lag is divided by the energy of
+        // its *actually-overlapping* region, not the full-window energy, so short
+        // lags (which sum more terms) are no longer inflated relative to long lags
+        // (P2-AUD-018). Without this the estimate biases toward high BPM.
+        let (scores, best_lag, best_score) = normalized_autocorr(&sig, min_lag, max_lag);
 
         if best_lag == 0 || best_score <= 0.0 {
             // No clear periodicity → bleed off confidence.
@@ -288,6 +275,51 @@ impl TempoTracker {
         }
         self.confidence += 0.2 * (raw_conf - self.confidence);
     }
+}
+
+/// Overlap-normalized autocorrelation of `sig` over lags `[min_lag, max_lag]`.
+///
+/// The correlation numerator at lag `L` sums `n - L` products, so dividing every
+/// lag by the same full-window energy inflates short lags (fewer-term long lags
+/// look weaker) and biases the tempo estimate toward high BPM. Instead each lag is
+/// normalized by the geometric mean of the energies of the two actually-
+/// overlapping regions — `sqrt(E_a · E_b)` where `E_a = Σ_{i≥L} x[i]²` and
+/// `E_b = Σ_{i<n-L} x[i]²`. That yields a Pearson-style coefficient in roughly
+/// `[-1, 1]` that is unbiased across lags (P2-AUD-018).
+///
+/// Prefix sums of squares make the per-lag energies `O(1)`, so the total cost is
+/// the same order as the raw correlation. Returns `(scores_by_lag, best_lag,
+/// best_score)` with `scores` indexed by lag (`0..=max_lag`).
+fn normalized_autocorr(sig: &[f32], min_lag: usize, max_lag: usize) -> (Vec<f32>, usize, f32) {
+    let n = sig.len();
+    let mut prefix_sq = vec![0.0f32; n + 1];
+    for i in 0..n {
+        prefix_sq[i + 1] = prefix_sq[i] + sig[i] * sig[i];
+    }
+    let mut scores = vec![0.0f32; max_lag + 1];
+    let mut best_lag = 0usize;
+    let mut best_score = 0.0f32;
+    for lag in min_lag..=max_lag {
+        if lag >= n {
+            break;
+        }
+        let mut acc = 0.0f32;
+        for i in lag..n {
+            acc += sig[i] * sig[i - lag];
+        }
+        // Energy of the tail [lag, n) and of the head [0, n-lag) — the two spans
+        // the lagged product actually correlates.
+        let e_a = prefix_sq[n] - prefix_sq[lag];
+        let e_b = prefix_sq[n - lag];
+        let denom = (e_a * e_b).sqrt().max(1e-9);
+        let score = acc / denom;
+        scores[lag] = score;
+        if score > best_score {
+            best_score = score;
+            best_lag = lag;
+        }
+    }
+    (scores, best_lag, best_score)
 }
 
 /// Choose between a tempo and its octave variants (×2, ÷2) by combining
@@ -366,6 +398,78 @@ mod tests {
             "estimated bpm {} not near {}",
             last.bpm,
             bpm
+        );
+    }
+
+    /// P2-AUD-018: with overlap normalization the autocorrelation peaks at the
+    /// true (fundamental) period; the pre-fix full-window normalization inflates
+    /// the shorter half-period lag and mis-peaks there — the classic double-tempo
+    /// octave error.
+    #[test]
+    fn autocorr_normalization_is_unbiased_across_lags() {
+        // A backbeat onset envelope: a strong beat every `period` and a weaker
+        // off-beat halfway between. The half-period lag correlates strong↔weak (a
+        // real but lesser peak); the full period correlates strong↔strong and
+        // weak↔weak (the true, stronger peak). Because the half-period lag sums
+        // more terms, dividing every lag by the same full-window energy inflates it
+        // past the fundamental — biasing the estimate toward double tempo.
+        let n = 600usize;
+        let period = 120usize;
+        let half = period / 2;
+        let bump_w = 10usize;
+        let mut sig = vec![0.0f32; n];
+        for center in (0..n).step_by(half) {
+            // Strong on the beat (multiples of `period`), weak on the off-beat.
+            // The off-beat is only slightly weaker so the half-period correlation
+            // nearly matches the full period — then the extra terms a short lag
+            // sums are what tip the (biased) full-window normalization.
+            let amp = if center % period == 0 { 1.0 } else { 0.7 };
+            for d in 0..bump_w {
+                let idx = center + d;
+                if idx < n {
+                    let phase = d as f32 / bump_w as f32;
+                    sig[idx] += amp * (0.5 - 0.5 * (2.0 * PI * phase).cos());
+                }
+            }
+        }
+        // DC-remove exactly as `estimate_tempo` does before correlating.
+        let mean = sig.iter().sum::<f32>() / n as f32;
+        for s in &mut sig {
+            *s -= mean;
+        }
+
+        // Search a band spanning both the half-period and the full period, but not
+        // the double period (as the real one-octave tempo search does).
+        let min_lag = 40usize;
+        let max_lag = 180usize; // > period, < 2·period
+
+        // Overlap-normalized (production) path locks onto the fundamental period.
+        let (_scores, best_lag, best_score) = normalized_autocorr(&sig, min_lag, max_lag);
+        assert!(best_score > 0.0, "should find a positive periodic peak");
+        assert!(
+            best_lag.abs_diff(period) <= 3,
+            "overlap-normalized autocorr should peak at the true period {period}, got {best_lag}"
+        );
+
+        // Pre-fix full-window normalization (constant denominator) inflates the
+        // shorter half-period lag and mis-peaks there (double-tempo error).
+        let energy: f32 = sig.iter().map(|s| s * s).sum::<f32>().max(1e-9);
+        let mut old_best_lag = 0usize;
+        let mut old_best = 0.0f32;
+        for lag in min_lag..=max_lag {
+            let mut acc = 0.0f32;
+            for i in lag..n {
+                acc += sig[i] * sig[i - lag];
+            }
+            let score = acc / energy;
+            if score > old_best {
+                old_best = score;
+                old_best_lag = lag;
+            }
+        }
+        assert!(
+            old_best_lag < period - 3,
+            "pre-fix full-window normalization should mis-peak short (near {half}), got {old_best_lag}"
         );
     }
 

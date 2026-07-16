@@ -226,6 +226,120 @@ impl SpectrogramSnapshot {
     }
 }
 
+/// Number of recycled snapshot pages behind [`SpectrogramPublisher`]. Triple
+/// buffering: one page the producer is filling, one currently published, and one
+/// the single consumer may still be holding — so a free page always exists
+/// without the producer ever allocating or copying a full ring under the lock.
+#[cfg(feature = "capture")]
+const SPECTROGRAM_PAGES: usize = 3;
+
+/// Producer half of the spectrogram hand-off (DSP worker side).
+///
+/// Instead of copying the whole `frames × bins` ring into a shared buffer under a
+/// lock every hop, the producer fills a *recycled* immutable page off-lock and
+/// publishes it by swapping a single [`Arc`] pointer. The lock is held only for
+/// that pointer store, and no full-size allocation happens per hop (P2-AUD-017).
+#[cfg(feature = "capture")]
+pub struct SpectrogramPublisher {
+    /// Preallocated page pool. A page is free to reuse when the pool holds the
+    /// only reference to it (`Arc::strong_count == 1`).
+    pool: Vec<std::sync::Arc<SpectrogramSnapshot>>,
+    /// The currently-published page, read by [`SpectrogramReader::latest`].
+    shared: std::sync::Arc<std::sync::Mutex<std::sync::Arc<SpectrogramSnapshot>>>,
+    /// Count of fallback allocations (should stay 0 in steady state); test-only.
+    #[cfg(test)]
+    allocations: usize,
+}
+
+/// Consumer half of the spectrogram hand-off (render/UI side).
+///
+/// [`SpectrogramReader::latest`] clones an [`Arc`] under a brief lock — a pointer
+/// bump, never a full-ring data copy.
+#[cfg(feature = "capture")]
+pub struct SpectrogramReader {
+    shared: std::sync::Arc<std::sync::Mutex<std::sync::Arc<SpectrogramSnapshot>>>,
+}
+
+#[cfg(feature = "capture")]
+impl SpectrogramTrail {
+    /// Build a publisher/reader pair sized to this trail. The producer thread
+    /// takes the [`SpectrogramPublisher`] and calls [`SpectrogramPublisher::publish`]
+    /// once per hop; the consumer thread takes the [`SpectrogramReader`].
+    pub fn publisher(&self) -> (SpectrogramPublisher, SpectrogramReader) {
+        use std::sync::{Arc, Mutex};
+        let pool: Vec<Arc<SpectrogramSnapshot>> = (0..SPECTROGRAM_PAGES)
+            .map(|_| Arc::new(self.snapshot()))
+            .collect();
+        let shared = Arc::new(Mutex::new(pool[0].clone()));
+        (
+            SpectrogramPublisher {
+                pool,
+                shared: shared.clone(),
+                #[cfg(test)]
+                allocations: 0,
+            },
+            SpectrogramReader { shared },
+        )
+    }
+}
+
+#[cfg(feature = "capture")]
+impl SpectrogramPublisher {
+    /// Publish the trail's current ring. Fills a recycled page off-lock (a memcpy
+    /// of preallocated storage — no allocation) and swaps it in under a brief lock.
+    pub fn publish(&mut self, trail: &SpectrogramTrail) {
+        use std::sync::Arc;
+        // A page referenced only by the pool (strong_count == 1) is not published
+        // and not held by the reader, so it is safe to mutate off-lock. The
+        // triple-buffer invariant (3 pages, single consumer) guarantees one exists.
+        let idx = self.pool.iter().position(|p| Arc::strong_count(p) == 1);
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                // Invariant violated (should not happen): allocate rather than
+                // block or mutate a page a consumer may be reading.
+                self.pool.push(Arc::new(trail.snapshot()));
+                #[cfg(test)]
+                {
+                    self.allocations += 1;
+                }
+                self.pool.len() - 1
+            }
+        };
+        if let Some(page) = Arc::get_mut(&mut self.pool[idx]) {
+            // memcpy into preallocated storage — no allocation on the audio thread.
+            trail.fill_snapshot(page);
+        } else {
+            // Lost exclusivity between the count check and get_mut (should not
+            // happen for a pool-only page); take a fresh page instead of mutating
+            // shared data.
+            self.pool[idx] = Arc::new(trail.snapshot());
+            #[cfg(test)]
+            {
+                self.allocations += 1;
+            }
+        }
+        let published = self.pool[idx].clone();
+        match self.shared.lock() {
+            Ok(mut slot) => *slot = published,
+            Err(poison) => *poison.into_inner() = published,
+        }
+    }
+}
+
+#[cfg(feature = "capture")]
+impl SpectrogramReader {
+    /// Clone the most-recently-published page. This is an [`Arc`] pointer bump
+    /// under a brief lock — no full-ring copy. Repeated reads with no intervening
+    /// publish return the same shared page (verifiable via [`Arc::ptr_eq`]).
+    pub fn latest(&self) -> std::sync::Arc<SpectrogramSnapshot> {
+        match self.shared.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poison) => poison.into_inner().clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +470,81 @@ mod tests {
         // center of band b is at (b+1)/(count+1) → b ≈ frac*(count+1) - 1
         let b = frac * (count as f32 + 1.0) - 1.0;
         b.round().clamp(0.0, (count - 1) as f32) as usize
+    }
+}
+
+#[cfg(all(test, feature = "capture"))]
+mod publish_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    const FFT_LEN: usize = 2048;
+    const N_BINS: usize = FFT_LEN / 2 + 1;
+
+    /// A magnitude frame with a single spike at `bin`, so successive pushes are
+    /// distinguishable in the published ring.
+    fn spike(bin: usize) -> Vec<f32> {
+        let mut mag = vec![0.0f32; N_BINS];
+        mag[bin % N_BINS] = 1.0;
+        mag[(bin + 1) % N_BINS] = 0.4;
+        mag
+    }
+
+    /// P2-AUD-017: publishing hands the consumer a shared immutable page. The
+    /// published ring matches the trail's ring exactly (i.e. the old full-copy
+    /// content), reads are zero-copy Arc bumps, and steady-state publishing never
+    /// allocates a full-size page per hop even while the consumer holds a page.
+    #[test]
+    fn publish_is_zero_copy_and_alloc_free_per_hop() {
+        let mut trail = SpectrogramTrail::with_size(8, 16, FFT_LEN, 48_000.0);
+        trail.push(&spike(100), false);
+        let (mut publisher, reader) = trail.publisher();
+
+        // Publish the current state and confirm the reader sees the exact ring.
+        publisher.publish(&trail);
+        let snap = reader.latest();
+        assert_eq!(
+            snap.raw_ring().0,
+            trail.raw_ring().0,
+            "published ring must match the trail's full-copy content"
+        );
+        assert_eq!(
+            snap.raw_ring().1,
+            trail.raw_ring().1,
+            "write cursor must match"
+        );
+        assert_eq!(snap.filled(), trail.filled());
+
+        // Two reads with no intervening publish return the SAME shared page — proof
+        // the read path performs no per-call data copy.
+        let a = reader.latest();
+        let b = reader.latest();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "consecutive reads should share one immutable page (no copy per read)"
+        );
+        drop((a, b));
+
+        // Simulate a slow consumer holding the latest page while the producer keeps
+        // publishing new frames. The page pool recycles; no per-hop allocation.
+        let held = reader.latest();
+        for k in 0..500usize {
+            trail.push(&spike(200 + k), false);
+            publisher.publish(&trail);
+            let s = reader.latest();
+            assert_eq!(
+                s.raw_ring().0,
+                trail.raw_ring().0,
+                "each publish must expose the live ring content at hop {k}"
+            );
+            assert_eq!(s.raw_ring().1, trail.raw_ring().1);
+        }
+        assert_eq!(
+            publisher.allocations, 0,
+            "steady-state publishing must not allocate a full-size page per hop"
+        );
+        // The long-held page stayed valid (immutable) the whole time.
+        assert_eq!(held.frames(), trail.frames());
+        drop(held);
     }
 }
