@@ -657,6 +657,13 @@ impl EelProgram {
         self.compiled.op_count
     }
 
+    /// Whether the compiled program can read or write `name`. Renderer pools use
+    /// this once at activation to seed only the q/t/reg globals their bytecode
+    /// can observe, instead of copying all 140 globals for every shape instance.
+    pub(crate) fn references_symbol(&self, name: &str) -> bool {
+        self.compiled.symbols.iter().any(|symbol| symbol == name)
+    }
+
     pub(crate) fn uses_gmegabuf(&self) -> bool {
         self.compiled.uses_gmegabuf
     }
@@ -2158,6 +2165,17 @@ mod tests {
             env.insert("value2", -0.25);
             pure.run_with(&mut env, &mut state);
             assert_eq!(state.value_capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn compiled_program_reports_only_referenced_symbols() {
+        let program = EelProgram::parse("x=q7+reg03; t2=x; y=sample;");
+        for name in ["x", "y", "q7", "reg03", "t2", "sample"] {
+            assert!(program.references_symbol(name), "missing {name}");
+        }
+        for name in ["q1", "q8", "reg00", "reg04", "t1", "value1"] {
+            assert!(!program.references_symbol(name), "unexpected {name}");
         }
     }
 

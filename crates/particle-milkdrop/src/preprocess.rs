@@ -1919,10 +1919,18 @@ pub fn fix_glsl_vector_types(glsl: &str) -> String {
         Some(pos) => glsl.split_at(pos),
         None => ("", glsl.as_str()),
     };
+    // Preset locals may shadow overloaded helper names (`float lum = ...` is
+    // common). Give only unambiguous body declarations precedence over the
+    // whole-module table. Names declared at multiple widths (for example `tmp`
+    // in separate helpers) stay Unknown and continue to use scoped repair.
+    for (name, ty) in collect_unambiguous_local_decls(body) {
+        table.insert(name, ty);
+    }
     let s0 = fix_array_brace_init(body);
     let s0b = join_logical_statements(&s0);
     let s0c = drop_duplicate_bare_decls_same_scope(&s0b);
-    let s1 = fix_vector_relops(&s0c, &table);
+    let s0d = fix_missing_function_returns(&s0c);
+    let s1 = fix_vector_relops(&s0d, &table);
     let s2 = fix_call_arg_promotion(&s1, &table, &sigs);
     let s2b = fix_pow_arg_width(&s2, &table);
     let s2c = fix_mix_calls(&s2b, &table);
@@ -1937,8 +1945,63 @@ pub fn fix_glsl_vector_types(glsl: &str) -> String {
     let s3e = fix_assignment_width_mismatches(&s3d, &table);
     let s3f = fix_int_compound_assignments(&s3e);
     let s3g = fix_numeric_logical_not(&s3f, &table);
-    let s4 = fix_for_constructor_cond(&s3g);
+    let s3h = fix_numeric_control_conditions(&s3g, &table);
+    let s4 = fix_for_constructor_cond(&s3h);
     format!("{prefix}{s4}")
+}
+
+fn collect_unambiguous_local_decls(src: &str) -> TypeTable {
+    fn record_segment(segment: &str, table: &mut TypeTable) {
+        let core = segment.trim();
+        if core.is_empty() {
+            return;
+        }
+        let mut words = core.splitn(2, char::is_whitespace);
+        let (Some(keyword), Some(rest)) = (words.next(), words.next()) else {
+            return;
+        };
+        let Some(ty) = keyword_gty(keyword) else {
+            return;
+        };
+        let rest = rest.trim_start();
+        if rest
+            .find('(')
+            .is_some_and(|open| rest.find('=').is_none_or(|assignment| open < assignment))
+        {
+            return;
+        }
+        for item in split_top_level_commas(rest) {
+            let name: String = item
+                .trim()
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            if !name.is_empty() {
+                ins_ty(table, name, ty);
+            }
+        }
+    }
+
+    let mut table = TypeTable::new();
+    for line in src.lines() {
+        let bytes = line.as_bytes();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            match byte {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b';' | b'{' | b'}' if depth == 0 => {
+                    record_segment(&line[start..index], &mut table);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        record_segment(&line[start..], &mut table);
+    }
+    table.retain(|_, ty| *ty != GTy::Unknown);
+    table
 }
 
 /// Expand the small class of object-like helper aliases emitted by MilkDrop
@@ -2475,6 +2538,24 @@ mod tests {
     }
 
     #[test]
+    fn corpus_failure_comma_sequence_repairs_each_assignment() {
+        let hlsl = r#"shader_body {
+            ret = tex2D(sampler_main, uv).z, ret -= roam_sin.wzy * roam_cos.zxy;
+            ret *= 0.5;
+        }"#;
+
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(
+            fixed.contains("ret = vec3(texture(sampler2D(sampler_main"),
+            "{fixed}"
+        );
+        assert!(fixed.contains(", ret -= roam_sin.wzy"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("comma-sequence shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
     fn corpus_failure_helper_alias_enables_scalar_lum_repair() {
         let hlsl = r#"shader_body {
             #define MyGet GetPixel
@@ -2537,6 +2618,78 @@ mod tests {
         assert!(fixed.contains("float(float(first) == 0.0)"), "{fixed}");
         crate::renderer::compile_glsl(&glsl)
             .unwrap_or_else(|error| panic!("numeric-flag shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_bool_compound_and_logical_coercions_compile() {
+        let hlsl = r#"shader_body {
+            float noise = tex2D(sampler_noise_lq, uv).x;
+            float mask1 = noise;
+            float gmask = 0;
+            noise *= (noise >= 0.9);
+            gmask = gmask || mask1;
+            ret = noise + gmask;
+        }"#;
+
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(fixed.contains("noise *=float("), "{fixed}");
+        assert!(fixed.contains("(mask1) != 0.0"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("bool-coercion shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_sampling_helpers_accept_legacy_coordinate_widths() {
+        let hlsl = r#"shader_body {
+            float scalar = 0.5;
+            float3 wide = tex2D(sampler_main, uv).xyz;
+            ret = GetPixel(scalar) + GetBlur1(0) + GetBlur3(wide);
+        }"#;
+
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(fixed.contains("GetPixel(vec2(scalar))"), "{fixed}");
+        assert!(fixed.contains("GetBlur1(vec2(0))"), "{fixed}");
+        assert!(fixed.contains("GetBlur3((wide).xy)"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("sampling-coordinate shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_fallthrough_helper_gets_deterministic_return() {
+        let hlsl = r#"
+            float shadow(float2 uvi) {
+                int n; float dark;
+                dark = 0; n = 0;
+                while (!dark && (n < 4)) { n += 1; }
+            }
+            shader_body { ret = shadow(uv); }
+        "#;
+
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(fixed.contains("return 0.0;"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("fallthrough-helper shader failed: {error}\n{fixed}"));
+    }
+
+    #[test]
+    fn corpus_failure_multi_declarations_and_shadowed_lum_compile() {
+        let hlsl = r#"shader_body {
+            float4 lum1 = 0, lum2 = 0;
+            float lum = dot(ret, float3(0.3, 0.5, 0.2));
+            ret = lerp(lum, ret, 1.7) + lum1.xyz + lum2.xyz;
+        }"#;
+
+        let split = split_hlsl_multi_declarators(hlsl);
+        assert!(split.contains("float4 lum1 = 0;"), "{split}");
+        assert!(split.contains("float4 lum2 = 0"), "{split}");
+        let glsl = hlsl_milk_body_to_naga(hlsl);
+        let fixed = fix_glsl_vector_types(&glsl);
+        assert!(fixed.contains("mix(vec3(lum), ret"), "{fixed}");
+        crate::renderer::compile_glsl(&glsl)
+            .unwrap_or_else(|error| panic!("multi-decl/lum shader failed: {error}\n{fixed}"));
     }
 
     // ── P2-VIS-014: shader source/work budgets + one-pass preprocessing ───────
@@ -2884,6 +3037,110 @@ fn parse_fn_header(s: &str) -> Option<(GTy, Vec<(String, GTy)>)> {
         }
     }
     Some((ret, params))
+}
+
+/// HLSL accepts a non-void helper that reaches the end of its body. The result is
+/// undefined there, but the legacy converter emits that helper verbatim and naga
+/// rejects the complete module even when the helper is only used behind a zero
+/// multiplier. Give helpers with no authored return a deterministic zero value.
+/// Functions containing any return are left untouched; this intentionally fixes
+/// only the unambiguous corpus pattern instead of attempting control-flow analysis.
+fn fix_missing_function_returns(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let type_start = i;
+        i += 1;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let return_type = &src[type_start..i];
+        let Some(return_gty) = keyword_gty(return_type) else {
+            continue;
+        };
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == name_start {
+            continue;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'(') {
+            continue;
+        }
+        let Some(params_close) = matching_close(src, i) else {
+            break;
+        };
+        i = params_close + 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'{') {
+            continue;
+        }
+        let body_open = i;
+        let Some(body_close) = matching_brace(src, body_open) else {
+            break;
+        };
+        let body = &src[body_open + 1..body_close];
+        if !contains_word(body, "return") {
+            let zero = match return_gty {
+                GTy::F => "0.0".to_string(),
+                GTy::V(width) => format!("vec{width}(0.0)"),
+                GTy::B => "false".to_string(),
+                GTy::BV(width) => format!("bvec{width}(false)"),
+                GTy::Unknown => {
+                    i = body_close + 1;
+                    continue;
+                }
+            };
+            out.push_str(&src[cursor..body_close]);
+            out.push_str(&format!("\nreturn {zero};\n"));
+            cursor = body_close;
+        }
+        i = body_close + 1;
+    }
+    out.push_str(&src[cursor..]);
+    out
+}
+
+fn matching_brace(src: &str, open: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 0i32;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn contains_word(src: &str, word: &str) -> bool {
+    src.match_indices(word).any(|(index, _)| {
+        let before = index.checked_sub(1).and_then(|i| src.as_bytes().get(i));
+        let after = src.as_bytes().get(index + word.len());
+        !before.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            && !after.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    })
 }
 
 /// Record leading `<typekw> name[, name…]` declarations found in `line` into `table`,
@@ -4024,7 +4281,13 @@ fn fix_op_width_segment(seg: &str, t: &TypeTable) -> String {
         // (`(a*=b).xyz` → naga `InvalidToken: Assign`). `lhs` keeps the whole `op=` token.
         let lhs = &body[..op + 2];
         let rhs = &body[op + 2..];
-        rewrite_expr_width(rhs, t).map(|new_rhs| format!("{lhs}{new_rhs}"))
+        let rewritten = rewrite_expr_width(rhs, t);
+        let rhs_text = rewritten.as_deref().unwrap_or(rhs);
+        if let Some(numeric) = bool_to_numeric_expr(rhs_text, infer_ty(rhs_text, t)) {
+            Some(format!("{lhs}{numeric}"))
+        } else {
+            rewritten.map(|new_rhs| format!("{lhs}{new_rhs}"))
+        }
     } else if is_return_keyword(body) {
         // `return <expr>;` — rewrite op-width mismatches inside the returned expression.
         // `expr` keeps its leading whitespace / `(`, which rewrite_expr_width preserves.
@@ -4060,6 +4323,27 @@ fn rewrite_expr_width(e: &str, t: &TypeTable) -> Option<String> {
         let mut ltext = lnew.clone().unwrap_or_else(|| l.to_string());
         let mut rtext = rnew.clone().unwrap_or_else(|| r.to_string());
         let mut acted = false;
+        let lt = infer_ty(&ltext, t);
+        let rt = infer_ty(&rtext, t);
+        if matches!(op, "+" | "-" | "*" | "/" | "%") {
+            if let Some(numeric) = bool_to_numeric_expr(&ltext, lt) {
+                ltext = numeric;
+                acted = true;
+            }
+            if let Some(numeric) = bool_to_numeric_expr(&rtext, rt) {
+                rtext = numeric;
+                acted = true;
+            }
+        } else if matches!(op, "&&" | "||") {
+            if let Some(boolean) = numeric_to_bool_expr(&ltext, lt) {
+                ltext = boolean;
+                acted = true;
+            }
+            if let Some(boolean) = numeric_to_bool_expr(&rtext, rt) {
+                rtext = boolean;
+                acted = true;
+            }
+        }
         if op == "%" {
             let lt = infer_ty(&ltext, t);
             let rt = infer_ty(&rtext, t);
@@ -4180,6 +4464,27 @@ fn rewrite_expr_width(e: &str, t: &TypeTable) -> Option<String> {
         }
     }
     None
+}
+
+/// HLSL treats comparisons and bool variables as 0/1 when they participate in
+/// arithmetic. GLSL keeps bool and numeric types disjoint, so make that legacy
+/// coercion explicit before width repair handles the rest of the expression.
+fn bool_to_numeric_expr(expr: &str, ty: GTy) -> Option<String> {
+    match ty {
+        GTy::B => Some(format!("float({})", expr.trim())),
+        GTy::BV(width) => Some(format!("vec{width}({})", expr.trim())),
+        _ => None,
+    }
+}
+
+/// The inverse legacy coercion for logical operators. Numeric vectors follow
+/// HLSL's aggregate truthiness: the expression is true when any lane is non-zero.
+fn numeric_to_bool_expr(expr: &str, ty: GTy) -> Option<String> {
+    match ty {
+        GTy::F => Some(format!("(({}) != 0.0)", expr.trim())),
+        GTy::V(width) => Some(format!("any(notEqual({}, vec{width}(0.0)))", expr.trim())),
+        _ => None,
+    }
 }
 
 /// LAST top-level binary operator of the lowest precedence present (left-associative —
@@ -4408,6 +4713,25 @@ fn fix_assign_segment(seg: &str, t: &TypeTable) -> String {
         let fixed = fix_assign_segment(rest, t);
         if fixed != rest {
             return format!("{lead}{prefix}{fixed}{trail}");
+        }
+    }
+    // The legacy MilkDrop converter sometimes emits comma-expression statement
+    // sequences, for example `ret = tex2D(...).z, ret -= offset;`. HLSL applies
+    // the usual scalar-to-vector broadcast to each assignment independently, but
+    // treating the whole sequence as one RHS hides the first assignment's type
+    // from the repair below. Recurse into top-level comma clauses while preserving
+    // the comma operator and all clause whitespace verbatim. Commas inside calls,
+    // constructors, array indexing, and brace initializers are excluded by the
+    // balanced splitter.
+    let comma_clauses = split_top_level_commas(body);
+    if comma_clauses.len() > 1 {
+        let fixed: Vec<String> = comma_clauses
+            .iter()
+            .map(|clause| fix_assign_segment(clause, t))
+            .collect();
+        let joined = fixed.join(",");
+        if joined != body {
+            return format!("{lead}{joined}{trail}");
         }
     }
     let Some(eq) = find_plain_eq(body) else {
@@ -4681,6 +5005,66 @@ fn fix_numeric_logical_not_line(line: &str, table: &TypeTable) -> String {
     out
 }
 
+/// HLSL treats any non-zero numeric value as true in control-flow headers.
+/// GLSL/naga require an actual bool. Repair complete `if`/`while` conditions
+/// after type inference, including scalar flags and numeric vector masks.
+fn fix_numeric_control_conditions(src: &str, table: &TypeTable) -> String {
+    let mut out = String::with_capacity(src.len() + 32);
+    for line in src.lines() {
+        let mut fixed = line.to_string();
+        for keyword in ["if", "while"] {
+            let mut search_from = 0usize;
+            loop {
+                let Some(relative) = fixed[search_from..].find(keyword) else {
+                    break;
+                };
+                let start = search_from + relative;
+                let before = start.checked_sub(1).and_then(|i| fixed.as_bytes().get(i));
+                let after_keyword = start + keyword.len();
+                if before.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    || fixed
+                        .as_bytes()
+                        .get(after_keyword)
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    search_from = after_keyword;
+                    continue;
+                }
+                let mut open = after_keyword;
+                while fixed
+                    .as_bytes()
+                    .get(open)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    open += 1;
+                }
+                if fixed.as_bytes().get(open) != Some(&b'(') {
+                    search_from = after_keyword;
+                    continue;
+                }
+                let Some(close) = matching_close(&fixed, open) else {
+                    break;
+                };
+                let condition = fixed[open + 1..close].trim();
+                let replacement = match infer_ty(condition, table) {
+                    GTy::F => Some(format!("({condition}) != 0.0")),
+                    GTy::V(width) => Some(format!("any(notEqual({condition}, vec{width}(0.0)))")),
+                    _ => None,
+                };
+                if let Some(replacement) = replacement {
+                    fixed.replace_range(open + 1..close, &replacement);
+                    search_from = open + 1 + replacement.len() + 1;
+                } else {
+                    search_from = close + 1;
+                }
+            }
+        }
+        out.push_str(&fixed);
+        out.push('\n');
+    }
+    out
+}
+
 /// Some converter output keeps control/block prefixes on the same physical segment,
 /// e.g. `if(cond)ret += vec4;` or `else {ret = vec4;}`. The assignment/op fixers need
 /// to see the actual statement start (`ret ...`), so peel those prefixes first.
@@ -4854,6 +5238,14 @@ fn param_widths(
     sigs: &HashMap<String, Vec<GTy>>,
     t: &TypeTable,
 ) -> Vec<Option<u8>> {
+    // MilkDrop's sampling helpers are authored as float2-coordinate functions,
+    // but HLSL accepts both scalar splats (`GetPixel(0.5)`) and wider vectors
+    // (`GetBlur3(tex2D(...))`, implicitly taking `.xy`). The generated preamble
+    // deliberately exposes multiple helper overloads, so signature collection
+    // cannot choose this coercion on its own.
+    if matches!(name, "GetPixel" | "GetBlur1" | "GetBlur2" | "GetBlur3") {
+        return vec![Some(2)];
+    }
     if let Some(sig) = sigs.get(name) {
         return sig
             .iter()
@@ -6596,7 +6988,8 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
     // Collapse `ident (` → `ident(` up front so every downstream call rewrite
     // (lerp→mix, mul, tex2D→texture, pow/max int coercion) matches. GLSL treats
     // `f (x)` and `f(x)` identically, so this changes nothing semantically.
-    let mut s = collapse_call_spaces(src);
+    let mut s = split_hlsl_multi_declarators(src);
+    s = collapse_call_spaces(&s);
     s = normalize_milkdrop_sampler_variants(&s);
     s = strip_comments(&s);
     s = rename_reserved_sample_local(&s);
@@ -6709,7 +7102,8 @@ fn hlsl_to_glsl_body_ex(src: &str, drop_dead: bool) -> String {
 /// following tokens), forcing these presets onto the weaker pure-Rust fallback.
 /// Rewriting `double*` → `float*` up front lets them go through the native path.
 fn hlsl_pre_native_fixups(src: &str) -> String {
-    let mut s = normalize_milkdrop_sampler_variants(src);
+    let mut s = split_hlsl_multi_declarators(src);
+    s = normalize_milkdrop_sampler_variants(&s);
     s = strip_comments(&s);
     s = replace_word(&s, "double2", "float2");
     s = replace_word(&s, "double3", "float3");
@@ -6720,6 +7114,98 @@ fn hlsl_pre_native_fixups(src: &str) -> String {
     // through the native converter (and compute correctly).
     s = wrap_bool_arith(&s);
     s
+}
+
+/// hlsl2glslfork silently loses all but the first initializer in declarations
+/// such as `float4 lum1=0, lum2=0;`. Split each top-level declarator into its own
+/// declaration before either converter sees it. Commas in constructors/calls and
+/// semicolons in `for (...)` headers are deliberately ignored.
+fn split_hlsl_multi_declarators(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut start = 0usize;
+    let mut paren_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth -= 1,
+            b';' if paren_depth == 0 && bracket_depth == 0 => {
+                let segment = &src[start..index];
+                if let Some(split) = split_hlsl_multi_decl_segment(segment) {
+                    out.push_str(&split);
+                } else {
+                    out.push_str(segment);
+                }
+                out.push(';');
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&src[start..]);
+    out
+}
+
+fn split_hlsl_multi_decl_segment(segment: &str) -> Option<String> {
+    let core_start = segment
+        .rmatch_indices(['{', '}'])
+        .next()
+        .map_or(0, |(index, ch)| index + ch.len());
+    let prefix = &segment[..core_start];
+    let core = &segment[core_start..];
+    let trimmed = core.trim_start();
+    let whitespace = &core[..core.len() - trimmed.len()];
+
+    let mut rest = trimmed;
+    let mut qualifiers = Vec::new();
+    loop {
+        let Some((word, tail)) = split_first_word(rest) else {
+            return None;
+        };
+        if matches!(word, "static" | "const") {
+            qualifiers.push(word);
+            rest = tail.trim_start();
+        } else {
+            break;
+        }
+    }
+    let (ty, declarators) = split_first_word(rest)?;
+    if !is_hlsl_value_type(ty) {
+        return None;
+    }
+    let declarators = declarators.trim_start();
+    let pieces = split_top_level_commas(declarators);
+    if pieces.len() < 2 {
+        return None;
+    }
+
+    let indent = whitespace.rsplit('\n').next().unwrap_or(whitespace);
+    let decl_prefix = if qualifiers.is_empty() {
+        ty.to_string()
+    } else {
+        format!("{} {ty}", qualifiers.join(" "))
+    };
+    let mut result = String::with_capacity(segment.len() + pieces.len() * decl_prefix.len());
+    result.push_str(prefix);
+    result.push_str(whitespace);
+    for (index, piece) in pieces.iter().enumerate() {
+        if index > 0 {
+            result.push_str(";\n");
+            result.push_str(indent);
+        }
+        result.push_str(&decl_prefix);
+        result.push(' ');
+        result.push_str(piece.trim());
+    }
+    Some(result)
+}
+
+fn split_first_word(src: &str) -> Option<(&str, &str)> {
+    let end = src.find(char::is_whitespace)?;
+    Some((&src[..end], &src[end..]))
 }
 
 /// Does `s` contain a TOP-LEVEL relational/equality operator (`<` `>` `<=` `>=` `==`

@@ -408,6 +408,20 @@ struct RendererScratch {
     frame_border_draws: Vec<(u32, u32)>,
     border_uniform_bytes: Vec<u8>,
     frame_border_uniform_bytes: Vec<u8>,
+    custom_wave_draws: Vec<Option<WaveDraw>>,
+    basic_wave: BasicWaveScratch,
+}
+
+/// Persistent storage for the built-in waveform path. These vectors used
+/// to allocate on every rendered frame, even though their upper bounds are
+/// stable for a renderer/audio configuration.
+#[derive(Default)]
+struct BasicWaveScratch {
+    processed_l: Vec<f32>,
+    processed_r: Vec<f32>,
+    positions: Vec<[f32; 2]>,
+    positions2: Vec<[f32; 2]>,
+    smoothed: Vec<[f32; 2]>,
 }
 
 /// Cached slots for the frame/audio variables repeatedly seeded into shape and
@@ -593,6 +607,12 @@ struct ShapeRT {
     reg_slots: [EnvSlot; 100],
     q_slots: [EnvSlot; 32],
     t_slots: [EnvSlot; 8],
+    /// Only globals statically referenced by this pool's steady-state bytecode.
+    /// Init keeps the full slot arrays above because it must thread every reg to
+    /// the next authored pool, but per-instance execution can copy selectively.
+    live_reg_indices: Vec<u8>,
+    live_q_indices: Vec<u8>,
+    live_t_indices: Vec<u8>,
     slots: ShapeEnvSlots,
     t_init: [f64; 8],
     /// Per-pool megabuf (private) sharing the preset-wide gmegabuf.
@@ -609,6 +629,10 @@ struct WaveRT {
     reg_slots: [EnvSlot; 100],
     q_slots: [EnvSlot; 32],
     t_slots: [EnvSlot; 8],
+    /// Union of globals referenced by the per-frame and per-point programs.
+    live_reg_indices: Vec<u8>,
+    live_q_indices: Vec<u8>,
+    live_t_indices: Vec<u8>,
     slots: WaveEnvSlots,
     t_init: [f64; 8],
     /// Per-pool megabuf (private) sharing the preset-wide gmegabuf.
@@ -3648,14 +3672,34 @@ impl MilkdropRenderer {
                 let reg_slots = std::array::from_fn(|i| env.intern_slot(&format!("reg{i:02}")));
                 let q_slots = std::array::from_fn(|i| env.intern_slot(&format!("q{}", i + 1)));
                 let t_slots = std::array::from_fn(|i| env.intern_slot(&format!("t{}", i + 1)));
+                let prog = sc.per_frame.as_deref().map(EelProgram::parse);
+                let references = |name: &str| {
+                    prog.as_ref()
+                        .is_some_and(|program| program.references_symbol(name))
+                };
+                let live_reg_indices = (0..100)
+                    .filter(|index| references(&format!("reg{index:02}")))
+                    .map(|index| index as u8)
+                    .collect();
+                let live_q_indices = (0..32)
+                    .filter(|index| references(&format!("q{}", index + 1)))
+                    .map(|index| index as u8)
+                    .collect();
+                let live_t_indices = (0..8)
+                    .filter(|index| references(&format!("t{}", index + 1)))
+                    .map(|index| index as u8)
+                    .collect();
                 let state = EelState::with_shared(gmegabuf.clone(), eel_rng.clone());
                 ShapeRT {
                     base: sc.base.clone(),
-                    prog: sc.per_frame.as_deref().map(EelProgram::parse),
+                    prog,
                     env,
                     reg_slots,
                     q_slots,
                     t_slots,
+                    live_reg_indices,
+                    live_q_indices,
+                    live_t_indices,
                     slots,
                     t_init: [0.0; 8],
                     state,
@@ -4005,6 +4049,28 @@ impl MilkdropRenderer {
                 let reg_slots = std::array::from_fn(|i| env.intern_slot(&format!("reg{i:02}")));
                 let q_slots = std::array::from_fn(|i| env.intern_slot(&format!("q{}", i + 1)));
                 let t_slots = std::array::from_fn(|i| env.intern_slot(&format!("t{}", i + 1)));
+                let per_frame_prog = wd.per_frame.as_deref().map(EelProgram::parse);
+                let per_point_prog = wd.per_point.as_deref().map(EelProgram::parse);
+                let references = |name: &str| {
+                    per_frame_prog
+                        .as_ref()
+                        .is_some_and(|program| program.references_symbol(name))
+                        || per_point_prog
+                            .as_ref()
+                            .is_some_and(|program| program.references_symbol(name))
+                };
+                let live_reg_indices = (0..100)
+                    .filter(|index| references(&format!("reg{index:02}")))
+                    .map(|index| index as u8)
+                    .collect();
+                let live_q_indices = (0..32)
+                    .filter(|index| references(&format!("q{}", index + 1)))
+                    .map(|index| index as u8)
+                    .collect();
+                let live_t_indices = (0..8)
+                    .filter(|index| references(&format!("t{}", index + 1)))
+                    .map(|index| index as u8)
+                    .collect();
                 let state = EelState::with_shared(gmegabuf.clone(), eel_rng.clone());
                 WaveRT {
                     def: CustomWaveDef {
@@ -4026,12 +4092,15 @@ impl MilkdropRenderer {
                         per_frame_init: wd.per_frame_init.clone(),
                         per_point: wd.per_point.clone(),
                     },
-                    per_frame_prog: wd.per_frame.as_deref().map(EelProgram::parse),
-                    per_point_prog: wd.per_point.as_deref().map(EelProgram::parse),
+                    per_frame_prog,
+                    per_point_prog,
                     env,
                     reg_slots,
                     q_slots,
                     t_slots,
+                    live_reg_indices,
+                    live_q_indices,
+                    live_t_indices,
                     slots,
                     t_init: [0.0; 8],
                     state,
@@ -4281,6 +4350,8 @@ impl MilkdropRenderer {
                 frame_border_draws: Vec::with_capacity(2),
                 border_uniform_bytes: Vec::new(),
                 frame_border_uniform_bytes: Vec::with_capacity(512),
+                custom_wave_draws: Vec::new(),
+                basic_wave: BasicWaveScratch::default(),
             },
             geometry_diagnostics: GeometryDiagnosticCollector::default(),
             geometry_stage_readback: None,
@@ -5009,11 +5080,13 @@ impl MilkdropRenderer {
                     // Reset shape vars from base each instance (butterchurn semantics).
                     let env = &mut s.env;
                     let slots = s.slots;
-                    for (slot, value) in s.reg_slots.iter().zip(regs) {
-                        env.set_slot_value(*slot, *value);
+                    for &index in &s.live_reg_indices {
+                        let index = index as usize;
+                        env.set_slot_value(s.reg_slots[index], regs[index]);
                     }
-                    for (slot, value) in s.t_slots.iter().zip(&s.t_init) {
-                        env.set_slot_value(*slot, *value);
+                    for &index in &s.live_t_indices {
+                        let index = index as usize;
+                        env.set_slot_value(s.t_slots[index], s.t_init[index]);
                     }
                     slots.frame.seed(
                         env,
@@ -5030,8 +5103,9 @@ impl MilkdropRenderer {
                         aspectx as f64,
                         aspecty as f64,
                     );
-                    for (slot, value) in s.q_slots.iter().zip(q) {
-                        env.set_slot_value(*slot, *value);
+                    for &index in &s.live_q_indices {
+                        let index = index as usize;
+                        env.set_slot_value(s.q_slots[index], q[index]);
                     }
                     env.set_slot_value(slots.instance, j as f64);
                     env.set_slot_value(slots.num_inst, num_inst as f64);
@@ -5154,14 +5228,16 @@ impl MilkdropRenderer {
                     let p = (k - 1) as f32 / sides as f32;
                     let p_two_pi = p * 2.0 * PI;
                     let ang_sum = p_two_pi + ang + quarter_pi;
-                    let px = x_ndc + rad * ang_sum.cos() * aspecty;
-                    let py = y_ndc + rad * ang_sum.sin();
+                    let (ang_sin, ang_cos) = ang_sum.sin_cos();
+                    let px = x_ndc + rad * ang_cos * aspecty;
+                    let py = y_ndc + rad * ang_sin;
                     let (uu, vv) = if is_textured {
                         let tex_ang_sum = p_two_pi + tex_ang + quarter_pi;
+                        let (tex_sin, tex_cos) = tex_ang_sum.sin_cos();
                         let z = if tex_zoom.abs() < 1e-6 { 1.0 } else { tex_zoom };
                         (
-                            0.5 + (0.5 * tex_ang_sum.cos() / z) * aspecty,
-                            0.5 + (0.5 * tex_ang_sum.sin() / z),
+                            0.5 + (0.5 * tex_cos / z) * aspecty,
+                            0.5 + (0.5 * tex_sin / z),
                         )
                     } else {
                         (-1.0, -1.0)
@@ -5271,6 +5347,7 @@ impl MilkdropRenderer {
                 .map(|v| v as f32)
                 .unwrap_or(self.bw_a);
             let phase_t = shader_time_seconds(t);
+            let mut basic_scratch = std::mem::take(&mut self.scratch.basic_wave);
             self.build_basic_waveform(
                 phase_t,
                 bass,
@@ -5283,7 +5360,9 @@ impl MilkdropRenderer {
                 wave_r,
                 &mut verts,
                 &mut draws,
+                &mut basic_scratch,
             );
+            self.scratch.basic_wave = basic_scratch;
         }
 
         (verts, draws, custom_extent)
@@ -5303,6 +5382,7 @@ impl MilkdropRenderer {
         time_r: &[f32],
         verts: &mut Vec<WaveVert>,
         draws: &mut Vec<WaveDraw>,
+        scratch: &mut BasicWaveScratch,
     ) {
         use std::f32::consts::PI;
         // alpha gate: built-in reads the post-per-frame wave_a (butterchurn behavior).
@@ -5337,23 +5417,25 @@ impl MilkdropRenderer {
         // processWaveform (butterchurn 4520-4533): scale = wave_scale/128 on Int8.
         // Our samples are f32 in [-1,1] (== Int8/128), so the effective scale on the
         // f32 data is simply wave_scale.
-        let process = |src: &[f32]| -> Vec<f32> {
+        let process = |src: &[f32], out: &mut Vec<f32>| {
             let scale = live_wave_scale;
             let smooth = live_wave_smoothing;
             let smooth2 = scale * (1.0 - smooth);
             let n = src.len();
-            let mut out = vec![0.0f32; n];
+            out.clear();
+            out.resize(n, 0.0);
             if n == 0 {
-                return out;
+                return;
             }
             out[0] = src[0] * scale;
             for i in 1..n {
                 out[i] = src[i] * smooth2 + out[i - 1] * smooth;
             }
-            out
         };
-        let wave_l = process(time_l);
-        let wave_r = process(time_r);
+        process(time_l, &mut scratch.processed_l);
+        process(time_r, &mut scratch.processed_r);
+        let wave_l = scratch.processed_l.as_slice();
+        let wave_r = scratch.processed_r.as_slice();
 
         let new_wave_mode = (live_wave_mode.floor() as i32).rem_euclid(8);
         let wave_pos_x = live_wave_x * 2.0 - 1.0;
@@ -5368,9 +5450,12 @@ impl MilkdropRenderer {
         }
 
         let nlen = wave_l.len();
-        let mut positions: Vec<[f32; 2]> = Vec::new();
-        // Mode 7 emits a SECOND polyline (R-channel line). Populated only by mode 7.
-        let mut positions2: Option<Vec<[f32; 2]>> = None;
+        let positions = &mut scratch.positions;
+        positions.clear();
+        // Mode 7 emits a SECOND polyline (R-channel line). Reuse its backing store.
+        let positions2 = &mut scratch.positions2;
+        positions2.clear();
+        let mut has_positions2 = false;
         let mut alpha = base_alpha;
 
         // mod-wave-alpha-by-volume (every mode applies this). Guarded divide like mode 0.
@@ -5413,9 +5498,10 @@ impl MilkdropRenderer {
                         let rad2 = 0.5 + 0.4 * wave_r[idx2] + param2;
                         rad = (1.0 - mix) * rad2 + rad * mix;
                     }
+                    let (ang_sin, ang_cos) = ang.sin_cos();
                     positions[i] = [
-                        rad * ang.cos() * aspecty + wave_pos_x,
-                        rad * ang.sin() * aspectx + wave_pos_y,
+                        rad * ang_cos * aspecty + wave_pos_x,
+                        rad * ang_sin * aspectx + wave_pos_y,
                     ];
                 }
                 positions[num_vert - 1] = positions[0];
@@ -5433,9 +5519,10 @@ impl MilkdropRenderer {
                 for i in 0..num_vert {
                     let rad = 0.53 + 0.43 * wave_r[i] + param2;
                     let ang = wave_l[(i + 32).min(nlen - 1)] * 0.5 * PI + t * 2.3;
+                    let (ang_sin, ang_cos) = ang.sin_cos();
                     positions[i] = [
-                        rad * ang.cos() * aspecty + wave_pos_x,
-                        rad * ang.sin() * aspectx + wave_pos_y,
+                        rad * ang_cos * aspecty + wave_pos_x,
+                        rad * ang_sin * aspectx + wave_pos_y,
                     ];
                 }
             }
@@ -5520,8 +5607,7 @@ impl MilkdropRenderer {
                 };
                 mod_alpha(&mut alpha);
                 alpha = alpha.clamp(0.0, 1.0);
-                let cos_rot = (t * 0.3).cos();
-                let sin_rot = (t * 0.3).sin();
+                let (sin_rot, cos_rot) = (t * 0.3).sin_cos();
                 let num_vert = nlen;
                 positions.resize(num_vert, [0.0, 0.0]);
                 for i in 0..num_vert {
@@ -5547,16 +5633,18 @@ impl MilkdropRenderer {
                 }
                 let sample_offset = nlen.saturating_sub(num_vert) / 2;
                 let ang = PI * 0.5 * param2;
-                let mut dx = ang.cos();
-                let mut dy = ang.sin();
+                let (ang_sin, ang_cos) = ang.sin_cos();
+                let mut dx = ang_cos;
+                let mut dy = ang_sin;
+                let (perp_seed_sin, perp_seed_cos) = (ang + PI * 0.5).sin_cos();
                 // Both edgex AND edgey seed from wave_pos_x (butterchurn quirk — literal).
                 let mut edgex = [
-                    wave_pos_x * (ang + PI * 0.5).cos() - dx * 3.0,
-                    wave_pos_x * (ang + PI * 0.5).cos() + dx * 3.0,
+                    wave_pos_x * perp_seed_cos - dx * 3.0,
+                    wave_pos_x * perp_seed_cos + dx * 3.0,
                 ];
                 let mut edgey = [
-                    wave_pos_x * (ang + PI * 0.5).sin() - dy * 3.0,
-                    wave_pos_x * (ang + PI * 0.5).sin() + dy * 3.0,
+                    wave_pos_x * perp_seed_sin - dy * 3.0,
+                    wave_pos_x * perp_seed_sin + dy * 3.0,
                 ];
                 for i in 0..2 {
                     for j in 0..4 {
@@ -5600,8 +5688,7 @@ impl MilkdropRenderer {
                 dx = (edgex[1] - edgex[0]) / num_vert as f32;
                 dy = (edgey[1] - edgey[0]) / num_vert as f32;
                 let ang2 = dy.atan2(dx);
-                let perp_dx = (ang2 + PI * 0.5).cos();
-                let perp_dy = (ang2 + PI * 0.5).sin();
+                let (perp_dy, perp_dx) = (ang2 + PI * 0.5).sin_cos();
 
                 if new_wave_mode == 6 {
                     positions.resize(num_vert, [0.0, 0.0]);
@@ -5616,7 +5703,7 @@ impl MilkdropRenderer {
                     // MODE 7: dual line — L line + R line separated by sep.
                     let sep = (wave_pos_y * 0.5 + 0.5).powi(2);
                     positions.resize(num_vert, [0.0, 0.0]);
-                    let mut p2: Vec<[f32; 2]> = vec![[0.0, 0.0]; num_vert];
+                    positions2.resize(num_vert, [0.0, 0.0]);
                     for i in 0..num_vert {
                         let s = wave_l[i + sample_offset];
                         positions[i] = [
@@ -5626,12 +5713,12 @@ impl MilkdropRenderer {
                     }
                     for i in 0..num_vert {
                         let s = wave_r[i + sample_offset];
-                        p2[i] = [
+                        positions2[i] = [
                             edgex[0] + dx * (i as f32) + perp_dx * (0.25 * s - sep),
                             edgey[0] + dy * (i as f32) + perp_dy * (0.25 * s - sep),
                         ];
                     }
-                    positions2 = Some(p2);
+                    has_positions2 = true;
                 }
             }
             _ => {
@@ -5666,16 +5753,17 @@ impl MilkdropRenderer {
         let dots = live_dots;
         let additive = live_additive;
         let thick = live_thick || live_dots;
+        let smoothed = &mut scratch.smoothed;
         let mut emit = |pos: &mut Vec<[f32; 2]>| {
             for p in pos.iter_mut() {
                 p[1] = -p[1];
             }
-            let smoothed = smooth_wave(pos);
+            smooth_wave_into(pos, smoothed);
             if smoothed.is_empty() {
                 return;
             }
             let start = verts.len() as u32;
-            for p in &smoothed {
+            for p in smoothed.iter() {
                 verts.push(WaveVert { pos: *p, color });
             }
             draws.push(WaveDraw {
@@ -5686,9 +5774,9 @@ impl MilkdropRenderer {
                 thick,
             });
         };
-        emit(&mut positions);
-        if let Some(mut p2) = positions2 {
-            emit(&mut p2);
+        emit(positions);
+        if has_positions2 {
+            emit(positions2);
         }
     }
 
@@ -5746,11 +5834,13 @@ impl MilkdropRenderer {
             // ── per-frame run ────────────────────────────────────────────────
             let env = &mut wv.env;
             let slots = wv.slots;
-            for (slot, value) in wv.reg_slots.iter().zip(regs) {
-                env.set_slot_value(*slot, *value);
+            for &index in &wv.live_reg_indices {
+                let index = index as usize;
+                env.set_slot_value(wv.reg_slots[index], regs[index]);
             }
-            for (slot, value) in wv.t_slots.iter().zip(&wv.t_init) {
-                env.set_slot_value(*slot, *value);
+            for &index in &wv.live_t_indices {
+                let index = index as usize;
+                env.set_slot_value(wv.t_slots[index], wv.t_init[index]);
             }
             slots.frame.seed(
                 env,
@@ -5767,8 +5857,9 @@ impl MilkdropRenderer {
                 inv_aspectx as f64,
                 inv_aspecty as f64,
             );
-            for (slot, value) in wv.q_slots.iter().zip(&qv) {
-                env.set_slot_value(*slot, *value);
+            for &index in &wv.live_q_indices {
+                let index = index as usize;
+                env.set_slot_value(wv.q_slots[index], qv[index]);
             }
             env.set_slot_value(slots.samples, wv.def.samples as f64);
             env.set_slot_value(slots.sep, wv.def.sep as f64);
@@ -6014,17 +6105,22 @@ impl MilkdropRenderer {
                 Some(draw)
             }
         };
-        let outputs: Vec<Option<WaveDraw>> = if parallel_safe {
-            self.waves.par_iter_mut().map(&build_wave).collect()
+        let mut outputs = std::mem::take(&mut self.scratch.custom_wave_draws);
+        outputs.clear();
+        if parallel_safe {
+            self.waves
+                .par_iter_mut()
+                .map(&build_wave)
+                .collect_into_vec(&mut outputs);
         } else {
-            self.waves.iter_mut().map(&build_wave).collect()
-        };
+            outputs.extend(self.waves.iter_mut().map(&build_wave));
+        }
         // Merge in authored wave order so GPU draw order and alpha blending remain
         // deterministic even when CPU equation evaluation completed out of order.
         for (wave, output) in self
             .waves
             .iter()
-            .zip(outputs)
+            .zip(outputs.iter().copied())
             .filter_map(|(wave, draw)| draw.map(|draw| (wave, draw)))
         {
             if verts.len() >= WAVE_VERT_CAP {
@@ -6040,6 +6136,7 @@ impl MilkdropRenderer {
                 draws.push(draw);
             }
         }
+        self.scratch.custom_wave_draws = outputs;
     }
 
     fn warp_gpu_params(
@@ -6250,8 +6347,7 @@ impl MilkdropRenderer {
                 // rotate about (cx,cy)
                 let u2 = u - cx;
                 let v2 = v - cy;
-                let cr = rot.cos();
-                let sr = rot.sin();
+                let (sr, cr) = rot.sin_cos();
                 u = u2 * cr - v2 * sr + cx;
                 v = u2 * sr + v2 * cr + cy;
                 // translate
@@ -6645,35 +6741,41 @@ impl MilkdropRenderer {
         // Build the shared portion of the warp/comp uniforms now. rand_frame is
         // filled after the corresponding EEL phases so shared RNG consumption
         // matches Butterchurn's observable lifecycle.
+        let roam_pair = |rate: f32| {
+            let (sin, cos) = (shader_t * rate).sin_cos();
+            (0.5 + 0.5 * cos, 0.5 + 0.5 * sin)
+        };
+        let slow_roam = [
+            roam_pair(0.005),
+            roam_pair(0.008),
+            roam_pair(0.013),
+            roam_pair(0.022),
+        ];
+        let roam = [
+            roam_pair(0.3),
+            roam_pair(1.3),
+            roam_pair(5.0),
+            roam_pair(20.0),
+        ];
         let mut pf = PerFrame {
             texsize: [w, h, 1.0 / w, 1.0 / h],
             aspect: [shape_aspectx, shape_aspecty, inv_aspectx, inv_aspecty],
             // Time-based roam oscillators in [0,1] (butterchurn warp.js:838-861 / comp.js).
             // Were zeroed (..Zeroable) → roam-using warp/comp collapsed to grayscale/dim.
             slow_roam_cos: [
-                0.5 + 0.5 * (shader_t * 0.005).cos(),
-                0.5 + 0.5 * (shader_t * 0.008).cos(),
-                0.5 + 0.5 * (shader_t * 0.013).cos(),
-                0.5 + 0.5 * (shader_t * 0.022).cos(),
+                slow_roam[0].0,
+                slow_roam[1].0,
+                slow_roam[2].0,
+                slow_roam[3].0,
             ],
-            roam_cos: [
-                0.5 + 0.5 * (shader_t * 0.3).cos(),
-                0.5 + 0.5 * (shader_t * 1.3).cos(),
-                0.5 + 0.5 * (shader_t * 5.0).cos(),
-                0.5 + 0.5 * (shader_t * 20.0).cos(),
-            ],
+            roam_cos: [roam[0].0, roam[1].0, roam[2].0, roam[3].0],
             slow_roam_sin: [
-                0.5 + 0.5 * (shader_t * 0.005).sin(),
-                0.5 + 0.5 * (shader_t * 0.008).sin(),
-                0.5 + 0.5 * (shader_t * 0.013).sin(),
-                0.5 + 0.5 * (shader_t * 0.022).sin(),
+                slow_roam[0].1,
+                slow_roam[1].1,
+                slow_roam[2].1,
+                slow_roam[3].1,
             ],
-            roam_sin: [
-                0.5 + 0.5 * (shader_t * 0.3).sin(),
-                0.5 + 0.5 * (shader_t * 1.3).sin(),
-                0.5 + 0.5 * (shader_t * 5.0).sin(),
-                0.5 + 0.5 * (shader_t * 20.0).sin(),
-            ],
+            roam_sin: [roam[0].1, roam[1].1, roam[2].1, roam[3].1],
             rand_frame: [0.0; 4],
             rand_start: self.rand_start,
             rand_preset: self.rand_preset,
@@ -6750,11 +6852,24 @@ impl MilkdropRenderer {
             (&self.blur1_ubo, 0usize),
             (&self.blur2_ubo, 1),
             (&self.blur3_ubo, 2),
-        ] {
-            let sb = [scale[lvl], bias[lvl], 0.0f32, 0.0f32];
+        ]
+        .into_iter()
+        .take(self.blur_levels as usize)
+        {
+            // `edges` and scale/bias occupy adjacent vec4s in BlurParams. Submit
+            // one queue write per live level, and skip inactive levels entirely.
+            let params = [
+                edges[lvl][0],
+                edges[lvl][1],
+                edges[lvl][2],
+                edges[lvl][3],
+                scale[lvl],
+                bias[lvl],
+                0.0f32,
+                0.0f32,
+            ];
             self.queue
-                .write_buffer(ubo, 16, bytemuck::cast_slice(&edges[lvl]));
-            self.queue.write_buffer(ubo, 32, bytemuck::cast_slice(&sb));
+                .write_buffer(ubo, 16, bytemuck::cast_slice(&params));
         }
 
         // Evaluate the warp mesh before custom shapes/waves so reg00..reg99
@@ -7435,18 +7550,27 @@ impl MilkdropRenderer {
             // batching all fills before all borders changes overlap blending.
             if !fill_draws.is_empty() {
                 rp.set_index_buffer(self.shape_idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+                let mut fill_state_dirty = true;
+                let mut last_additive = None;
                 for d in &fill_draws {
                     if d.base_vertex as u32 + d.sides + 2 > SHAPE_VERT_CAP as u32 {
                         continue;
                     }
-                    rp.set_vertex_buffer(0, self.shape_vert_buf.slice(..));
-                    let pipe = if d.additive {
-                        &self.shapes_fill_pipeline_additive
-                    } else {
-                        &self.shapes_fill_pipeline_alpha
-                    };
-                    rp.set_pipeline(pipe);
-                    rp.set_bind_group(0, shape_read_bg, &[]);
+                    if fill_state_dirty {
+                        rp.set_vertex_buffer(0, self.shape_vert_buf.slice(..));
+                        rp.set_bind_group(0, shape_read_bg, &[]);
+                        last_additive = None;
+                        fill_state_dirty = false;
+                    }
+                    if last_additive != Some(d.additive) {
+                        let pipe = if d.additive {
+                            &self.shapes_fill_pipeline_additive
+                        } else {
+                            &self.shapes_fill_pipeline_alpha
+                        };
+                        rp.set_pipeline(pipe);
+                        last_additive = Some(d.additive);
+                    }
                     rp.draw_indexed(0..(d.sides * 3), d.base_vertex, 0..1);
 
                     if let Some(draw_idx) = d.border_draw_index {
@@ -7472,6 +7596,10 @@ impl MilkdropRenderer {
                             rp.set_bind_group(0, &self.border_bg, &[offset]);
                             rp.draw(border.start_vert..end, 0..1);
                         }
+                        // The border uses a different pipeline, vertex buffer, and
+                        // bind-group layout. Restore fill state lazily only when a
+                        // later authored instance actually needs it.
+                        fill_state_dirty = true;
                     }
                 }
             }
@@ -7706,16 +7834,24 @@ fn custom_wave_sources(
 // WaveUtils.smoothWave — positions only (used by BasicWaveform). Catmull-Rom-ish.
 // `pts` is a flat list of (x,y); returns interleaved smoothed list of (n*2-1).
 fn smooth_wave(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    let mut out = Vec::new();
+    smooth_wave_into(pts, &mut out);
+    out
+}
+
+fn smooth_wave_into(pts: &[[f32; 2]], out: &mut Vec<[f32; 2]>) {
     let n = pts.len();
+    out.clear();
     if n < 2 {
-        return pts.to_vec();
+        out.extend_from_slice(pts);
+        return;
     }
     let c1 = -0.15f32;
     let c2 = 1.15f32;
     let c3 = 1.15f32;
     let c4 = -0.15f32;
     let inv_sum = 1.0 / (c1 + c2 + c3 + c4); // = 0.5
-    let mut out = vec![[0.0f32; 2]; n * 2 - 1];
+    out.resize(n * 2 - 1, [0.0f32; 2]);
     let mut j = 0usize;
     let mut i_below = 0usize;
     let mut i_above2 = 1usize;
@@ -7733,7 +7869,6 @@ fn smooth_wave(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
         j += 2;
     }
     out[j] = pts[n - 1];
-    out
 }
 
 // WaveUtils.smoothWaveAndColor — positions + held color. Returns (positions, colors).
@@ -8271,10 +8406,10 @@ mod tests {
              per_frame_1=q1=q1+1;reg00=reg00+1;\n\
              wavecode_0_enabled=1\n\
              wave_0_per_frame_init_1=t1=q1;reg01=reg00+10;\n\
-             wave_0_per_frame_1=t1=t1+1;\n\
+             wave_0_per_frame_1=t1=t1+1+q8*0+reg04*0;\n\
              shapecode_0_enabled=1\n\
              shape_0_per_frame_init_1=t1=q1;reg02=reg01+20;\n\
-             shape_0_per_frame_1=t1=t1+1;\n",
+             shape_0_per_frame_1=t1=t1+1+q7*0+reg03*0;\n",
         );
         let target = offscreen_target(&device, 64, 64, wgpu::TextureFormat::Rgba8Unorm);
         let mut renderer = MilkdropRenderer::new(
@@ -8292,6 +8427,12 @@ mod tests {
         assert_eq!(renderer.eel_env.get("reg00").copied(), Some(4.0));
         assert_eq!(renderer.eel_env.get("reg01").copied(), Some(14.0));
         assert_eq!(renderer.eel_env.get("reg02").copied(), Some(34.0));
+        assert_eq!(renderer.waves[0].live_reg_indices.as_slice(), &[4]);
+        assert_eq!(renderer.waves[0].live_q_indices.as_slice(), &[7]);
+        assert_eq!(renderer.waves[0].live_t_indices.as_slice(), &[0]);
+        assert_eq!(renderer.shapes[0].live_reg_indices.as_slice(), &[3]);
+        assert_eq!(renderer.shapes[0].live_q_indices.as_slice(), &[6]);
+        assert_eq!(renderer.shapes[0].live_t_indices.as_slice(), &[0]);
         assert_ne!(renderer.rand_start, renderer.rand_preset);
         for _ in 0..2 {
             renderer.render(&target);
@@ -8608,12 +8749,18 @@ mod tests {
         assert!(!renderer.scratch.shape_fill_verts.is_empty());
         assert!(!renderer.scratch.wave_verts.is_empty());
         assert!(!renderer.waves[0].scratch.output.is_empty());
+        assert!(!renderer.scratch.basic_wave.processed_l.is_empty());
+        assert!(!renderer.scratch.custom_wave_draws.is_empty());
         let shape_ptr = renderer.scratch.shape_fill_verts.as_ptr();
         let shape_capacity = renderer.scratch.shape_fill_verts.capacity();
         let wave_ptr = renderer.scratch.wave_verts.as_ptr();
         let wave_capacity = renderer.scratch.wave_verts.capacity();
         let custom_wave_ptr = renderer.waves[0].scratch.output.as_ptr();
         let custom_wave_capacity = renderer.waves[0].scratch.output.capacity();
+        let basic_wave_ptr = renderer.scratch.basic_wave.processed_l.as_ptr();
+        let basic_wave_capacity = renderer.scratch.basic_wave.processed_l.capacity();
+        let custom_wave_draws_ptr = renderer.scratch.custom_wave_draws.as_ptr();
+        let custom_wave_draws_capacity = renderer.scratch.custom_wave_draws.capacity();
 
         renderer.render(&target);
         assert_eq!(renderer.scratch.shape_fill_verts.as_ptr(), shape_ptr);
@@ -8624,6 +8771,22 @@ mod tests {
         assert_eq!(
             renderer.waves[0].scratch.output.capacity(),
             custom_wave_capacity
+        );
+        assert_eq!(
+            renderer.scratch.basic_wave.processed_l.as_ptr(),
+            basic_wave_ptr
+        );
+        assert_eq!(
+            renderer.scratch.basic_wave.processed_l.capacity(),
+            basic_wave_capacity
+        );
+        assert_eq!(
+            renderer.scratch.custom_wave_draws.as_ptr(),
+            custom_wave_draws_ptr
+        );
+        assert_eq!(
+            renderer.scratch.custom_wave_draws.capacity(),
+            custom_wave_draws_capacity
         );
     }
 
