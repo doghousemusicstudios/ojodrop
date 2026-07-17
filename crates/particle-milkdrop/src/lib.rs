@@ -43,9 +43,10 @@ pub use named_textures::{
 pub use parse_milk::{parse, CustomWaveDef, MilkShaders, ShapeBaseVals, ShapeCode};
 pub use renderer::{
     compile_glsl, compile_milkdrop_shader_bodies, compile_milkdrop_shader_bodies_from_parts,
-    CompiledMilkdropShaderBodies, DimensionError, MilkdropAlphaSummary, MilkdropGeometryBounds,
-    MilkdropGeometryDiagnostics, MilkdropRenderer, MilkdropResizeDebouncer, MilkdropRgbSummary,
-    MilkdropShapeGeometryDiagnostics, MilkdropWaveGeometryDiagnostics, INTERACTIVE_RESIZE_DEBOUNCE,
+    CompiledMilkdropShaderBodies, DimensionError, MilkBaseVals, MilkdropAlphaSummary,
+    MilkdropGeometryBounds, MilkdropGeometryDiagnostics, MilkdropRenderer, MilkdropResizeDebouncer,
+    MilkdropRgbSummary, MilkdropShapeGeometryDiagnostics, MilkdropWaveGeometryDiagnostics,
+    INTERACTIVE_RESIZE_DEBOUNCE,
 };
 
 /// Whether this process can ingest raw `.milk` presets through the isolated

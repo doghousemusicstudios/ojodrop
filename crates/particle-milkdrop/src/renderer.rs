@@ -240,6 +240,141 @@ struct WarpBase {
     wrap: bool,
 }
 
+/// Allocation-free live scalar snapshot. Updating this state preserves the
+/// renderer, equation programs, q/user variables, megabufs, and feedback chain.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MilkBaseVals {
+    pub decay: f32,
+    pub gamma_adj: f32,
+    pub fshader: f32,
+    pub echo_zoom: f32,
+    pub echo_alpha: f32,
+    pub echo_orient: f32,
+    pub brighten: bool,
+    pub darken: bool,
+    pub solarize: bool,
+    pub invert: bool,
+    pub warpscale: f32,
+    pub warpanimspeed: f32,
+    pub zoom: f32,
+    pub zoomexp: f32,
+    pub rot: f32,
+    pub warp_amount: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub dx: f32,
+    pub dy: f32,
+    pub sx: f32,
+    pub sy: f32,
+    pub wrap: bool,
+    pub wave_mode: f32,
+    pub wave_x: f32,
+    pub wave_y: f32,
+    pub wave_r: f32,
+    pub wave_g: f32,
+    pub wave_b: f32,
+    pub wave_a: f32,
+    pub wave_mystery: f32,
+    pub wave_scale: f32,
+    pub wave_smoothing: f32,
+    pub wave_dots: bool,
+    pub wave_thick: bool,
+    pub additive_wave: bool,
+    pub wave_brighten: bool,
+    pub modwavealphabyvolume: bool,
+    pub modwavealphastart: f32,
+    pub modwavealphaend: f32,
+    pub mv_on: bool,
+    pub mv_x: f32,
+    pub mv_y: f32,
+    pub mv_dx: f32,
+    pub mv_dy: f32,
+    pub mv_l: f32,
+    pub mv_r: f32,
+    pub mv_g: f32,
+    pub mv_b: f32,
+    pub mv_a: f32,
+    pub ob_size: f32,
+    pub ob_r: f32,
+    pub ob_g: f32,
+    pub ob_b: f32,
+    pub ob_a: f32,
+    pub ib_size: f32,
+    pub ib_r: f32,
+    pub ib_g: f32,
+    pub ib_b: f32,
+    pub ib_a: f32,
+    pub darken_center: bool,
+}
+
+impl Default for MilkBaseVals {
+    fn default() -> Self {
+        Self {
+            decay: 0.98,
+            gamma_adj: 2.0,
+            fshader: 0.0,
+            echo_zoom: 2.0,
+            echo_alpha: 0.0,
+            echo_orient: 0.0,
+            brighten: false,
+            darken: false,
+            solarize: false,
+            invert: false,
+            warpscale: 1.0,
+            warpanimspeed: 1.0,
+            zoom: 1.0,
+            zoomexp: 1.0,
+            rot: 0.0,
+            warp_amount: 1.0,
+            cx: 0.5,
+            cy: 0.5,
+            dx: 0.0,
+            dy: 0.0,
+            sx: 1.0,
+            sy: 1.0,
+            wrap: true,
+            wave_mode: 0.0,
+            wave_x: 0.5,
+            wave_y: 0.5,
+            wave_r: 1.0,
+            wave_g: 1.0,
+            wave_b: 1.0,
+            wave_a: 1.0,
+            wave_mystery: 0.0,
+            wave_scale: 1.0,
+            wave_smoothing: 0.75,
+            wave_dots: false,
+            wave_thick: false,
+            additive_wave: false,
+            wave_brighten: true,
+            modwavealphabyvolume: false,
+            modwavealphastart: 0.75,
+            modwavealphaend: 0.95,
+            mv_on: true,
+            mv_x: 12.0,
+            mv_y: 9.0,
+            mv_dx: 0.0,
+            mv_dy: 0.0,
+            mv_l: 0.9,
+            mv_r: 1.0,
+            mv_g: 1.0,
+            mv_b: 1.0,
+            mv_a: 1.0,
+            ob_size: 0.01,
+            ob_r: 0.0,
+            ob_g: 0.0,
+            ob_b: 0.0,
+            ob_a: 0.0,
+            ib_size: 0.01,
+            ib_r: 0.25,
+            ib_g: 0.25,
+            ib_b: 0.25,
+            ib_a: 0.0,
+            darken_center: false,
+        }
+    }
+}
+
 /// Per-frame default-warp parameters consumed by the vertex shader. The final
 /// vector carries a CPU-mesh flag so presets with per-pixel EEL (or enabled
 /// motion vectors, which sample the CPU flow field) retain the exact legacy path.
@@ -4481,6 +4616,84 @@ impl MilkdropRenderer {
     /// failure; it intentionally reports the last successfully committed size.
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Replace live numeric/bool base values without rebuilding renderer-owned
+    /// programs, equation state, buffers, or feedback textures.
+    pub fn apply_base_vals(&mut self, values: &MilkBaseVals) {
+        self.base_warp = WarpBase {
+            zoom: values.zoom,
+            zoomexp: values.zoomexp,
+            rot: values.rot,
+            warp: values.warp_amount,
+            cx: values.cx,
+            cy: values.cy,
+            dx: values.dx,
+            dy: values.dy,
+            sx: values.sx,
+            sy: values.sy,
+            warpscale: values.warpscale,
+            warpanimspeed: values.warpanimspeed,
+            decay: values.decay,
+            wrap: values.wrap,
+        };
+        self.bw_mode = values.wave_mode;
+        self.bw_x = values.wave_x;
+        self.bw_y = values.wave_y;
+        self.bw_r = values.wave_r;
+        self.bw_g = values.wave_g;
+        self.bw_b = values.wave_b;
+        self.bw_a = values.wave_a;
+        self.bw_mystery = values.wave_mystery;
+        self.bw_scale = values.wave_scale;
+        self.bw_smoothing = values.wave_smoothing;
+        self.bw_dots = values.wave_dots;
+        self.bw_thick = values.wave_thick;
+        self.bw_additive = values.additive_wave;
+        self.bw_brighten = values.wave_brighten;
+        self.bw_modalphavol = values.modwavealphabyvolume;
+        self.bw_modalphastart = values.modwavealphastart;
+        self.bw_modalphaend = values.modwavealphaend;
+        self.comp_gamma_adj = values.gamma_adj;
+        self.comp_fshader = values.fshader;
+        self.echo_zoom = values.echo_zoom;
+        self.echo_alpha = values.echo_alpha;
+        self.echo_orient = values.echo_orient;
+        self.comp_brighten = values.brighten;
+        self.comp_darken = values.darken;
+        self.comp_solarize = values.solarize;
+        self.comp_invert = values.invert;
+        self.mv_on = values.mv_on;
+        self.mv_x = values.mv_x;
+        self.mv_y = values.mv_y;
+        self.mv_dx = values.mv_dx;
+        self.mv_dy = values.mv_dy;
+        self.mv_l = values.mv_l;
+        self.mv_r = values.mv_r;
+        self.mv_g = values.mv_g;
+        self.mv_b = values.mv_b;
+        self.mv_a = values.mv_a;
+        self.ob_size = values.ob_size;
+        self.ob_r = values.ob_r;
+        self.ob_g = values.ob_g;
+        self.ob_b = values.ob_b;
+        self.ob_a = values.ob_a;
+        self.ib_size = values.ib_size;
+        self.ib_r = values.ib_r;
+        self.ib_g = values.ib_g;
+        self.ib_b = values.ib_b;
+        self.ib_a = values.ib_a;
+        self.darken_center = values.darken_center;
+
+        for (name, value) in [
+            ("echo_zoom", values.echo_zoom),
+            ("echo_alpha", values.echo_alpha),
+            ("echo_orient", values.echo_orient),
+            ("gamma", values.gamma_adj),
+            ("gammaadj", values.gamma_adj),
+        ] {
+            self.eel_env.insert(name.into(), value as f64);
+        }
     }
 
     /// Resize the GPU targets without rebuilding the preset runtime.
